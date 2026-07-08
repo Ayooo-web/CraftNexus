@@ -56,22 +56,22 @@ The onboarding contract solves several key problems within CraftNexus:
 #### System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    CraftNexus Platform                      │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  ┌──────────────┐    ┌──────────────────┐    ┌───────────┐  │
-│  │    User      │───▶│ Onboarding       │───▶│  Role     │  │
-│  │  (Wallet)    │    │   Contract       │    │ Assignment│  │
-│  └──────────────┘    └──────────────────┘    └───────────┘  │
-│                              │                     │          │
-│                              ▼                     ▼          │
-│                      ┌──────────────────┐    ┌───────────┐    │
-│                      │  User Profile    │◀───│  Escrow   │    │
-│                      │  Storage         │    │  Contract │    │
-│                      └──────────────────┘    └───────────┘    │
-│                                                               │
-└─────────────────────────────────────────────────────────────┘
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚                    CraftNexus Platform                      â”‚
+â”œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¤
+â”‚                                                               â”‚
+â”‚  â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”    â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”    â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”  â”‚
+â”‚  â”‚    User      â”‚â”€â”€â”€â–¶â”‚ Onboarding       â”‚â”€â”€â”€â–¶â”‚  Role     â”‚  â”‚
+â”‚  â”‚  (Wallet)    â”‚    â”‚   Contract       â”‚    â”‚ Assignmentâ”‚  â”‚
+â”‚  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜    â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜    â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜  â”‚
+â”‚                              â”‚                     â”‚          â”‚
+â”‚                              â–¼                     â–¼          â”‚
+â”‚                      â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”    â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”    â”‚
+â”‚                      â”‚  User Profile    â”‚â—€â”€â”€â”€â”‚  Escrow   â”‚    â”‚
+â”‚                      â”‚  Storage         â”‚    â”‚  Contract â”‚    â”‚
+â”‚                      â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜    â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜    â”‚
+â”‚                                                               â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
 ```
 
 #### User Roles
@@ -123,7 +123,7 @@ Initialize the onboarding contract with an administrator.
 **Description:** Sets up the contract configuration and assigns the platform admin.
 
 **Parameters:**
-- `admin (address)` – Wallet address of the platform administrator
+- `admin (address)` â€“ Wallet address of the platform administrator
 
 **Behavior:**
 - Stores contract configuration
@@ -156,9 +156,9 @@ error discriminant *before* panicking. Off-chain indexers can subscribe to this
 topic to distinguish a user-request rejection from a host panic or network error.
 
 **Parameters:**
-- `user (address)` – User's wallet address
-- `username (string)` – Desired username (3-50 characters)
-- `role (u32)` – Desired role (1 = Buyer, 2 = Artisan)
+- `user (address)` â€“ User's wallet address
+- `username (string)` â€“ Desired username (3-50 characters)
+- `role (u32)` â€“ Desired role (1 = Buyer, 2 = Artisan)
 
 **Behavior:**
 - Validates user authentication
@@ -247,7 +247,7 @@ Retrieve user profile information.
 **Description:** Fetches the complete user profile for a given address.
 
 **Parameters:**
-- `user (address)` – User's wallet address
+- `user (address)` â€“ User's wallet address
 
 **Returns:**
 - `UserProfile` struct containing:
@@ -280,7 +280,7 @@ Get user's current role.
 **Description:** Returns the role assigned to a user without fetching the full profile.
 
 **Parameters:**
-- `user (address)` – User's wallet address
+- `user (address)` â€“ User's wallet address
 
 **Returns:**
 - `u32` - Role value (0=None, 1=Buyer, 2=Artisan, 3=Admin)
@@ -304,7 +304,7 @@ Check if user has completed onboarding.
 **Description:** Quick check to determine if a wallet address has registered on the platform.
 
 **Parameters:**
-- `user (address)` – User's wallet address
+- `user (address)` â€“ User's wallet address
 
 **Returns:**
 - `bool` - true if user is onboarded, false otherwise
@@ -328,8 +328,8 @@ Update user's role (Admin only).
 **Description:** Allows the platform administrator to change a user's role.
 
 **Parameters:**
-- `user (address)` – User's wallet address to update
-- `new_role (u32)` – New role to assign (0=None, 1=Buyer, 2=Artisan, 3=Admin)
+- `user (address)` â€“ User's wallet address to update
+- `new_role (u32)` â€“ New role to assign (0=None, 1=Buyer, 2=Artisan, 3=Admin)
 
 **Behavior:**
 - Validates caller is the platform admin
@@ -361,7 +361,7 @@ Verify a user (Admin only).
 **Description:** Allows the platform administrator to verify a user, granting them additional trust.
 
 **Parameters:**
-- `user (address)` – User's wallet address to verify
+- `user (address)` â€“ User's wallet address to verify
 
 **Behavior:**
 - Validates caller is the platform admin
@@ -392,8 +392,8 @@ Check if user has a specific role.
 **Description:** Efficiently check if a user has a particular role.
 
 **Parameters:**
-- `user (address)` – User's wallet address
-- `role (u32)` – Role to check
+- `user (address)` â€“ User's wallet address
+- `role (u32)` â€“ Role to check
 
 **Returns:**
 - `bool` - true if user has the specified role
@@ -416,7 +416,7 @@ Return the precise number of active escrow contracts tracked for a user (Feature
 **Description:** Complements `has_active_contracts` (which only returns a boolean) by exposing the exact concurrency level maintained in `DataKey::ActiveContractCount(user)`. Off-chain indexers and reputation/risk dashboards use this to weight users by concurrent workload without replaying every escrow event or making a cross-contract call. Returns `0` when no active contracts are tracked.
 
 **Parameters:**
-- `user (address)` – User's wallet address
+- `user (address)` â€“ User's wallet address
 
 **Returns:**
 - `u32` - number of currently-active contracts (`0` when none)
@@ -440,7 +440,7 @@ Force-clear a stale or abandoned manual verification request (admin only, Issue 
 **Description:** Privileged queue-maintenance endpoint that removes a user's pending verification request and advances the verification queue head, without approving or rejecting it. Gated behind `platform_admin.require_auth()` so unauthorized callers cannot evict legitimate users from the queue. For an audited approve/reject decision, use `process_verification_request` instead.
 
 **Parameters:**
-- `user (address)` – Address whose pending verification request should be cleared
+- `user (address)` â€“ Address whose pending verification request should be cleared
 
 **Returns:**
 - `bool` - `true` if a pending request existed and was cleared; `false` if there was nothing to clear (idempotent no-op)
@@ -631,11 +631,11 @@ Escrow events publish with topics `(event_symbol, order_id)` and typed event bod
 
 | Event Symbol | Data Struct |
 |-------------|-------------|
-| `escrow_created` | `EscrowCreatedEvent { escrow_id, buyer, seller, amount, token, release_window, ipfs_hash, metadata_hash }` |
-| `funds_released` | `FundsReleasedEvent { escrow_id, amount }` |
-| `funds_refunded` | `FundsRefundedEvent { escrow_id, amount }` |
-| `escrow_disputed` | `EscrowDisputedEvent { escrow_id, dispute_reason }` |
-| `escrow_resolved` | `EscrowResolvedEvent { escrow_id, resolution }` |
+| `escrow.created` | `EscrowCreatedEvent { escrow_id, buyer, seller, amount, token, release_window, ipfs_hash, metadata_hash }` |
+| `escrow.released` | `FundsReleasedEvent { escrow_id, amount }` |
+| `escrow.refunded` | `FundsRefundedEvent { escrow_id, amount }` |
+| `escrow.disputed` | `EscrowDisputedEvent { escrow_id, dispute_reason }` |
+| `escrow.resolved` | `EscrowResolvedEvent { escrow_id, resolution }` |
 
 ### Onboarding Events
 
@@ -654,7 +654,7 @@ Onboarding events publish with one topic symbol and payload `Address`:
 Errors are grouped by category for off-chain triage. Use `is_retryable(error)` in
 `src/lib.rs` to check if an error may succeed on retry.
 
-### Auth / Access (1–9) — rollback immediately
+### Auth / Access (1â€“9) â€” rollback immediately
 
 | Code | Variant | Meaning |
 |------|---------|---------|
@@ -668,7 +668,7 @@ Errors are grouped by category for off-chain triage. Use `is_retryable(error)` i
 | `8` | `NotInDispute` | Escrow expected to be disputed but was not |
 | `9` | `AlreadyOnboarded` | Reserved for onboarding collision handling |
 
-### State / Transition (10–19) — retry after state change
+### State / Transition (10â€“19) â€” retry after state change
 
 | Code | Variant | Meaning |
 |------|---------|---------|
@@ -683,7 +683,7 @@ Errors are grouped by category for off-chain triage. Use `is_retryable(error)` i
 | `18` | `StakeCooldownActive` | Stake cooldown period still active |
 | `19` | `InvalidRefundAmount` | Refund amount invalid (zero, negative, or exceeds escrow) |
 
-### Config / Resource (20–29) — operator must act
+### Config / Resource (20â€“29) â€” operator must act
 
 | Code | Variant | Meaning |
 |------|---------|---------|
@@ -698,7 +698,7 @@ Errors are grouped by category for off-chain triage. Use `is_retryable(error)` i
 | `28` | `AdminRecoveryFailed` | Admin recovery failed due to time lock or invalid conditions |
 | `29` | `BatchLimitExceeded` | Batch operation limit exceeded |
 
-### Operational / Gates (30–39) — retry after cooldown
+### Operational / Gates (30â€“39) â€” retry after cooldown
 
 | Code | Variant | Meaning |
 |------|---------|---------|
@@ -713,7 +713,7 @@ Errors are grouped by category for off-chain triage. Use `is_retryable(error)` i
 | `38` | `RecurringEscrowIdExhausted` | Recurring escrow ID counter exhausted |
 | `39` | `OnboardingContractNotSet` | Onboarding contract address not configured |
 
-### Validation (40–42) — fix caller input
+### Validation (40â€“42) â€” fix caller input
 
 | Code | Variant | Meaning |
 |------|---------|---------|
@@ -948,13 +948,13 @@ for (const evt of ledgerEvents) {
   const eventName = evt.topic[0].toString();
   const orderId = evt.topic[1]?.toString();
 
-  if (eventName === "escrow_created") {
+  if (eventName === "escrow.created") {
     const data = parseEscrowCreatedEvent(evt.value);
     saveEscrowCreated(orderId, data.buyer, data.seller, data.amount, data.token);
-  } else if (eventName === "escrow_disputed") {
+  } else if (eventName === "escrow.disputed") {
     const data = parseEscrowDisputedEvent(evt.value);
     saveEscrowDispute(orderId, data.dispute_reason);
-  } else if (eventName === "escrow_resolved") {
+  } else if (eventName === "escrow.resolved") {
     const data = parseEscrowResolvedEvent(evt.value);
     saveEscrowResolution(orderId, data.resolution);
   }
@@ -1015,25 +1015,25 @@ All public state-mutating functions in CraftNexus that perform token transfers *
 
 CEI (Checks-Effects-Interactions) is a Soroban security pattern that prevents reentrancy and state corruption by enforcing a strict ordering within functions:
 
-1. **Checks** — Validate all inputs and preconditions (auth, balances, state)
-2. **Effects** — Update contract state (storage writes)
-3. **Interactions** — Call external contracts (token transfers, cross-contract calls)
+1. **Checks** â€” Validate all inputs and preconditions (auth, balances, state)
+2. **Effects** â€” Update contract state (storage writes)
+3. **Interactions** â€” Call external contracts (token transfers, cross-contract calls)
 
 Token transfers and cross-contract calls must always come **last**.
 
-#### ❌ Non-compliant (vulnerable)
+#### âŒ Non-compliant (vulnerable)
 
 ```rust
 pub fn release_funds(env: Env, recipient: Address, amount: i128) {
     recipient.require_auth();
-    // ❌ WRONG: Token transfer BEFORE state update
+    // âŒ WRONG: Token transfer BEFORE state update
     token_client.transfer(&env.current_contract_address(), &recipient, &amount);
-    // ❌ State updated after external call — vulnerable to reentrancy
+    // âŒ State updated after external call â€” vulnerable to reentrancy
     env.storage().persistent().set(&DataKey::Balance, &(balance - amount));
 }
 ```
 
-#### ✅ CEI-compliant (correct)
+#### âœ… CEI-compliant (correct)
 
 ```rust
 pub fn release_funds(env: Env, recipient: Address, amount: i128) {
@@ -1104,7 +1104,7 @@ Returns a paginated list of escrow IDs for a specific buyer.
 | `page_size` | `u32` | Number of results per page (capped at `MAX_BATCH_SIZE = 20`) |
 | `reverse` | `bool` | If `true`, returns results in reverse chronological order |
 
-**Returns:** `Vec<u64>` — List of escrow IDs for the requested page. Empty if `page` is out of range.
+**Returns:** `Vec<u64>` â€” List of escrow IDs for the requested page. Empty if `page` is out of range.
 
 **Notes:**
 - `page_size` values above `MAX_BATCH_SIZE` (20) are silently capped to prevent memory exhaustion.
@@ -1138,7 +1138,7 @@ Returns a paginated list of escrow IDs for a specific seller.
 | `page_size` | `u32` | Number of results per page (capped at `MAX_BATCH_SIZE = 20`) |
 | `reverse` | `bool` | If `true`, returns results in reverse chronological order |
 
-**Returns:** `Vec<u64>` — List of escrow IDs for the requested page. Empty if `page` is out of range.
+**Returns:** `Vec<u64>` â€” List of escrow IDs for the requested page. Empty if `page` is out of range.
 
 **Notes:**
 - `page_size` values above `MAX_BATCH_SIZE` (20) are silently capped to prevent memory exhaustion.
