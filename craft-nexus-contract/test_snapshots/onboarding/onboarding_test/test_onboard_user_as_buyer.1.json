@@ -46,6 +46,29 @@
           },
           "sub_invocations": []
         }
+      ],
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "function_name": "onboard_user",
+              "args": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "string": "john_doe"
+                },
+                {
+                  "u32": 1
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
       ]
     ]
   ],
@@ -227,12 +250,6 @@
                     },
                     {
                       "key": {
-                        "symbol": "portfolio_cid"
-                      },
-                      "val": "void"
-                    },
-                    {
-                      "key": {
                         "symbol": "registered_at"
                       },
                       "val": {
@@ -268,7 +285,7 @@
                         "symbol": "username"
                       },
                       "val": {
-                        "string": "admin"
+                        "symbol": "admin"
                       }
                     },
                     {
@@ -276,7 +293,7 @@
                         "symbol": "version"
                       },
                       "val": {
-                        "u32": 4
+                        "u32": 5
                       }
                     }
                   ]
@@ -351,12 +368,6 @@
                     },
                     {
                       "key": {
-                        "symbol": "portfolio_cid"
-                      },
-                      "val": "void"
-                    },
-                    {
-                      "key": {
                         "symbol": "registered_at"
                       },
                       "val": {
@@ -392,7 +403,7 @@
                         "symbol": "username"
                       },
                       "val": {
-                        "string": "john_doe"
+                        "symbol": "john_doe"
                       }
                     },
                     {
@@ -400,7 +411,7 @@
                         "symbol": "version"
                       },
                       "val": {
-                        "u32": 4
+                        "u32": 5
                       }
                     }
                   ]
@@ -556,6 +567,39 @@
                 "key": {
                   "ledger_key_nonce": {
                     "nonce": 801925984706572462
+                  }
+                },
+                "durability": "temporary",
+                "val": "void"
+              }
+            },
+            "ext": "v0"
+          },
+          6311999
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+            "key": {
+              "ledger_key_nonce": {
+                "nonce": 1033654523790656264
+              }
+            },
+            "durability": "temporary"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+                "key": {
+                  "ledger_key_nonce": {
+                    "nonce": 1033654523790656264
                   }
                 },
                 "durability": "temporary",
@@ -904,7 +948,7 @@
                     "symbol": "username"
                   },
                   "val": {
-                    "string": "john_doe"
+                    "symbol": "john_doe"
                   }
                 },
                 {
@@ -912,7 +956,7 @@
                     "symbol": "version"
                   },
                   "val": {
-                    "u32": 4
+                    "u32": 5
                   }
                 }
               ]
