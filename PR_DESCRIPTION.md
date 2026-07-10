@@ -1,20 +1,33 @@
-# Pull Request Description
+# Pull Request
+
+## Issue(s)
+<!-- Link to GitHub issue(s) this PR addresses -->
+- Closes #
 
 ## Summary
-[Brief description of what this PR accomplishes]
+<!-- Short summary of what the PR changes and why -->
 
 ## Changes Made
-- [ ] Change 1
-- [ ] Change 2
-- [ ] Change 3
+<!-- List key changes in bullet points -->
+- [ ]
+- [ ]
+- [ ]
 
-## Testing
-- [ ] Test 1
-- [ ] Test 2
-- [ ] Test 3
+## Validation
+- [ ] `cargo check --tests` passes
+- [ ] `cargo test` passes
+- [ ] `cargo build --target wasm32-unknown-unknown --release` succeeds
+- [ ] Snapshot files are unchanged or intentionally updated
+- [ ] Documentation is updated (RustDoc, README, etc.)
 
-## Screenshots (if applicable)
-[Add screenshots here]
+## PR Checklist
+- [ ] I have read the contributing guidelines
+- [ ] My code follows the project's style guidelines
+- [ ] I have performed a self-review of my code
+- [ ] I have added necessary tests
+- [ ] All tests pass
+- [ ] Code is properly linted
 
-## Additional Notes
-[Any other relevant information]
+## Additional Context
+<!-- Any other relevant context, screenshots, or links -->
+
