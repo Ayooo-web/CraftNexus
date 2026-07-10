@@ -2,7 +2,7 @@
 
 ## Issue(s)
 <!-- Link to GitHub issue(s) this PR addresses -->
-- Closes # (replace with actual issue number)
+- Closes #627
 
 ## Summary
 This PR resolves multiple critical build errors in the CraftNexus Soroban smart contract, making the codebase buildable and testable again.
