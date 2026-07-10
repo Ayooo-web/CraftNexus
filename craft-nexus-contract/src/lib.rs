@@ -35,11 +35,11 @@ pub mod onboarding;
 ///
 /// | Range   | Category     | Meaning                                         | Triage                    |
 /// |---------|-------------|-------------------------------------------------|---------------------------|
-/// | 1–9     | Auth/Access | Authorization, ownership, or existence failures | Rollback immediately      |
-/// | 10–19   | State       | Invalid state transitions or preconditions      | Retry after state change  |
-/// | 20–29   | Config      | Operator-configurable limits or misconfig       | Operator must act         |
-/// | 30–39   | Operational | System or cooldown gates                        | Retry after cooldown      |
-/// | 40–42   | Validation  | Input validation failures                       | Fix caller input          |
+/// | 1â€“9     | Auth/Access | Authorization, ownership, or existence failures | Rollback immediately      |
+/// | 10â€“19   | State       | Invalid state transitions or preconditions      | Retry after state change  |
+/// | 20â€“29   | Config      | Operator-configurable limits or misconfig       | Operator must act         |
+/// | 30â€“39   | Operational | System or cooldown gates                        | Retry after cooldown      |
+/// | 40â€“42   | Validation  | Input validation failures                       | Fix caller input          |
 ///
 /// Use [`is_retryable`] to determine whether an error may succeed on retry.
 #[contracterror]
@@ -47,7 +47,7 @@ pub mod onboarding;
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 #[repr(u32)]
 pub enum Error {
-    // ── Auth / Access (1–9): rollback immediately ──
+    // â”€â”€ Auth / Access (1â€“9): rollback immediately â”€â”€
     /// Unauthorized operation
     Unauthorized = 1,
     /// Escrow not found
@@ -66,7 +66,7 @@ pub enum Error {
     NotInDispute = 8,
     /// DEPRECATED: Handled by onboarding contract. Retained for ABI compatibility.
     AlreadyOnboarded = 9,
-    // ── State / Transition (10–19): retry after state change ──
+    // â”€â”€ State / Transition (10â€“19): retry after state change â”€â”€
     /// Invalid fee amount (must be <= MAX_PLATFORM_FEE_BPS)
     InvalidFee = 10,
     /// Buyer and seller cannot be the same
@@ -87,7 +87,7 @@ pub enum Error {
     StakeCooldownActive = 18,
     /// Refund amount is invalid (zero, negative, or exceeds escrow amount)
     InvalidRefundAmount = 19,
-    // ── Config / Resource (20–29): operator must act ──
+    // â”€â”€ Config / Resource (20â€“29): operator must act â”€â”€
     /// Partial refund proposal not found
     ProposalNotFound = 20,
     /// Partial refund proposal already exists for this order
@@ -108,7 +108,7 @@ pub enum Error {
     AdminRecoveryFailed = 28,
     /// Batch operation limit exceeded
     BatchLimitExceeded = 29,
-    // ── Operational / Gates (30–39): retry after cooldown ──
+    // â”€â”€ Operational / Gates (30â€“39): retry after cooldown â”€â”€
     /// Deprecated function called (no-op for ABI compatibility)
     DeprecatedFunction = 30,
     /// No pending admin transfer to accept or cancel
@@ -129,7 +129,7 @@ pub enum Error {
     RecurringEscrowIdExhausted = 38,
     /// Onboarding contract address has not been configured
     OnboardingContractNotSet = 39,
-    // ── Validation (40+): fix caller input ──
+    // â”€â”€ Validation (40+): fix caller input â”€â”€
     /// Provided metadata hash is invalid
     InvalidMetadataHash = 40,
     /// Provided IPFS hash is invalid
@@ -565,7 +565,7 @@ pub struct EscrowEvent {
     pub buyer: Address,
     pub seller: Address,
     /// Monetary fields are emitted as raw integer types (i128/u64). Avoid
-    /// converting integers to strings inside the contract — emit numeric
+    /// converting integers to strings inside the contract â€” emit numeric
     /// values and perform human-friendly formatting off-chain (UI/indexer).
     pub amount: i128,
     pub token: Address,
@@ -604,7 +604,7 @@ pub struct ReputationUpdateEvent {
 /// Soroban events must be self-describing for off-chain indexers, but
 /// `PlatformConfig` fields are heterogeneous (counts, monetary amounts,
 /// addresses, and free-form strings). Rather than emit a separate event type
-/// per field — which would bloat the contract's event ABI — every admin
+/// per field â€” which would bloat the contract's event ABI â€” every admin
 /// configuration change is normalized into one of these four variants. Indexers
 /// match on the variant tag to recover the underlying Rust type without any
 /// loss of precision (in particular, `I128` monetary values are never
@@ -612,10 +612,10 @@ pub struct ReputationUpdateEvent {
 ///
 /// # Variant mapping
 ///
-/// * `U32`     — bounded counters and basis-point fees (e.g. `platform_fee_bps`).
-/// * `I128`    — monetary thresholds such as `min_escrow_amount`.
-/// * `Address` — role and token addresses (e.g. `fee_collector`).
-/// * `String`  — human-readable identifiers that have no compact encoding.
+/// * `U32`     â€” bounded counters and basis-point fees (e.g. `platform_fee_bps`).
+/// * `I128`    â€” monetary thresholds such as `min_escrow_amount`.
+/// * `Address` â€” role and token addresses (e.g. `fee_collector`).
+/// * `String`  â€” human-readable identifiers that have no compact encoding.
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -650,9 +650,9 @@ pub enum ConfigValue {
 ///
 /// # Payload
 ///
-/// * `field_name` — symbolic name of the mutated field.
-/// * `old_value`  — value held immediately before the write.
-/// * `new_value`  — value persisted by this update.
+/// * `field_name` â€” symbolic name of the mutated field.
+/// * `old_value`  â€” value held immediately before the write.
+/// * `new_value`  â€” value persisted by this update.
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -686,8 +686,8 @@ pub struct ConfigUpdatedEvent {
 ///
 /// # Payload
 ///
-/// * `artisan` — address whose fee tier was updated.
-/// * `fee_bps` — the new fee in basis points applied to future escrows.
+/// * `artisan` â€” address whose fee tier was updated.
+/// * `fee_bps` â€” the new fee in basis points applied to future escrows.
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -710,7 +710,7 @@ pub struct ArtisanFeeTierUpdatedEvent {
 ///
 /// # Preconditions
 ///
-/// * `artisan.require_auth()` — only the staker may stake on their own behalf.
+/// * `artisan.require_auth()` â€” only the staker may stake on their own behalf.
 /// * `amount` must be positive and `token` whitelisted.
 ///
 /// # Storage side-effects
@@ -719,9 +719,9 @@ pub struct ArtisanFeeTierUpdatedEvent {
 ///
 /// # Payload
 ///
-/// * `artisan` — the staking address.
-/// * `token`   — the staked token's contract address.
-/// * `amount`  — raw token amount staked (never stringified on-chain).
+/// * `artisan` â€” the staking address.
+/// * `token`   â€” the staked token's contract address.
+/// * `amount`  â€” raw token amount staked (never stringified on-chain).
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -753,9 +753,9 @@ pub struct TokensStakedEvent {
 ///
 /// # Payload
 ///
-/// * `artisan` — the withdrawing address.
-/// * `token`   — the unstaked token's contract address.
-/// * `amount`  — raw token amount returned to the artisan.
+/// * `artisan` â€” the withdrawing address.
+/// * `token`   â€” the unstaked token's contract address.
+/// * `amount`  â€” raw token amount returned to the artisan.
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -790,9 +790,9 @@ pub struct TokensUnstakedEvent {
 ///
 /// # Payload
 ///
-/// * `order_id`  — the escrow/order whose metadata was verified.
-/// * `verifier`  — address that submitted the reveal proof.
-/// * `timestamp` — ledger timestamp at verification time.
+/// * `order_id`  â€” the escrow/order whose metadata was verified.
+/// * `verifier`  â€” address that submitted the reveal proof.
+/// * `timestamp` â€” ledger timestamp at verification time.
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -850,7 +850,7 @@ pub struct Metadata {
 ///
 /// `upgrade_at` is the earliest ledger timestamp at which `execute_upgrade` may
 /// run; it equals `proposed_at + wasm_upgrade_cooldown` from `PlatformConfig`.
-/// `proposed_by` records the admin that submitted the proposal — note that the
+/// `proposed_by` records the admin that submitted the proposal â€” note that the
 /// admin role can rotate via the two-step transfer (`update_admin` /
 /// `claim_admin`), so the value reflects the admin at proposal time, not at
 /// execution time. `execute_upgrade` re-checks the *current* admin's auth, so
@@ -902,7 +902,7 @@ pub struct UpgradeRecord {
 /// contract upgrade. This struct gives us a per-token slot keyed by
 /// `DataKey::FeeTokenConfig(token)` that can carry forward additional fields
 /// (e.g. custom_bps overrides, token-specific receivers) without touching the
-/// global storage shape — new fields can be appended as `Option<T>` and read
+/// global storage shape â€” new fields can be appended as `Option<T>` and read
 /// with safe fallbacks.
 ///
 /// # Fields
@@ -988,7 +988,7 @@ pub struct EscrowCreateParams {
 ///
 /// A dispute "expires" when the configured `max_dispute_duration` elapses
 /// without the arbitrator delivering a verdict (see [`PlatformConfig`]).
-/// At that point the escrow must still be unwound — but the platform fee
+/// At that point the escrow must still be unwound â€” but the platform fee
 /// is suddenly ambiguous: nobody won the dispute, so the usual "loser
 /// pays the fee" rule doesn't apply. This enum is the on-chain knob the
 /// admin uses to pick a policy at configuration time.
@@ -1005,7 +1005,7 @@ pub struct EscrowCreateParams {
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 pub enum ExpiredDisputeFeePolicy {
     /// Refund buyer in full, platform collects no fee. The default,
-    /// buyer-friendly policy — the platform absorbs the cost of the
+    /// buyer-friendly policy â€” the platform absorbs the cost of the
     /// arbitrator timing out. Use when buyer goodwill matters more than
     /// covering operational cost on stalled disputes.
     RefundFullNoPlatformFee = 0,
@@ -1016,13 +1016,13 @@ pub enum ExpiredDisputeFeePolicy {
     RefundMinusPlatformFee = 1,
     /// Refund buyer in full, deduct platform fee from the seller's
     /// locked amount. The seller forfeits the fee even though they
-    /// never received payment — use when seller responsibility for
+    /// never received payment â€” use when seller responsibility for
     /// presenting evidence outweighs the cost of forfeiting on a
     /// stalled arbitration.
     DeductFeeFromSeller = 2,
     /// Split the platform fee: half deducted from the buyer's refund,
     /// half from the seller's locked amount. The most "neutral" policy
-    /// — both sides share the cost of the arbitrator timing out.
+    /// â€” both sides share the cost of the arbitrator timing out.
     SplitFee = 3,
 }
 
@@ -1287,7 +1287,7 @@ impl CraftNexusContract {
     /// Panics with `Error::InvalidIpfsHash` if the CID is present but fails `validate_ipfs_cid`.
     ///
     /// # Storage side-effects
-    /// None — this is a pure validation helper with no storage reads or writes.
+    /// None â€” this is a pure validation helper with no storage reads or writes.
     fn validate_optional_ipfs_hash(env: &Env, ipfs_hash: &Option<String>) {
         if let Some(cid) = ipfs_hash {
             if !Self::validate_ipfs_cid(cid) {
@@ -1306,7 +1306,7 @@ impl CraftNexusContract {
     /// Panics with `Error::InvalidMetadataHash` if the hash is present but its length is not exactly 32 bytes.
     ///
     /// # Storage side-effects
-    /// None — this is a pure validation helper with no storage reads or writes.
+    /// None â€” this is a pure validation helper with no storage reads or writes.
     fn validate_optional_metadata_hash(env: &Env, metadata_hash: &Option<Bytes>) {
         if let Some(hash) = metadata_hash {
             if hash.len() != 32 {
@@ -1331,10 +1331,10 @@ impl CraftNexusContract {
     /// admin-gated mutation. Checks are ordered cheapest-first so the
     /// common case (a structurally valid candidate that differs from
     /// the current contract address) returns without touching persistent
-    /// storage at all — a small but consistent gas saving across every
+    /// storage at all â€” a small but consistent gas saving across every
     /// transfer / propose / accept_admin call.
     fn validate_admin_address(env: &Env, admin: &Address) -> Result<(), Error> {
-        // Ensure the address is not the contract's own address — a common
+        // Ensure the address is not the contract's own address â€” a common
         // misconfiguration that would lock the contract out of admin
         // operations forever.
         let contract = env.current_contract_address();
@@ -1369,7 +1369,7 @@ impl CraftNexusContract {
             Self::extend_persistent(env, &DataKey::FallbackAdmin);
             // Emit recovery event for audit trail
             env.events().publish(
-                (Symbol::new(env, "admin_config_recovered"), true),
+                (Symbol::new(env, "admin.config_recovered"), true),
                 String::from_str(env, "Using fallback admin after config corruption detected"),
             );
             // Return a minimal valid config with fallback admin
@@ -1402,7 +1402,7 @@ impl CraftNexusContract {
         change_type: &str,
     ) {
         env.events().publish(
-            (Symbol::new(env, "admin_changed"), change_type.as_bytes()),
+            (Symbol::new(env, "admin.changed"), change_type.as_bytes()),
             (previous_admin, new_admin),
         );
     }
@@ -1425,14 +1425,14 @@ impl CraftNexusContract {
 
     fn emit_escrow_resolved_event(env: &Env, event: EscrowResolvedEvent) {
         env.events().publish(
-            (Symbol::new(env, "escrow_resolved"), event.escrow_id),
+            (Symbol::new(env, "escrow.resolved"), event.escrow_id),
             event,
         );
     }
 
     fn emit_reputation_update(env: &Env, event: ReputationUpdateEvent) {
         env.events().publish(
-            (Symbol::new(env, "reputation_update"), event.address.clone()),
+            (Symbol::new(env, "stake.reputation_update"), event.address.clone()),
             event,
         );
     }
@@ -1445,7 +1445,7 @@ impl CraftNexusContract {
     ) {
         env.events().publish(
             (
-                Symbol::new(env, "config_updated"),
+                Symbol::new(env, "admin.config_updated"),
                 Symbol::new(env, field_name),
             ),
             ConfigUpdatedEvent {
@@ -1459,7 +1459,7 @@ impl CraftNexusContract {
     fn emit_artisan_fee_tier_updated(env: &Env, artisan: Address, fee_bps: u32) {
         env.events().publish(
             (
-                Symbol::new(env, "artisan_fee_tier_updated"),
+                Symbol::new(env, "admin.fee_tier_updated"),
                 artisan.clone(),
             ),
             ArtisanFeeTierUpdatedEvent { artisan, fee_bps },
@@ -1468,7 +1468,7 @@ impl CraftNexusContract {
 
     fn emit_metadata_verified(env: &Env, order_id: u32, verifier: Address) {
         env.events().publish(
-            (Symbol::new(env, "metadata_verified"), (order_id as u64)),
+            (Symbol::new(env, "escrow.metadata_verified"), (order_id as u64)),
             MetadataVerifiedEvent {
                 order_id: order_id as u64,
                 verifier,
@@ -1479,7 +1479,7 @@ impl CraftNexusContract {
 
     fn emit_platform_paused(env: &Env, initiator: Address) {
         env.events().publish(
-            (Symbol::new(env, "platform_paused"), initiator.clone()),
+            (Symbol::new(env, "admin.platform_paused"), initiator.clone()),
             PlatformPausedEvent {
                 initiator,
                 timestamp: env.ledger().timestamp(),
@@ -1489,7 +1489,7 @@ impl CraftNexusContract {
 
     fn emit_platform_unpaused(env: &Env, initiator: Address) {
         env.events().publish(
-            (Symbol::new(env, "platform_unpaused"), initiator.clone()),
+            (Symbol::new(env, "admin.platform_unpaused"), initiator.clone()),
             PlatformUnpausedEvent {
                 initiator,
                 timestamp: env.ledger().timestamp(),
@@ -1500,7 +1500,7 @@ impl CraftNexusContract {
     /// Atomically appends one escrow ID to the indexed global registry and
     /// increments `EscrowCount` (#515 / Issue #226).
     fn update_escrow_indices_atomic(env: &Env, order_id: u32) {
-        // Issue #515 — O(1) indexed append replaces monolithic AllEscrowIds Vec
+        // Issue #515 â€” O(1) indexed append replaces monolithic AllEscrowIds Vec
         // rewrites. Legacy Vec entries are migrated lazily on first touch.
         Self::migrate_legacy_all_escrow_ids(env);
 
@@ -1797,7 +1797,7 @@ impl CraftNexusContract {
     /// Returns an OnboardingClient pointed at the registered onboarding contract,
     /// or None if no address has been configured via set_onboarding_contract.
     ///
-    /// NOTE (#243): callers should NOT invoke methods on this client directly —
+    /// NOTE (#243): callers should NOT invoke methods on this client directly â€”
     /// a malicious or version-skewed onboarding contract could panic and trap
     /// the entire escrow operation, holding user funds hostage. Use the
     /// `safe_update_reputation` / `safe_update_user_metrics` helpers instead;
@@ -1841,7 +1841,7 @@ impl CraftNexusContract {
     /// Returns `Ok(true)` on a successful cross-contract call, `Ok(false)` if
     /// the call failed (so the caller can decide whether to fall back to
     /// emitting events) or no contract is configured. Never panics, never
-    /// propagates the host trap — the escrow flow MUST keep moving even if
+    /// propagates the host trap â€” the escrow flow MUST keep moving even if
     /// the onboarding contract is broken or pointing at a malicious
     /// implementation (#243).
     #[allow(dead_code)]
@@ -1851,7 +1851,7 @@ impl CraftNexusContract {
         successful_delta: u32,
         disputed_delta: u32,
     ) -> bool {
-        // Issue #527 — short-circuit on the no-op call before paying
+        // Issue #527 â€” short-circuit on the no-op call before paying
         // for the persistent storage read of the onboarding contract
         // address. If both reputation deltas are 0 the cross-contract
         // call has no effect; returning `true` here saves a storage
@@ -2001,7 +2001,7 @@ impl CraftNexusContract {
     /// Register the deployed OnboardingContract address so the escrow contract
     /// can make cross-contract reputation / metrics updates (admin only).
     ///
-    /// (#243) Rejects pointing the onboarding contract at the escrow itself —
+    /// (#243) Rejects pointing the onboarding contract at the escrow itself â€”
     /// a self-call would create a re-entrancy hazard if the trait surface ever
     /// expands. Cross-contract calls into the configured address remain
     /// indirect via `safe_update_reputation` / `safe_update_user_metrics`,
@@ -2018,7 +2018,7 @@ impl CraftNexusContract {
 
         let previous = Self::get_onboarding_address(&env);
 
-        // Issue #527 — short-circuit on the no-op call before paying
+        // Issue #527 â€” short-circuit on the no-op call before paying
         // for the persistent storage write and TTL extension.
         if let Some(ref current) = previous {
             if *current == contract_address {
@@ -2046,7 +2046,7 @@ impl CraftNexusContract {
     /// Clear the registered onboarding contract address (admin only) (#243).
     /// After calling this, `get_onboarding_contract` returns
     /// `OnboardingContractNotSet` and the safe cross-contract helpers become
-    /// no-ops — escrow flows continue to emit `ReputationUpdateEvent`s for
+    /// no-ops â€” escrow flows continue to emit `ReputationUpdateEvent`s for
     /// off-chain reconstruction (#211).
     pub fn clear_onboarding_contract(env: Env) -> Result<(), Error> {
         let config = Self::get_platform_config_internal(&env);
@@ -2542,7 +2542,7 @@ impl CraftNexusContract {
             return Err(Error::AdminRecoveryFailed);
         }
 
-        // Check if recovery time lock has passed (#431 — TTL-friendly read)
+        // Check if recovery time lock has passed (#431 â€” TTL-friendly read)
         let recovery_time = Self::get_persistent_u64(&env, &DataKey::AdminRecoveryTime);
 
         let current_time = env.ledger().timestamp();
@@ -2592,7 +2592,7 @@ impl CraftNexusContract {
 
         config.admin = recovered_admin.clone();
         config.pending_admin = None;
-        // Write config to instance storage (primary location) — TTL already extended
+        // Write config to instance storage (primary location) â€” TTL already extended
         // by get_platform_config_internal. No redundant extend_persistent needed.
         env.storage()
             .instance()
@@ -3022,8 +3022,8 @@ impl CraftNexusContract {
     /// of escrows that were actually cancelled.
     ///
     /// # Arguments
-    /// * `admin` – Must be the platform admin address; auth is required.
-    /// * `order_ids` – List of escrow order IDs to check and cancel.
+    /// * `admin` â€“ Must be the platform admin address; auth is required.
+    /// * `order_ids` â€“ List of escrow order IDs to check and cancel.
     pub fn auto_cancel_unfunded(
         env: Env,
         admin: Address,
@@ -3451,7 +3451,7 @@ impl CraftNexusContract {
     /// reconciliation) impossible without a contract upgrade. We now also
     /// write a per-token `FeeTokenConfig(token)` slot, which is the storage
     /// shape new code should read going forward. The legacy Vec is kept as
-    /// the canonical enumeration source for backward compatibility — a
+    /// the canonical enumeration source for backward compatibility â€” a
     /// `migrate_fee_token_configs` admin call backfills `FeeTokenConfig` for
     /// pre-existing tokens.
     fn add_fee_token_to_index(env: &Env, token: &Address) {
@@ -3480,7 +3480,7 @@ impl CraftNexusContract {
     }
 
     /// Seed a default `FeeTokenInfo` slot the first time a token is seen.
-    /// Idempotent — once a slot exists, subsequent calls leave it untouched
+    /// Idempotent â€” once a slot exists, subsequent calls leave it untouched
     /// so admin overrides survive future fee deposits (#239).
     fn ensure_fee_token_config(env: &Env, token: &Address) {
         let cfg_key = DataKey::FeeTokenConfig(token.clone());
@@ -3538,7 +3538,7 @@ impl CraftNexusContract {
     /// Update mutable fields of a `FeeTokenInfo` slot (admin only, #239).
     ///
     /// `active` and `custom_fee_bps` are admin-controlled. `accumulated` is
-    /// IGNORED if passed in — the running total is owned by the contract and
+    /// IGNORED if passed in â€” the running total is owned by the contract and
     /// only `record_total_fees` may move it. This split prevents an admin
     /// from rewriting historical fee accounting via the config setter.
     ///
@@ -3584,7 +3584,7 @@ impl CraftNexusContract {
     /// Backfill `FeeTokenConfig(token)` slots for every token currently
     /// present in the legacy `FeeTokenIndex` Vec (admin only, #239).
     ///
-    /// Idempotent — already-migrated tokens are skipped, so it is safe to
+    /// Idempotent â€” already-migrated tokens are skipped, so it is safe to
     /// call from a deploy script or an automated migration job. Returns the
     /// number of new config slots written so callers can verify progress.
     /// Pairs with `set_fee_token_config` for downstream tuning.
@@ -3763,7 +3763,7 @@ impl CraftNexusContract {
             },
         );
 
-        // Emit reputation update events — decoupled from onboarding contract (#211)
+        // Emit reputation update events â€” decoupled from onboarding contract (#211)
         let ts = env.ledger().timestamp();
         Self::emit_reputation_update(
             &env,
@@ -3859,7 +3859,7 @@ impl CraftNexusContract {
             },
         );
 
-        // Emit reputation update events — decoupled from onboarding contract (#211)
+        // Emit reputation update events â€” decoupled from onboarding contract (#211)
         let ts = env.ledger().timestamp();
         Self::emit_reputation_update(
             &env,
@@ -4056,13 +4056,13 @@ impl CraftNexusContract {
         }
 
         if (distinct_current_approvals.len() as u32) < threshold {
-            // Threshold not yet met — persist partial approvals and return.
+            // Threshold not yet met â€” persist partial approvals and return.
             env.storage().persistent().set(&approvals_key, &approvals);
             Self::extend_persistent(&env, &approvals_key);
             return Ok(());
         }
 
-        // Threshold reached — commit the proposal and clean up approvals.
+        // Threshold reached â€” commit the proposal and clean up approvals.
         env.storage().persistent().remove(&approvals_key);
 
         let config = Self::get_platform_config_internal(&env);
@@ -4243,7 +4243,7 @@ impl CraftNexusContract {
     }
 
     /// Returns the currently pending WASM upgrade proposal, if any (#230).
-    /// Read-only — useful for off-chain monitors and admin dashboards that
+    /// Read-only â€” useful for off-chain monitors and admin dashboards that
     /// need to confirm what `execute_upgrade` will apply.
     pub fn get_upgrade_proposal(env: Env) -> Option<WasmUpgradeProposal> {
         env.storage()
@@ -4290,7 +4290,7 @@ impl CraftNexusContract {
     /// Returns the bounded log of past contract upgrades (#241).
     ///
     /// Newer entries are at the back. The log is capped at
-    /// `MAX_UPGRADE_HISTORY` records — older entries are dropped FIFO so
+    /// `MAX_UPGRADE_HISTORY` records â€” older entries are dropped FIFO so
     /// storage cannot grow unbounded. For long-term audit trails operators
     /// should mirror the `wasm_upgrade` events to off-chain storage.
     pub fn get_upgrade_history(env: Env) -> Vec<UpgradeRecord> {
@@ -4362,7 +4362,7 @@ impl CraftNexusContract {
             },
         );
 
-        // Emit reputation update events — decoupled from onboarding contract (#211)
+        // Emit reputation update events â€” decoupled from onboarding contract (#211)
         let ts = env.ledger().timestamp();
         Self::emit_reputation_update(
             &env,
@@ -4667,7 +4667,7 @@ impl CraftNexusContract {
             },
         );
 
-        // Emit reputation update events — decoupled from onboarding contract (#211)
+        // Emit reputation update events â€” decoupled from onboarding contract (#211)
         let ts = env.ledger().timestamp();
         match resolution {
             Resolution::ReleaseToSeller => {
@@ -5406,7 +5406,7 @@ impl CraftNexusContract {
         config.is_paused
     }
 
-    // ── Tiered Artisan Fees (#98) ───────────────────────────────────
+    // â”€â”€ Tiered Artisan Fees (#98) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Admin assigns a custom fee tier (in basis points) for an artisan.
     pub fn set_artisan_fee_tier(env: Env, artisan: Address, fee_bps: u32) {
@@ -5438,7 +5438,7 @@ impl CraftNexusContract {
         }
     }
 
-    // ── Dispute Resolution Deadline (#93) ───────────────────────────
+    // â”€â”€ Dispute Resolution Deadline (#93) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Resolve a dispute that has exceeded the maximum dispute duration.
     ///
@@ -5559,7 +5559,7 @@ impl CraftNexusContract {
         Ok(())
     }
 
-    // ── Staking Requirement for Artisans (#99) ───────────────────────
+    // â”€â”€ Staking Requirement for Artisans (#99) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Stake tokens to satisfy the platform's minimum stake requirement.
     ///
@@ -5918,7 +5918,7 @@ impl CraftNexusContract {
         Ok(())
     }
 
-    // ── Partial Refund Negotiation (#101) ────────────────────────────
+    // â”€â”€ Partial Refund Negotiation (#101) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Propose a partial refund for a disputed escrow.
     ///
@@ -5978,11 +5978,11 @@ impl CraftNexusContract {
         Ok(())
     }
 
-    // ── Storage Explorer ──────────────────────────────────────
+    // â”€â”€ Storage Explorer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Returns the total number of escrows ever created on this platform.
     ///
-    /// This is an O(1) read — safe to call at any scale. Pair with
+    /// This is an O(1) read â€” safe to call at any scale. Pair with
     /// `get_all_escrow_ids_iterative` to paginate the full ID set without
     /// hitting Soroban CPU/memory resource limits.
     pub fn get_escrow_count(env: Env) -> u32 {
@@ -6011,20 +6011,20 @@ impl CraftNexusContract {
     /// To enumerate storage keys directly via the RPC without calling this function,
     /// use the `getLedgerEntries` method or the experimental `getContractData` cursor
     /// endpoint.  Relevant key patterns:
-    /// - `DataKey::GlobalEscrowIdIndexed(index)` – indexed global escrow ID (#515)
-    /// - `DataKey::EscrowCount`            – u32 total count
-    /// - `DataKey::AllEscrowIds`           – DEPRECATED legacy Vec index
-    /// - `(ESCROW, order_id: u32)`         – individual escrow struct
-    /// - `DataKey::BuyerEscrows(address)`  – DEPRECATED: Legacy Vec<u64> of IDs for a buyer
-    /// - `DataKey::SellerEscrows(address)` – DEPRECATED: Legacy Vec<u64> of IDs for a seller
-    /// - `DataKey::BuyerEscrowIndexed(address, index)` – Indexed storage: u64 escrow ID at position
-    /// - `DataKey::BuyerEscrowCount(address)` – u32 total count of buyer's escrows
-    /// - `DataKey::SellerEscrowIndexed(address, index)` – Indexed storage: u64 escrow ID at position
-    /// - `DataKey::SellerEscrowCount(address)` – u32 total count of seller's escrows
+    /// - `DataKey::GlobalEscrowIdIndexed(index)` â€“ indexed global escrow ID (#515)
+    /// - `DataKey::EscrowCount`            â€“ u32 total count
+    /// - `DataKey::AllEscrowIds`           â€“ DEPRECATED legacy Vec index
+    /// - `(ESCROW, order_id: u32)`         â€“ individual escrow struct
+    /// - `DataKey::BuyerEscrows(address)`  â€“ DEPRECATED: Legacy Vec<u64> of IDs for a buyer
+    /// - `DataKey::SellerEscrows(address)` â€“ DEPRECATED: Legacy Vec<u64> of IDs for a seller
+    /// - `DataKey::BuyerEscrowIndexed(address, index)` â€“ Indexed storage: u64 escrow ID at position
+    /// - `DataKey::BuyerEscrowCount(address)` â€“ u32 total count of buyer's escrows
+    /// - `DataKey::SellerEscrowIndexed(address, index)` â€“ Indexed storage: u64 escrow ID at position
+    /// - `DataKey::SellerEscrowCount(address)` â€“ u32 total count of seller's escrows
     ///
     /// # Arguments
-    /// * `page`  – Zero-indexed page number
-    /// * `limit` – Page size; values above `MAX_BATCH_SIZE` are silently capped
+    /// * `page`  â€“ Zero-indexed page number
+    /// * `limit` â€“ Page size; values above `MAX_BATCH_SIZE` are silently capped
     ///
     /// # Returns
     /// A `Vec<u32>` of escrow IDs for the requested page; empty when `page` is out of range.
@@ -6399,7 +6399,7 @@ impl CraftNexusContract {
             },
         );
 
-        // Emit reputation update events — decoupled from onboarding contract (#211)
+        // Emit reputation update events â€” decoupled from onboarding contract (#211)
         let ts = env.ledger().timestamp();
         Self::emit_reputation_update(
             &env,
