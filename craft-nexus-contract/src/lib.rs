@@ -1432,7 +1432,10 @@ impl CraftNexusContract {
 
     fn emit_reputation_update(env: &Env, event: ReputationUpdateEvent) {
         env.events().publish(
-            (Symbol::new(env, "stake.reputation_update"), event.address.clone()),
+            (
+                Symbol::new(env, "stake.reputation_update"),
+                event.address.clone(),
+            ),
             event,
         );
     }
@@ -1458,17 +1461,17 @@ impl CraftNexusContract {
 
     fn emit_artisan_fee_tier_updated(env: &Env, artisan: Address, fee_bps: u32) {
         env.events().publish(
-            (
-                Symbol::new(env, "admin.fee_tier_updated"),
-                artisan.clone(),
-            ),
+            (Symbol::new(env, "admin.fee_tier_updated"), artisan.clone()),
             ArtisanFeeTierUpdatedEvent { artisan, fee_bps },
         );
     }
 
     fn emit_metadata_verified(env: &Env, order_id: u32, verifier: Address) {
         env.events().publish(
-            (Symbol::new(env, "escrow.metadata_verified"), (order_id as u64)),
+            (
+                Symbol::new(env, "escrow.metadata_verified"),
+                (order_id as u64),
+            ),
             MetadataVerifiedEvent {
                 order_id: order_id as u64,
                 verifier,
@@ -1489,7 +1492,10 @@ impl CraftNexusContract {
 
     fn emit_platform_unpaused(env: &Env, initiator: Address) {
         env.events().publish(
-            (Symbol::new(env, "admin.platform_unpaused"), initiator.clone()),
+            (
+                Symbol::new(env, "admin.platform_unpaused"),
+                initiator.clone(),
+            ),
             PlatformUnpausedEvent {
                 initiator,
                 timestamp: env.ledger().timestamp(),
@@ -1794,17 +1800,18 @@ impl CraftNexusContract {
             .get::<DataKey, Address>(&DataKey::OnboardingContractAddress)
     }
 
-    /// Returns an OnboardingClient pointed at the registered onboarding contract,
-    /// or None if no address has been configured via set_onboarding_contract.
+    /// Build a client for the configured onboarding contract, if one is set.
     ///
-    /// NOTE (#243): callers should NOT invoke methods on this client directly â€”
-    /// a malicious or version-skewed onboarding contract could panic and trap
-    /// the entire escrow operation, holding user funds hostage. Use the
-    /// `safe_update_reputation` / `safe_update_user_metrics` helpers instead;
-    /// they wrap calls in `try_invoke_contract` and degrade gracefully on
-    /// failure. Reputation tracking is also emitted as events
-    /// (`ReputationUpdateEvent`) so off-chain consumers can recover state if
-    /// the cross-contract call fails (#211).
+    /// This helper is used by the escrow contract’s safe cross-contract
+    /// integration so onboarding updates remain behind a single, explicit
+    /// entry point instead of being spread across ad-hoc address lookups.
+    fn get_onboarding_client(env: &Env) -> Option<(Address, OnboardingClient<'_>)> {
+        Self::get_onboarding_address(env).map(|address| {
+            let client = OnboardingClient::new(env, &address);
+            (address, client)
+        })
+    }
+
     /// Public read-only accessor for the registered onboarding contract
     /// address. Returns `OnboardingContractNotSet` rather than `None` so that
     /// SDK clients receive a typed error instead of a silent unwrap on a
@@ -1861,18 +1868,19 @@ impl CraftNexusContract {
             return true;
         }
 
-        let onboarding = match Self::get_onboarding_address(env) {
-            Some(a) => a,
+        let (onboarding_address, onboarding) = match Self::get_onboarding_client(env) {
+            Some(client) => client,
             None => return false,
         };
 
         let method = Symbol::new(env, "update_reputation");
         let args: Vec<Val> = (address.clone(), successful_delta, disputed_delta).into_val(env);
 
-        match env.try_invoke_contract::<(), soroban_sdk::Error>(&onboarding, &method, args) {
+        match env.try_invoke_contract::<(), soroban_sdk::Error>(&onboarding_address, &method, args)
+        {
             Ok(Ok(())) => true,
             _ => {
-                Self::emit_onboarding_call_failed(env, method, onboarding);
+                Self::emit_onboarding_call_failed(env, method, onboarding_address);
                 false
             }
         }
@@ -1889,8 +1897,8 @@ impl CraftNexusContract {
         volume_delta: i128,
         token_address: Address,
     ) -> bool {
-        let onboarding = match Self::get_onboarding_address(env) {
-            Some(a) => a,
+        let (onboarding_address, _onboarding) = match Self::get_onboarding_client(env) {
+            Some(client) => client,
             None => return false,
         };
 
@@ -1903,10 +1911,11 @@ impl CraftNexusContract {
         )
             .into_val(env);
 
-        match env.try_invoke_contract::<(), soroban_sdk::Error>(&onboarding, &method, args) {
+        match env.try_invoke_contract::<(), soroban_sdk::Error>(&onboarding_address, &method, args)
+        {
             Ok(Ok(())) => true,
             _ => {
-                Self::emit_onboarding_call_failed(env, method, onboarding);
+                Self::emit_onboarding_call_failed(env, method, onboarding_address);
                 false
             }
         }
@@ -1918,18 +1927,19 @@ impl CraftNexusContract {
             return true;
         }
 
-        let onboarding = match Self::get_onboarding_address(env) {
-            Some(a) => a,
+        let (onboarding_address, _onboarding) = match Self::get_onboarding_client(env) {
+            Some(client) => client,
             None => return false,
         };
 
         let method = Symbol::new(env, "update_active_contracts");
         let args: Vec<Val> = (user.clone(), delta).into_val(env);
 
-        match env.try_invoke_contract::<(), soroban_sdk::Error>(&onboarding, &method, args) {
+        match env.try_invoke_contract::<(), soroban_sdk::Error>(&onboarding_address, &method, args)
+        {
             Ok(Ok(())) => true,
             _ => {
-                Self::emit_onboarding_call_failed(env, method, onboarding);
+                Self::emit_onboarding_call_failed(env, method, onboarding_address);
                 false
             }
         }
@@ -4050,7 +4060,8 @@ impl CraftNexusContract {
         // threshold if the signer list changes while approvals are pending.
         let mut distinct_current_approvals: Vec<Address> = Vec::new(&env);
         for a in approvals.iter() {
-            if signers.iter().any(|s| s == a) && !distinct_current_approvals.iter().any(|d| d == a) {
+            if signers.iter().any(|s| s == a) && !distinct_current_approvals.iter().any(|d| d == a)
+            {
                 distinct_current_approvals.push_back(a.clone());
             }
         }
