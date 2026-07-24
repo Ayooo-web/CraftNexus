@@ -5074,8 +5074,11 @@ impl CraftNexusContract {
     /// Create multiple escrows in a batch operation (Issue #111: Optimized)
     ///
     /// Validates all escrows first before processing any to ensure atomic behavior.
+    /// Authorization model:
+    /// - Every distinct buyer in the batch must provide an authorization signature
+    /// - This prevents a single transaction from creating escrows on behalf of
+    ///   buyers who did not approve the operation
     /// Optimizations:
-    /// - Single authorization check for batch caller
     /// - Consolidated storage updates for buyer/seller escrow lists
     /// - Batch size limit to prevent resource exhaustion
     ///
@@ -5124,9 +5127,19 @@ impl CraftNexusContract {
             return Ok(results);
         }
 
-        // Issue #111: Single authorization check - require auth from first buyer only
-        let first_params = escrows.get(0).expect("");
-        first_params.buyer.require_auth();
+        // Issue #606: Require authorization from every distinct buyer in the batch.
+        // This prevents a single transaction from creating escrows on behalf of
+        // buyers who did not sign the operation.
+        let mut authorized_buyers: Map<Address, u32> = Map::new(&env);
+        for i in 0..escrows.len() {
+            if let Some(params) = escrows.get(i) {
+                let buyer_key = params.buyer.clone();
+                if !authorized_buyers.contains_key(buyer_key.clone()) {
+                    buyer_key.require_auth();
+                    authorized_buyers.set(buyer_key, 1u32);
+                }
+            }
+        }
 
         // Issue #111: Validate all first (single pass)
         for i in 0..escrows.len() {
