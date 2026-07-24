@@ -5074,8 +5074,11 @@ impl CraftNexusContract {
     /// Create multiple escrows in a batch operation (Issue #111: Optimized)
     ///
     /// Validates all escrows first before processing any to ensure atomic behavior.
+    /// Authorization model:
+    /// - Every distinct buyer in the batch must provide an authorization signature
+    /// - This prevents a single transaction from creating escrows on behalf of
+    ///   buyers who did not approve the operation
     /// Optimizations:
-    /// - Single authorization check for batch caller
     /// - Consolidated storage updates for buyer/seller escrow lists
     /// - Batch size limit to prevent resource exhaustion
     ///
@@ -5124,9 +5127,19 @@ impl CraftNexusContract {
             return Ok(results);
         }
 
-        // Issue #111: Single authorization check - require auth from first buyer only
-        let first_params = escrows.get(0).expect("");
-        first_params.buyer.require_auth();
+        // Issue #606: Require authorization from every distinct buyer in the batch.
+        // This prevents a single transaction from creating escrows on behalf of
+        // buyers who did not sign the operation.
+        let mut authorized_buyers: Map<Address, u32> = Map::new(&env);
+        for i in 0..escrows.len() {
+            if let Some(params) = escrows.get(i) {
+                let buyer_key = params.buyer.clone();
+                if !authorized_buyers.contains_key(buyer_key.clone()) {
+                    buyer_key.require_auth();
+                    authorized_buyers.set(buyer_key, 1u32);
+                }
+            }
+        }
 
         // Issue #111: Validate all first (single pass)
         for i in 0..escrows.len() {
@@ -5136,11 +5149,37 @@ impl CraftNexusContract {
         }
 
         // Issue #111: Collect buyer/seller updates to consolidate storage writes
-        // Using indexed storage for scalability
-        let mut buyer_counts: Map<Address, u32> = Map::new(&env);
-        let mut seller_counts: Map<Address, u32> = Map::new(&env);
+        // Using indexed storage for scalability. Precompute the starting counts for
+        // each buyer/seller once so the batch creation loop can reuse that state
+        // without repeatedly re-reading the same count map while populating indices.
+        let mut buyer_count_state: Map<Address, u32> = Map::new(&env);
+        let mut seller_count_state: Map<Address, u32> = Map::new(&env);
 
-        // Create all escrows
+        for i in 0..escrows.len() {
+            if let Some(params) = escrows.get(i) {
+                let buyer_key = params.buyer.clone();
+                let seller_key = params.seller.clone();
+
+                if !buyer_count_state.contains_key(buyer_key.clone()) {
+                    let count_key = DataKey::BuyerEscrowCount(buyer_key.clone());
+                    let existing_count: u32 =
+                        env.storage().persistent().get(&count_key).unwrap_or(0u32);
+                    buyer_count_state.set(buyer_key.clone(), existing_count);
+                }
+
+                if !seller_count_state.contains_key(seller_key.clone()) {
+                    let count_key = DataKey::SellerEscrowCount(seller_key.clone());
+                    let existing_count: u32 =
+                        env.storage().persistent().get(&count_key).unwrap_or(0u32);
+                    seller_count_state.set(seller_key.clone(), existing_count);
+                }
+            }
+        }
+
+        let mut buyer_next_counts: Map<Address, u32> = Map::new(&env);
+        let mut seller_next_counts: Map<Address, u32> = Map::new(&env);
+
+        // Create all escrows using the precomputed count state.
         for i in 0..escrows.len() {
             if let Some(params) = escrows.get(i) {
                 match Self::create_single_escrow(&env, params.clone(), Some(batch_id)) {
@@ -5148,14 +5187,13 @@ impl CraftNexusContract {
                         let buyer_key = params.buyer.clone();
                         let seller_key = params.seller.clone();
 
-                        // Track buyer counts for indexed storage
-                        if !buyer_counts.contains_key(buyer_key.clone()) {
-                            let count_key = DataKey::BuyerEscrowCount(buyer_key.clone());
-                            let existing_count: u32 =
-                                env.storage().persistent().get(&count_key).unwrap_or(0u32);
-                            buyer_counts.set(buyer_key.clone(), existing_count);
+                        if !buyer_next_counts.contains_key(buyer_key.clone()) {
+                            let existing_count = buyer_count_state
+                                .get(buyer_key.clone())
+                                .unwrap_or(0u32);
+                            buyer_next_counts.set(buyer_key.clone(), existing_count);
                         }
-                        let buyer_count = buyer_counts.get(buyer_key.clone()).unwrap();
+                        let buyer_count = buyer_next_counts.get(buyer_key.clone()).unwrap();
 
                         // Store escrow ID at indexed position
                         let buyer_index_key =
@@ -5163,16 +5201,15 @@ impl CraftNexusContract {
                         env.storage().persistent().set(&buyer_index_key, &id);
                         Self::extend_persistent(&env, &buyer_index_key);
 
-                        buyer_counts.set(buyer_key, buyer_count + 1);
+                        buyer_next_counts.set(buyer_key, buyer_count + 1);
 
-                        // Track seller counts for indexed storage
-                        if !seller_counts.contains_key(seller_key.clone()) {
-                            let count_key = DataKey::SellerEscrowCount(seller_key.clone());
-                            let existing_count: u32 =
-                                env.storage().persistent().get(&count_key).unwrap_or(0u32);
-                            seller_counts.set(seller_key.clone(), existing_count);
+                        if !seller_next_counts.contains_key(seller_key.clone()) {
+                            let existing_count = seller_count_state
+                                .get(seller_key.clone())
+                                .unwrap_or(0u32);
+                            seller_next_counts.set(seller_key.clone(), existing_count);
                         }
-                        let seller_count = seller_counts.get(seller_key.clone()).unwrap();
+                        let seller_count = seller_next_counts.get(seller_key.clone()).unwrap();
 
                         // Store escrow ID at indexed position
                         let seller_index_key =
@@ -5180,7 +5217,7 @@ impl CraftNexusContract {
                         env.storage().persistent().set(&seller_index_key, &id);
                         Self::extend_persistent(&env, &seller_index_key);
 
-                        seller_counts.set(seller_key, seller_count + 1);
+                        seller_next_counts.set(seller_key, seller_count + 1);
 
                         // Emit batch event
                         let escrow_opt: Option<Escrow> =
@@ -5211,11 +5248,11 @@ impl CraftNexusContract {
         // Issue #111: Consolidate all storage updates at once
         let mut i = 0;
         loop {
-            if i >= buyer_counts.len() {
+            if i >= buyer_next_counts.len() {
                 break;
             }
-            if let Some(buyer_addr) = buyer_counts.keys().get(i) {
-                if let Some(final_count) = buyer_counts.get(buyer_addr.clone()) {
+            if let Some(buyer_addr) = buyer_next_counts.keys().get(i) {
+                if let Some(final_count) = buyer_next_counts.get(buyer_addr.clone()) {
                     let count_key = DataKey::BuyerEscrowCount(buyer_addr.clone());
                     env.storage().persistent().set(&count_key, &final_count);
                     Self::extend_persistent(&env, &count_key);
@@ -5226,11 +5263,11 @@ impl CraftNexusContract {
 
         let mut i = 0;
         loop {
-            if i >= seller_counts.len() {
+            if i >= seller_next_counts.len() {
                 break;
             }
-            if let Some(seller_addr) = seller_counts.keys().get(i) {
-                if let Some(final_count) = seller_counts.get(seller_addr.clone()) {
+            if let Some(seller_addr) = seller_next_counts.keys().get(i) {
+                if let Some(final_count) = seller_next_counts.get(seller_addr.clone()) {
                     let count_key = DataKey::SellerEscrowCount(seller_addr.clone());
                     env.storage().persistent().set(&count_key, &final_count);
                     Self::extend_persistent(&env, &count_key);
@@ -5716,9 +5753,14 @@ impl CraftNexusContract {
             }
         }
 
-        // Update count to reflect pruned queue
-        env.storage().persistent().set(&count_key, &write_index);
-        Self::extend_persistent(env, &count_key);
+        // Update count to reflect pruned queue. If nothing remains, remove the
+        // count entry rather than leaving a stale counter behind.
+        if write_index > 0 {
+            env.storage().persistent().set(&count_key, &write_index);
+            Self::extend_persistent(env, &count_key);
+        } else {
+            env.storage().persistent().remove(&count_key);
+        }
     }
 
     /// Unstake previously staked tokens after the cooldown period has elapsed.

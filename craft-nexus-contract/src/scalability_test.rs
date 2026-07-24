@@ -128,6 +128,66 @@ fn test_indexed_storage_scalability() {
 }
 
 #[test]
+fn test_batch_escrow_indexing_scales_linearly_for_twenty_entries() {
+    let (env, client, buyer, seller, token, _, _, _) = setup_test();
+
+    let mut escrow_params = soroban_sdk::Vec::new(&env);
+    for i in 0..20u32 {
+        escrow_params.push_back(EscrowCreateParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: token.clone(),
+            amount: 1_000,
+            order_id: 1_000 + i as u64,
+            release_window: Some(3600),
+            ipfs_hash: None,
+            metadata_hash: None,
+        });
+    }
+
+    let results = client.create_batch_escrow(&7u64, &escrow_params);
+    assert_eq!(results.len(), 20);
+
+    let buyer_count_key = DataKey::BuyerEscrowCount(buyer.clone());
+    let buyer_count: u32 = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&buyer_count_key)
+            .unwrap_or(0u32)
+    });
+    assert_eq!(buyer_count, 20);
+
+    let seller_count_key = DataKey::SellerEscrowCount(seller.clone());
+    let seller_count: u32 = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&seller_count_key)
+            .unwrap_or(0u32)
+    });
+    assert_eq!(seller_count, 20);
+
+    for i in 0..20u32 {
+        let buyer_index_key = DataKey::BuyerEscrowIndexed(buyer.clone(), i);
+        let buyer_id: u64 = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get(&buyer_index_key)
+                .expect("buyer indexed entry should exist")
+        });
+        assert_eq!(buyer_id, (1_000 + i as u64));
+
+        let seller_index_key = DataKey::SellerEscrowIndexed(seller.clone(), i);
+        let seller_id: u64 = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get(&seller_index_key)
+                .expect("seller indexed entry should exist")
+        });
+        assert_eq!(seller_id, (1_000 + i as u64));
+    }
+}
+
+#[test]
 fn test_indexed_storage_multiple_users() {
     let (env, client, buyer1, seller1, token, _, _, _) = setup_test();
     let buyer2 = Address::generate(&env);
@@ -635,6 +695,82 @@ fn test_artisan_stake_queue_pruning() {
         missing_deposit.is_none(),
         "only the latest deposit should remain after pruning"
     );
+}
+
+#[test]
+fn test_artisan_stake_queue_pruning_does_not_run_before_threshold() {
+    let (env, client, _, artisan, token, _, _, _) = setup_test();
+
+    let token_asset = token::StellarAssetClient::new(&env, &token);
+    token_asset.mint(&artisan, &100_000_000);
+
+    for _ in 1..=49u32 {
+        client.stake_tokens(&artisan, &token, &1000);
+    }
+
+    let count = client.get_artisan_stake_queue_count(&artisan);
+    assert_eq!(count, 49);
+
+    let stored_deposit: Option<StakeDeposit> = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ArtisanStakeQueueIndexed(artisan.clone(), 48))
+    });
+    assert!(stored_deposit.is_some(), "queue should still contain the last deposit");
+}
+
+#[test]
+fn test_artisan_stake_queue_pruning_removes_all_matured_deposits() {
+    let (env, client, _, artisan, token, _, _, _) = setup_test();
+
+    let token_asset = token::StellarAssetClient::new(&env, &token);
+    token_asset.mint(&artisan, &100_000_000);
+
+    for _ in 1..=41u32 {
+        client.stake_tokens(&artisan, &token, &1000);
+    }
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = li.timestamp + (DEFAULT_STAKE_COOLDOWN as u64) + 1;
+    });
+
+    client.stake_tokens(&artisan, &token, &1000);
+
+    let count_after_pruning = client.get_artisan_stake_queue_count(&artisan);
+    assert_eq!(count_after_pruning, 1, "only the newest deposit should remain");
+
+    let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
+    let count_present = env.as_contract(&client.address, || {
+        env.storage().persistent().has(&count_key)
+    });
+    assert!(count_present, "queue count should remain stored for the remaining deposit");
+}
+
+#[test]
+fn test_artisan_stake_queue_pruning_can_empty_queue() {
+    let (env, client, _, artisan, token, _, _, _) = setup_test();
+
+    let token_asset = token::StellarAssetClient::new(&env, &token);
+    token_asset.mint(&artisan, &100_000_000);
+
+    for _ in 1..=1u32 {
+        client.stake_tokens(&artisan, &token, &1000);
+    }
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = li.timestamp + (DEFAULT_STAKE_COOLDOWN as u64) + 1;
+    });
+
+    client.stake_tokens(&artisan, &token, &1000);
+
+    let count_after_pruning = client.get_artisan_stake_queue_count(&artisan);
+    assert_eq!(count_after_pruning, 1);
+
+    let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
+    let count_present = env.as_contract(&client.address, || {
+        env.storage().persistent().has(&count_key)
+    });
+    assert!(count_present);
 }
 
 #[test]

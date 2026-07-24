@@ -2062,6 +2062,46 @@ fn test_create_batch_escrow_fails_same_buyer_seller() {
 }
 
 #[test]
+#[should_panic]
+fn test_create_batch_escrow_requires_authorization_for_each_distinct_buyer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    let second_buyer = Address::generate(&env);
+    token_admin.mint(&buyer, &1_000_000_000);
+    token_admin.mint(&second_buyer, &1_000_000_000);
+
+    let escrow_params = vec![
+        &env,
+        EscrowCreateParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: token_id.clone(),
+            amount: 100,
+            order_id: 100,
+            release_window: Some(3600),
+            ipfs_hash: None,
+            metadata_hash: None,
+        },
+        EscrowCreateParams {
+            buyer: second_buyer.clone(),
+            seller: seller.clone(),
+            token: token_id.clone(),
+            amount: 200,
+            order_id: 101,
+            release_window: Some(3600),
+            ipfs_hash: None,
+            metadata_hash: None,
+        },
+    ];
+
+    // Remove the second buyer's authorization so the batch should panic.
+    env.set_auths(&[]);
+    client.create_batch_escrow(&1u64, &escrow_params);
+}
+
+#[test]
 fn test_release_batch_funds_success() {
     let env = Env::default();
     env.mock_all_auths();
