@@ -5740,9 +5740,14 @@ impl CraftNexusContract {
             }
         }
 
-        // Update count to reflect pruned queue
-        env.storage().persistent().set(&count_key, &write_index);
-        Self::extend_persistent(env, &count_key);
+        // Update count to reflect pruned queue. If nothing remains, remove the
+        // count entry rather than leaving a stale counter behind.
+        if write_index > 0 {
+            env.storage().persistent().set(&count_key, &write_index);
+            Self::extend_persistent(env, &count_key);
+        } else {
+            env.storage().persistent().remove(&count_key);
+        }
     }
 
     /// Unstake previously staked tokens after the cooldown period has elapsed.

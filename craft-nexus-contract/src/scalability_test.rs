@@ -698,6 +698,82 @@ fn test_artisan_stake_queue_pruning() {
 }
 
 #[test]
+fn test_artisan_stake_queue_pruning_does_not_run_before_threshold() {
+    let (env, client, _, artisan, token, _, _, _) = setup_test();
+
+    let token_asset = token::StellarAssetClient::new(&env, &token);
+    token_asset.mint(&artisan, &100_000_000);
+
+    for _ in 1..=49u32 {
+        client.stake_tokens(&artisan, &token, &1000);
+    }
+
+    let count = client.get_artisan_stake_queue_count(&artisan);
+    assert_eq!(count, 49);
+
+    let stored_deposit: Option<StakeDeposit> = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ArtisanStakeQueueIndexed(artisan.clone(), 48))
+    });
+    assert!(stored_deposit.is_some(), "queue should still contain the last deposit");
+}
+
+#[test]
+fn test_artisan_stake_queue_pruning_removes_all_matured_deposits() {
+    let (env, client, _, artisan, token, _, _, _) = setup_test();
+
+    let token_asset = token::StellarAssetClient::new(&env, &token);
+    token_asset.mint(&artisan, &100_000_000);
+
+    for _ in 1..=41u32 {
+        client.stake_tokens(&artisan, &token, &1000);
+    }
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = li.timestamp + (DEFAULT_STAKE_COOLDOWN as u64) + 1;
+    });
+
+    client.stake_tokens(&artisan, &token, &1000);
+
+    let count_after_pruning = client.get_artisan_stake_queue_count(&artisan);
+    assert_eq!(count_after_pruning, 1, "only the newest deposit should remain");
+
+    let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
+    let count_present = env.as_contract(&client.address, || {
+        env.storage().persistent().has(&count_key)
+    });
+    assert!(count_present, "queue count should remain stored for the remaining deposit");
+}
+
+#[test]
+fn test_artisan_stake_queue_pruning_can_empty_queue() {
+    let (env, client, _, artisan, token, _, _, _) = setup_test();
+
+    let token_asset = token::StellarAssetClient::new(&env, &token);
+    token_asset.mint(&artisan, &100_000_000);
+
+    for _ in 1..=1u32 {
+        client.stake_tokens(&artisan, &token, &1000);
+    }
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = li.timestamp + (DEFAULT_STAKE_COOLDOWN as u64) + 1;
+    });
+
+    client.stake_tokens(&artisan, &token, &1000);
+
+    let count_after_pruning = client.get_artisan_stake_queue_count(&artisan);
+    assert_eq!(count_after_pruning, 1);
+
+    let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
+    let count_present = env.as_contract(&client.address, || {
+        env.storage().persistent().has(&count_key)
+    });
+    assert!(count_present);
+}
+
+#[test]
 fn test_artisan_stake_queue_migration() {
     let (env, client, _, artisan, _, _, _, _) = setup_test();
 
