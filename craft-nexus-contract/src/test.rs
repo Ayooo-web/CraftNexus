@@ -103,11 +103,12 @@ fn test_create_escrow_success() {
     let last_event = events.last().unwrap();
     assert_eq!(last_event.0, client.address);
     let last_event = events.last();
-    assert_eq!(last_event.clone().unwrap().0, client.address);
-    assert_eq!(last_event.clone().unwrap().0, client.address);
+    let last_event = last_event.unwrap();
+    assert_eq!(last_event.0, client.address);
+    assert_eq!(last_event.0, client.address);
     // Topics: ["escrow_created", escrow_id]
     assert_eq!(
-        last_event.clone().unwrap().1,
+        last_event.1,
         vec![
             &env,
             Symbol::new(&env, "escrow").into_val(&env),
@@ -115,7 +116,7 @@ fn test_create_escrow_success() {
         ]
     );
     // Verify payload
-    let event: EscrowEvent = last_event.unwrap().2.try_into_val(&env).unwrap();
+    let event: EscrowEvent = last_event.2.try_into_val(&env).unwrap();
     assert_eq!(event.escrow_id, order_id as u64);
     assert_eq!(event.action, EscrowAction::Created);
     assert_eq!(event.buyer, buyer);
@@ -724,8 +725,8 @@ fn test_update_platform_fee() {
     let events = env.events().all();
     let last_event = events.last().unwrap();
     let _config_event: ConfigUpdatedEvent = last_event.2.try_into_val(&env).unwrap();
-    let last_event = events.last();
-    let config_event: ConfigUpdatedEvent = last_event.unwrap().2.try_into_val(&env).unwrap();
+    let last_event = events.last().unwrap();
+    let config_event: ConfigUpdatedEvent = last_event.2.try_into_val(&env).unwrap();
     assert_eq!(
         config_event.field_name,
         Symbol::new(&env, "platform_fee_bps")
@@ -1201,7 +1202,9 @@ fn test_repropose_succeeds_after_cancel_cooldown_elapses() {
 
     // Re-proposing after the cooldown must succeed
     client.propose_upgrade_wasm(&admin, &hash);
-    let proposal = client.get_upgrade_proposal().expect("proposal should exist");
+    let proposal = client
+        .get_upgrade_proposal()
+        .expect("proposal should exist");
     assert_eq!(proposal.wasm_hash, hash);
 }
 
@@ -1596,8 +1599,8 @@ fn test_set_min_escrow_amount_emits_config_event() {
     let events = env.events().all();
     let last_event = events.last().unwrap();
     let _config_event: ConfigUpdatedEvent = last_event.2.try_into_val(&env).unwrap();
-    let last_event = events.last();
-    let config_event: ConfigUpdatedEvent = last_event.unwrap().2.try_into_val(&env).unwrap();
+    let last_event = events.last().unwrap();
+    let config_event: ConfigUpdatedEvent = last_event.2.try_into_val(&env).unwrap();
 
     assert_eq!(
         config_event.field_name,
@@ -2595,6 +2598,23 @@ fn test_set_onboarding_contract_same_address_skips_storage_write() {
     assert_eq!(client.get_onboarding_contract(), new_onboarding);
 }
 
+#[test]
+fn test_get_onboarding_client_uses_configured_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    assert!(CraftNexusContract::get_onboarding_client(&env).is_none());
+
+    let onboarding = Address::generate(&env);
+    client.set_onboarding_contract(&onboarding);
+
+    let configured = CraftNexusContract::get_onboarding_client(&env);
+    assert!(configured.is_some());
+    let (address, _client) = configured.unwrap();
+    assert_eq!(address, onboarding);
+}
+
 /// When no onboarding contract is set, release_funds completes without error.
 #[test]
 fn test_release_funds_no_onboarding_contract() {
@@ -3009,8 +3029,8 @@ fn test_migrate_fee_token_configs_is_idempotent_and_preserves_existing_configs()
     }
 
     let events = env.events().all();
-    let latest_summary: FeeTokenConfigsMigratedEvent =
-        events.last().unwrap().2.try_into_val(&env).unwrap();
+    let latest_event = events.last().unwrap();
+    let latest_summary: FeeTokenConfigsMigratedEvent = latest_event.2.try_into_val(&env).unwrap();
     assert_eq!(
         latest_summary,
         FeeTokenConfigsMigratedEvent {
@@ -3684,7 +3704,9 @@ fn test_legacy_all_escrow_ids_migrates_on_get_escrow_count() {
     });
     assert_eq!(stored_count, 4);
 
-    let has_legacy = env.as_contract(&client.address, || env.storage().persistent().has(&legacy_key));
+    let has_legacy = env.as_contract(&client.address, || {
+        env.storage().persistent().has(&legacy_key)
+    });
     assert!(!has_legacy);
 
     for (index, expected_id) in [11u32, 22, 33, 44].into_iter().enumerate() {
@@ -3724,7 +3746,9 @@ fn test_legacy_all_escrow_ids_migrates_on_iterative_read() {
     });
     assert_eq!(stored_count, 5);
 
-    let has_legacy = env.as_contract(&client.address, || env.storage().persistent().has(&legacy_key));
+    let has_legacy = env.as_contract(&client.address, || {
+        env.storage().persistent().has(&legacy_key)
+    });
     assert!(!has_legacy);
 }
 
@@ -3751,7 +3775,9 @@ fn test_legacy_all_escrow_ids_migration_is_idempotent_after_first_read() {
     assert_eq!(first_page, second_page);
     assert_eq!(client.get_escrow_count(), 3);
 
-    let has_legacy = env.as_contract(&client.address, || env.storage().persistent().has(&legacy_key));
+    let has_legacy = env.as_contract(&client.address, || {
+        env.storage().persistent().has(&legacy_key)
+    });
     assert!(!has_legacy);
 
     for (index, expected_id) in [5u32, 15, 25].into_iter().enumerate() {
@@ -3809,7 +3835,9 @@ fn test_legacy_all_escrow_ids_migration_preserves_existing_indexed_entries() {
     assert_eq!(second_id, 20u32);
     assert_eq!(third_id, 30u32);
 
-    let has_legacy = env.as_contract(&client.address, || env.storage().persistent().has(&legacy_key));
+    let has_legacy = env.as_contract(&client.address, || {
+        env.storage().persistent().has(&legacy_key)
+    });
     assert!(!has_legacy);
 }
 
@@ -4331,7 +4359,11 @@ fn test_get_escrows_pagination_large_dataset() {
 
     // page_size capped at MAX_PAGE_SIZE (100): requesting 200 returns only 100
     let capped = client.get_escrows_by_buyer(&buyer, &0, &200, &false);
-    assert_eq!(capped.len(), 100, "page_size should be capped at MAX_PAGE_SIZE=100");
+    assert_eq!(
+        capped.len(),
+        100,
+        "page_size should be capped at MAX_PAGE_SIZE=100"
+    );
 
     // Verify seller pagination returns same count
     let seller_page0 = client.get_escrows_by_seller(&seller, &0, &50, &false);

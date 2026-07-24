@@ -86,8 +86,6 @@ use soroban_sdk::{
     Symbol, TryFromVal, Val, Vec,
 };
 
-
-
 /// Standard TTL threshold for persistent storage (approx 14 hours at 5s ledger)
 const TTL_THRESHOLD: u32 = 10_000;
 const READ_TTL_THRESHOLD: u32 = 1_000;
@@ -1919,7 +1917,10 @@ impl OnboardingContract {
         if let Some(escrow_contract) = config.escrow_contract {
             let escrow_client = EscrowClient::new(&env, &escrow_contract);
             let escrow_config = escrow_client.get_platform_config();
-            assert!(!escrow_config.is_paused, "Platform is paused - onboarding disabled");
+            assert!(
+                !escrow_config.is_paused,
+                "Platform is paused - onboarding disabled"
+            );
         }
 
         // [SECURITY] Endpoint #93: Only verified platform roles may approve new user
@@ -2500,7 +2501,6 @@ impl OnboardingContract {
             env.panic_with_error(Error::ProfileDeactivated);
         }
 
-        // Replace the old to_string().as_ref() line with this:
         let username_string = String::from_str(&env, profile.username.to_string().as_ref());
         let normalized = normalize_username(&env, &username_string);
         if normalized == String::from_str(&env, "admin") {
@@ -2600,7 +2600,6 @@ impl OnboardingContract {
         }
 
         // Re-claim username — fail if another user took it while deactivated
-        // Replace the old to_string().as_ref() line with this:
         let username_string = String::from_str(&env, profile.username.to_string().as_ref());
         let normalized = normalize_username(&env, &username_string);
         if env
