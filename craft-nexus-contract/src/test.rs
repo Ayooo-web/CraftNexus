@@ -4484,3 +4484,279 @@ fn test_get_escrows_pagination_large_dataset() {
     let seller_page1 = client.get_escrows_by_seller(&seller, &1, &50, &false);
     assert_eq!(seller_page1.len(), 50, "seller page1 should have 50 items");
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #725 – Arbitrator blacklist tests
+//
+// These tests verify that:
+//   1. A blacklisted arbitrator is blocked from calling `resolve_dispute`.
+//   2. A blacklisted moderator is blocked from calling `resolve_dispute`.
+//   3. The admin is NEVER blocked, regardless of the blacklist.
+//   4. Removing an address from the blacklist restores the ability to resolve.
+//   5. `is_arbitrator_blacklisted` returns the correct state.
+//   6. Only the admin can call `blacklist_arbitrator` and
+//      `remove_arbitrator_from_blacklist`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Helper that initialises a fresh contract with an explicitly known arbitrator
+/// and funds a single disputed escrow (order_id = 1) for use by the blacklist
+/// tests.
+///
+/// Returns (client, buyer, seller, token_id, admin, arbitrator).
+fn setup_blacklist_test(
+    env: &Env,
+) -> (
+    CraftNexusContractClient<'static>,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
+    env.budget().reset_unlimited();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(env, &contract_id);
+
+    let admin = Address::generate(env);
+    let arbitrator = Address::generate(env);
+    let platform_wallet = Address::generate(env);
+    let buyer = Address::generate(env);
+    let seller = Address::generate(env);
+
+    // Mint token
+    let token_admin_addr = Address::generate(env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin_addr.clone());
+    let token_id = token_contract.address();
+    let token_admin_client = token::StellarAssetClient::new(env, &token_id);
+
+    env.ledger().with_mut(|li| li.timestamp = 1_711_368_000);
+
+    client.initialize(&platform_wallet, &admin, &arbitrator, &500, &None);
+    client.set_min_escrow_amount(&token_id, &0);
+    client.set_min_release_window(&1);
+
+    // Fund buyer and open a disputed escrow
+    token_admin_client.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(env, "Quality_issue"), &buyer);
+
+    (client, buyer, seller, token_id, admin, arbitrator)
+}
+
+/// A blacklisted arbitrator must not be able to resolve a dispute – the call
+/// should panic with `ArbitratorBlacklisted`.
+#[test]
+fn test_resolve_dispute_blacklisted_arbitrator_is_blocked() {
+    let env = Env::default();
+    let (client, _buyer, _seller, _token_id, _admin, arbitrator) =
+        setup_blacklist_test(&env);
+
+    // Admin blacklists the arbitrator.
+    client.blacklist_arbitrator(&arbitrator);
+
+    // The blacklisted arbitrator must be blocked.
+    let result = client.try_resolve_dispute(&1, &Resolution::RefundToBuyer, &arbitrator);
+    assert!(
+        matches!(result, Err(Ok(Error::ArbitratorBlacklisted))),
+        "expected ArbitratorBlacklisted error, got {:?}",
+        result
+    );
+
+    // Escrow must still be in Disputed state (nothing changed).
+    let escrow = client.get_escrow(&1);
+    assert_eq!(
+        escrow.status,
+        EscrowStatus::Disputed,
+        "escrow state must not change after blocked resolution attempt"
+    );
+}
+
+/// A blacklisted moderator must not be able to resolve a dispute either.
+#[test]
+fn test_resolve_dispute_blacklisted_moderator_is_blocked() {
+    let env = Env::default();
+    let (client, _buyer, _seller, _token_id, _admin, _arbitrator) =
+        setup_blacklist_test(&env);
+
+    let moderator = Address::generate(&env);
+    client.set_moderator(&moderator);
+
+    // Admin blacklists the moderator.
+    client.blacklist_arbitrator(&moderator);
+
+    // The blacklisted moderator must be blocked.
+    let result = client.try_resolve_dispute(&1, &Resolution::RefundToBuyer, &moderator);
+    assert!(
+        matches!(result, Err(Ok(Error::ArbitratorBlacklisted))),
+        "expected ArbitratorBlacklisted error for blacklisted moderator, got {:?}",
+        result
+    );
+}
+
+/// The admin is explicitly exempt from the blacklist – even if the admin
+/// address is passed to `blacklist_arbitrator`, the admin must still be able
+/// to resolve disputes.
+#[test]
+fn test_resolve_dispute_admin_exempt_from_blacklist() {
+    let env = Env::default();
+    let (client, _buyer, _seller, _token_id, admin, _arbitrator) =
+        setup_blacklist_test(&env);
+
+    // Attempt to blacklist the admin address (the call should succeed because
+    // the admin is allowed to perform administrative actions on any address,
+    // but the check inside resolve_dispute must skip the admin).
+    client.blacklist_arbitrator(&admin);
+
+    // Admin must still be able to resolve.
+    client.resolve_dispute(&1, &Resolution::RefundToBuyer, &admin);
+
+    let escrow = client.get_escrow(&1);
+    assert_eq!(
+        escrow.status,
+        EscrowStatus::Resolved,
+        "admin must be able to resolve disputes even when on the blacklist"
+    );
+}
+
+/// After removing an address from the blacklist it must be able to resolve
+/// disputes again.
+#[test]
+fn test_resolve_dispute_after_removing_from_blacklist_succeeds() {
+    let env = Env::default();
+    let (client, _buyer, _seller, _token_id, _admin, arbitrator) =
+        setup_blacklist_test(&env);
+
+    // Blacklist the arbitrator …
+    client.blacklist_arbitrator(&arbitrator);
+
+    // … verify it is blocked …
+    let blocked = client.try_resolve_dispute(&1, &Resolution::RefundToBuyer, &arbitrator);
+    assert!(
+        matches!(blocked, Err(Ok(Error::ArbitratorBlacklisted))),
+        "arbitrator must be blocked after being blacklisted"
+    );
+
+    // … remove from the blacklist …
+    client.remove_arbitrator_from_blacklist(&arbitrator);
+
+    // … now it must succeed.
+    client.resolve_dispute(&1, &Resolution::RefundToBuyer, &arbitrator);
+
+    let escrow = client.get_escrow(&1);
+    assert_eq!(
+        escrow.status,
+        EscrowStatus::Resolved,
+        "arbitrator must be able to resolve after being removed from blacklist"
+    );
+}
+
+/// `is_arbitrator_blacklisted` must return `false` for a fresh address, `true`
+/// after blacklisting, and `false` again after removal.
+#[test]
+fn test_is_arbitrator_blacklisted_reflects_state() {
+    let env = Env::default();
+    let (client, _buyer, _seller, _token_id, _admin, arbitrator) =
+        setup_blacklist_test(&env);
+
+    // Initially not blacklisted.
+    assert!(
+        !client.is_arbitrator_blacklisted(&arbitrator),
+        "address must not be blacklisted before any action"
+    );
+
+    // Blacklist it.
+    client.blacklist_arbitrator(&arbitrator);
+    assert!(
+        client.is_arbitrator_blacklisted(&arbitrator),
+        "address must be flagged as blacklisted after blacklist_arbitrator"
+    );
+
+    // Remove it.
+    client.remove_arbitrator_from_blacklist(&arbitrator);
+    assert!(
+        !client.is_arbitrator_blacklisted(&arbitrator),
+        "address must not be blacklisted after remove_arbitrator_from_blacklist"
+    );
+}
+
+/// Only the admin may call `blacklist_arbitrator`; any other caller must be
+/// rejected.
+#[test]
+#[should_panic]
+fn test_blacklist_arbitrator_requires_admin_auth() {
+    // Setup with a fresh env without mock_all_auths so auth is enforced.
+    let env = Env::default();
+    env.budget().reset_unlimited();
+
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+    let platform_wallet = Address::generate(&env);
+
+    // Only mock auth for the initial setup calls, not for the blacklist call.
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_711_368_000);
+    client.initialize(&platform_wallet, &admin, &arbitrator, &500, &None);
+
+    // Now drop all mocked auths so require_auth is enforced.
+    env.mock_auths(&[]);
+
+    // Calling blacklist_arbitrator without admin auth must panic.
+    client.blacklist_arbitrator(&arbitrator);
+}
+
+/// Only the admin may call `remove_arbitrator_from_blacklist`; any other
+/// caller must be rejected.
+#[test]
+#[should_panic]
+fn test_remove_from_blacklist_requires_admin_auth() {
+    // Setup with a fresh env without mock_all_auths so auth is enforced.
+    let env = Env::default();
+    env.budget().reset_unlimited();
+
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+    let platform_wallet = Address::generate(&env);
+
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_711_368_000);
+    client.initialize(&platform_wallet, &admin, &arbitrator, &500, &None);
+
+    // Blacklist the arbitrator while auths are still mocked.
+    client.blacklist_arbitrator(&arbitrator);
+
+    // Now drop all mocked auths so require_auth is enforced.
+    env.mock_auths(&[]);
+
+    // Calling remove_arbitrator_from_blacklist without admin auth must panic.
+    client.remove_arbitrator_from_blacklist(&arbitrator);
+}
+
+/// Blacklisting an address that was never an arbitrator or moderator must have
+/// no effect on the contract state other than setting the flag — and once set
+/// the address is still blocked if it somehow becomes authorized.
+///
+/// This is more of a contract-sanity test: adding an arbitrary address to the
+/// blacklist and then verifying it shows up as blacklisted.
+#[test]
+fn test_blacklist_arbitrary_address_sets_flag() {
+    let env = Env::default();
+    let (client, _buyer, _seller, _token_id, _admin, _arbitrator) =
+        setup_blacklist_test(&env);
+
+    let random = Address::generate(&env);
+    assert!(!client.is_arbitrator_blacklisted(&random));
+
+    client.blacklist_arbitrator(&random);
+    assert!(
+        client.is_arbitrator_blacklisted(&random),
+        "arbitrary address must be flagged after blacklist_arbitrator"
+    );
+}
+
