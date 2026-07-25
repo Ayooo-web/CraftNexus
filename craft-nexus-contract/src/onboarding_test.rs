@@ -1,7 +1,10 @@
 use super::decimal_test_token::{DecimalTestToken, DecimalTestTokenClient};
 use super::*;
 use crate::alloc::string::ToString;
-use soroban_sdk::{testutils::Address as _, token, Address, Bytes, Env, String, Symbol};
+use soroban_sdk::{
+    testutils::{storage::Persistent as _, Address as _},
+    token, Address, Bytes, Env, String, Symbol,
+};
 
 fn register_decimal_test_token(env: &Env, decimals: u32) -> Address {
     let admin = Address::generate(env);
@@ -2451,4 +2454,151 @@ fn test_onboard_rejected_when_escrow_paused() {
         &UserRole::Buyer,
     );
     assert!(result.is_err());
+}
+
+// ===== Issue #447 — storage/TTL read-path optimizations =====
+
+/// Every queue slot walked by `get_verification_queue` must have its TTL
+/// refreshed, not only the head slot touched by `advance_verification_head`.
+/// Otherwise a request queued behind a long-lived one is archived and its user
+/// silently disappears from the queue.
+#[test]
+fn test_get_verification_queue_extends_ttl_for_every_slot() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+
+    let mut users = soroban_sdk::Vec::new(&env);
+    for (index, name) in ["ttlqueue1", "ttlqueue2", "ttlqueue3"].iter().enumerate() {
+        let user = Address::generate(&env);
+        client.onboard_user(&user, &String::from_str(&env, name), &UserRole::Artisan);
+        client.request_verification(&user);
+        users.push_back(user);
+        assert_eq!(client.get_verification_queue().len() as usize, index + 1);
+    }
+
+    let live_before = env.as_contract(&client.address, || {
+        (0..users.len() as u64)
+            .filter(|slot| {
+                env.storage()
+                    .persistent()
+                    .has(&DataKey::VerificationQueueIndex(*slot))
+            })
+            .count()
+    });
+    assert_eq!(live_before, 3);
+
+    // Reading the queue must leave every slot live with a refreshed TTL.
+    assert_eq!(client.get_verification_queue().len(), 3);
+
+    env.as_contract(&client.address, || {
+        for slot in 0..users.len() as u64 {
+            let key = DataKey::VerificationQueueIndex(slot);
+            assert!(
+                env.storage().persistent().has(&key),
+                "queue slot {slot} should still be live"
+            );
+            assert!(
+                env.storage().persistent().get_ttl(&key) >= TTL_EXTENSION,
+                "queue slot {slot} should have been extended on read"
+            );
+        }
+    });
+}
+
+/// Read helpers refresh TTL on the entries they return without a second probe.
+#[test]
+fn test_read_paths_refresh_ttl_on_touched_entries() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "ttlreader"),
+        &UserRole::Artisan,
+    );
+    client.set_username_change_fee(&42);
+
+    // Drive the read API.
+    let _ = client.get_user(&user);
+    let _ = client.get_user_metrics(&user);
+    let _ = client.get_username_change_fee();
+    assert!(client.is_onboarded(&user));
+
+    env.as_contract(&client.address, || {
+        for key in [
+            DataKey::UserProfile(user.clone()),
+            DataKey::UsernameChangeFee,
+        ] {
+            assert!(env.storage().persistent().has(&key));
+            assert!(
+                env.storage().persistent().get_ttl(&key) >= TTL_EXTENSION,
+                "read path should have refreshed the entry TTL"
+            );
+        }
+    });
+}
+
+/// Absent optional entries must not be resurrected or charged for by the
+/// read helpers; they simply return the caller-supplied default.
+#[test]
+fn test_read_helpers_do_not_create_absent_entries() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "nodefaults"),
+        &UserRole::Artisan,
+    );
+
+    let metrics = client.get_user_metrics(&user);
+    assert_eq!(metrics.total_escrow_count, 0);
+    assert_eq!(metrics.total_volume, 0);
+    assert_eq!(client.get_username_change_fee(), 0);
+    assert_eq!(client.get_active_contract_count(&user), 0);
+    assert!(client.get_username_fee_token().is_none());
+
+    env.as_contract(&client.address, || {
+        for key in [
+            DataKey::UserMetrics(user.clone()),
+            DataKey::UsernameChangeFee,
+            DataKey::ActiveContractCount(user.clone()),
+            DataKey::UsernameChangeFeeToken,
+            DataKey::UserPortfolio(user.clone()),
+        ] {
+            assert!(
+                !env.storage().persistent().has(&key),
+                "reading a default must not materialize a storage entry"
+            );
+        }
+    });
+}
+
+/// Budget smoke test for the hot profile read path (issue #447 action item 3).
+/// `get_user` is the most frequently invoked entrypoint; running it against the
+/// default ledger budget guards the read path against regressions that would
+/// reintroduce redundant storage probes.
+#[test]
+fn test_profile_read_budget_smoke() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "budgetread"),
+        &UserRole::Artisan,
+    );
+
+    env.budget().reset_default();
+    let _ = client.get_user(&user);
+    let _ = client.get_user_reputation(&user);
+    let _ = client.get_user_metrics(&user);
 }

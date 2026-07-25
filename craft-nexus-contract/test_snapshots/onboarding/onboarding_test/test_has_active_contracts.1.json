@@ -2935,7 +2935,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "config_updated"
+                "symbol": "admin_config_updated"
               },
               {
                 "symbol": "platform_fee_bps"
@@ -2997,7 +2997,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "config_updated"
+                "symbol": "admin_config_updated"
               },
               {
                 "symbol": "platform_wallet"
@@ -3059,7 +3059,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "config_updated"
+                "symbol": "admin_config_updated"
               },
               {
                 "symbol": "onboarding_contract"
@@ -3538,7 +3538,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000004"
               },
               {
-                "symbol": "get_platform_config"
+                "symbol": "is_paused"
               }
             ],
             "data": "void"
@@ -3559,115 +3559,11 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "get_platform_config"
+                "symbol": "is_paused"
               }
             ],
             "data": {
-              "map": [
-                {
-                  "key": {
-                    "symbol": "admin"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "arbitrator"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "expired_dispute_fee_policy"
-                  },
-                  "val": {
-                    "u32": 0
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "is_paused"
-                  },
-                  "val": {
-                    "bool": false
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "max_dispute_duration"
-                  },
-                  "val": {
-                    "u32": 2592000
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "min_release_window"
-                  },
-                  "val": {
-                    "u32": 86400
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "min_stake_required"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 0
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "moderator"
-                  },
-                  "val": "void"
-                },
-                {
-                  "key": {
-                    "symbol": "pending_admin"
-                  },
-                  "val": "void"
-                },
-                {
-                  "key": {
-                    "symbol": "platform_fee_bps"
-                  },
-                  "val": {
-                    "u32": 500
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "platform_wallet"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "stake_cooldown"
-                  },
-                  "val": {
-                    "u32": 604800
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "wasm_upgrade_cooldown"
-                  },
-                  "val": {
-                    "u32": 604800
-                  }
-                }
-              ]
+              "bool": false
             }
           }
         }
@@ -3872,7 +3768,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000004"
               },
               {
-                "symbol": "get_platform_config"
+                "symbol": "is_paused"
               }
             ],
             "data": "void"
@@ -3893,115 +3789,11 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "get_platform_config"
+                "symbol": "is_paused"
               }
             ],
             "data": {
-              "map": [
-                {
-                  "key": {
-                    "symbol": "admin"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "arbitrator"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "expired_dispute_fee_policy"
-                  },
-                  "val": {
-                    "u32": 0
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "is_paused"
-                  },
-                  "val": {
-                    "bool": false
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "max_dispute_duration"
-                  },
-                  "val": {
-                    "u32": 2592000
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "min_release_window"
-                  },
-                  "val": {
-                    "u32": 86400
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "min_stake_required"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 0
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "moderator"
-                  },
-                  "val": "void"
-                },
-                {
-                  "key": {
-                    "symbol": "pending_admin"
-                  },
-                  "val": "void"
-                },
-                {
-                  "key": {
-                    "symbol": "platform_fee_bps"
-                  },
-                  "val": {
-                    "u32": 500
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "platform_wallet"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "stake_cooldown"
-                  },
-                  "val": {
-                    "u32": 604800
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "wasm_upgrade_cooldown"
-                  },
-                  "val": {
-                    "u32": 604800
-                  }
-                }
-              ]
+              "bool": false
             }
           }
         }

@@ -138,7 +138,7 @@ fn test_batch_escrow_indexing_scales_linearly_for_twenty_entries() {
             seller: seller.clone(),
             token: token.clone(),
             amount: 1_000,
-            order_id: 1_000 + i as u64,
+            order_id: 1_000 + i,
             release_window: Some(3600),
             ipfs_hash: None,
             metadata_hash: None,
@@ -763,14 +763,22 @@ fn test_artisan_stake_queue_pruning_can_empty_queue() {
     let token_asset = token::StellarAssetClient::new(&env, &token);
     token_asset.mint(&artisan, &100_000_000);
 
-    for _ in 1..=1u32 {
+    // Pruning is only attempted once the queue reaches the prune threshold, so
+    // fill it to exactly that many deposits before maturing all of them.
+    for _ in 0..STAKE_QUEUE_PRUNE_THRESHOLD {
         client.stake_tokens(&artisan, &token, &1000);
     }
+    assert_eq!(
+        client.get_artisan_stake_queue_count(&artisan),
+        STAKE_QUEUE_PRUNE_THRESHOLD
+    );
 
     env.ledger().with_mut(|li| {
         li.timestamp = li.timestamp + (DEFAULT_STAKE_COOLDOWN as u64) + 1;
     });
 
+    // Every queued deposit is now matured, so this stake empties the queue
+    // completely before appending the fresh deposit at index 0.
     client.stake_tokens(&artisan, &token, &1000);
 
     let count_after_pruning = client.get_artisan_stake_queue_count(&artisan);
@@ -781,6 +789,14 @@ fn test_artisan_stake_queue_pruning_can_empty_queue() {
         env.storage().persistent().has(&count_key)
     });
     assert!(count_present);
+
+    // The pruned slots must not linger in persistent storage.
+    for index in 1..STAKE_QUEUE_PRUNE_THRESHOLD {
+        let stale_key = DataKey::ArtisanStakeQueueIndexed(artisan.clone(), index);
+        let still_present =
+            env.as_contract(&client.address, || env.storage().persistent().has(&stale_key));
+        assert!(!still_present, "pruned deposit {index} should be removed");
+    }
 }
 
 #[test]

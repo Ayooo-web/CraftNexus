@@ -716,7 +716,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "config_updated"
+                "symbol": "admin_config_updated"
               },
               {
                 "symbol": "platform_fee_bps"
@@ -778,7 +778,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "config_updated"
+                "symbol": "admin_config_updated"
               },
               {
                 "symbol": "platform_wallet"
