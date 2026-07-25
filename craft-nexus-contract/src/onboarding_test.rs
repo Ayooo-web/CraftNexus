@@ -2602,3 +2602,27 @@ fn test_profile_read_budget_smoke() {
     let _ = client.get_user_reputation(&user);
     let _ = client.get_user_metrics(&user);
 }
+
+/// update_user_metrics panics with VolumeOverflow when adding a delta would
+/// overflow i128::MAX.
+#[test]
+#[should_panic]
+fn test_update_user_metrics_volume_overflow_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "overflow_user"), &UserRole::Artisan);
+
+    // Register a 7-decimal token so no normalization scaling occurs, making the
+    // overflow easy to reproduce with exact arithmetic.
+    let token_addr = register_decimal_test_token(&env, 7);
+
+    // First call: push total_volume to i128::MAX
+    client.update_user_metrics(&user, &0u32, &i128::MAX, &token_addr);
+
+    // Second call: adding any positive delta must overflow — should panic with
+    // Error::VolumeOverflow (code 17).
+    client.update_user_metrics(&user, &0u32, &1i128, &token_addr);
+}
