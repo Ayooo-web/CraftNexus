@@ -12,37 +12,43 @@ if [ -z "$SOURCE_ACCOUNT" ]; then
     exit 1
 fi
 
-echo "🚀 Deploying to $NETWORK..."
+if [ ! -f "$WASM_ARTIFACT" ]; then
+    echo "WASM artifact not found at ${WASM_ARTIFACT}. Running build first..."
+    ./scripts/build.sh
+fi
 
-# Build first
-./scripts/build.sh
+echo "Deploying to $NETWORK..."
 
-# Configure network if not already done
+# Set network configuration
 if [ "$NETWORK" = "testnet" ]; then
-    stellar network add \
-        --rpc-url https://soroban-testnet.stellar.org:443 \
-        --network-passphrase "Test SDF Network ; September 2015" \
-        testnet 2>/dev/null || true
+    RPC_URL="https://soroban-testnet.stellar.org:443"
+    NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 elif [ "$NETWORK" = "mainnet" ]; then
-    stellar network add \
-        --rpc-url https://soroban-rpc.mainnet.stellar.org:443 \
-        --network-passphrase "Public Global Stellar Network ; September 2015" \
-        mainnet 2>/dev/null || true
+    RPC_URL="https://soroban-rpc.mainnet.stellar.org:443"
+    NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"
 else
-    echo "❌ Invalid network. Use 'testnet' or 'mainnet'"
+    echo "Invalid network. Use 'testnet' or 'mainnet'"
     exit 1
 fi
 
+# Configure network alias for future commands
+stellar network add \
+    --rpc-url "$RPC_URL" \
+    --network-passphrase "$NETWORK_PASSPHRASE" \
+    "$NETWORK" 2>/dev/null || true
+
 # Deploy
-echo "📤 Deploying contract..."
+echo "Deploying contract..."
 CONTRACT_ID=$(stellar contract deploy \
     --wasm "$WASM_ARTIFACT" \
-    --source "$SOURCE_ACCOUNT" \
+    --source-account "$SOURCE_ACCOUNT" \
+    --rpc-url "$RPC_URL" \
+    --network-passphrase "$NETWORK_PASSPHRASE" \
     --network "$NETWORK")
 
 echo ""
-echo "✅ Contract deployed successfully!"
-echo "📝 Contract ID: $CONTRACT_ID"
+echo "Contract deployed successfully!"
+echo "Contract ID: $CONTRACT_ID"
 echo ""
 echo "Add this to your .env.local:"
 echo "NEXT_PUBLIC_ESCROW_CONTRACT_ADDRESS=$CONTRACT_ID"
