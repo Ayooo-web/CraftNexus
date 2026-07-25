@@ -1296,6 +1296,14 @@ impl OnboardingContract {
     /// actions for audit trails and compliance reporting. Implements circular-buffer semantics
     /// to enforce bounded storage while preserving temporal ordering of recent events.
     ///
+    /// Developer note: the historical record is stored in indexed slots under
+    /// `DataKey::VerificationHistoryIndexed(user, slot)` and the logical order is defined by
+    /// `DataKey::VerificationHistoryCount(user)`. Readers must iterate from slot `0` through
+    /// `count - 1`; writers must not write to an arbitrary slot based on timestamps or the
+    /// current append count once the buffer is full. When the buffer reaches capacity, older
+    /// entries are shifted down and the new entry is written to the tail slot. This preserves
+    /// the recent history without corrupting earlier entries.
+    ///
     /// When history reaches MAX_VERIFICATION_HISTORY (10 entries), oldest entries are shifted
     /// and the newest entry is appended at the tail. This enables long-running contract states
     /// to support arbitration reviews without unbounded storage growth.
@@ -3405,7 +3413,10 @@ impl OnboardingContract {
 
     /// Get the full verification history for a user.
     ///
-    /// Only the user themselves may read their own verification history.
+    /// Only the user themselves may read their own verification history. The read path
+    /// intentionally walks the circular-buffer from slot `0` to `count - 1` using the
+    /// persisted count key as the source of truth; it must not infer slots from timestamps
+    /// or mutate the storage layout while iterating.
     pub fn get_verification_history(env: Env, user: Address) -> Vec<VerificationEntry> {
         user.require_auth();
 
