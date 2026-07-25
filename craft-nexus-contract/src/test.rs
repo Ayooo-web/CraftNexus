@@ -1392,6 +1392,20 @@ fn test_unstake_rejects_different_token_than_original_stake() {
 }
 
 #[test]
+#[should_panic(expected = "Stake cooldown active. Remaining seconds: 604800")]
+fn test_unstake_too_early_returns_remaining_seconds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&seller, &20_000_000);
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+
+    // Try to unstake immediately (remaining seconds should be 604800)
+    client.unstake_tokens(&seller, &token_id);
+}
+
+#[test]
 fn test_create_escrow_with_metadata_success_cid_v0() {
     let env = Env::default();
     env.mock_all_auths();
