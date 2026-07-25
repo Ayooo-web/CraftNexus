@@ -2609,7 +2609,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "config_updated"
+                "symbol": "admin_config_updated"
               },
               {
                 "symbol": "platform_fee_bps"
@@ -2671,7 +2671,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "config_updated"
+                "symbol": "admin_config_updated"
               },
               {
                 "symbol": "platform_wallet"
@@ -2733,7 +2733,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "config_updated"
+                "symbol": "admin_config_updated"
               },
               {
                 "symbol": "onboarding_contract"
@@ -2852,7 +2852,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "config_updated"
+                "symbol": "admin_config_updated"
               },
               {
                 "symbol": "min_escrow_amount"
@@ -2967,7 +2967,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "config_updated"
+                "symbol": "admin_config_updated"
               },
               {
                 "symbol": "min_release_window"
@@ -4316,7 +4316,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "reputation_update"
+                "symbol": "stake_reputation_update"
               },
               {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -4399,7 +4399,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "reputation_update"
+                "symbol": "stake_reputation_update"
               },
               {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
@@ -5680,7 +5680,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "reputation_update"
+                "symbol": "stake_reputation_update"
               },
               {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -5763,7 +5763,7 @@
           "v0": {
             "topics": [
               {
-                "symbol": "reputation_update"
+                "symbol": "stake_reputation_update"
               },
               {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"

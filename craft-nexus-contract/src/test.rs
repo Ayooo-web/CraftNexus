@@ -859,7 +859,7 @@ fn test_set_artisan_fee_tier_emits_dedicated_event() {
         last_event.1,
         vec![
             &env,
-            Symbol::new(&env, "artisan_fee_tier_updated").into_val(&env),
+            Symbol::new(&env, "admin_fee_tier_updated").into_val(&env),
             seller.clone().into_val(&env)
         ]
     );
@@ -2604,14 +2604,22 @@ fn test_get_onboarding_client_uses_configured_address() {
     env.mock_all_auths();
     let (client, _, _, _, _, _, _) = setup_test(&env, true);
 
-    assert!(CraftNexusContract::get_onboarding_client(&env).is_none());
+    // `get_onboarding_client` reads contract storage, so it has to be invoked
+    // inside the contract's storage context rather than from the test frame.
+    let initial = env.as_contract(&client.address, || {
+        CraftNexusContract::get_onboarding_client(&env)
+    });
+    let (initial_address, _) = initial.expect("setup registers an onboarding contract");
+    assert_eq!(initial_address, client.get_onboarding_contract());
 
+    // Re-pointing the registry must be reflected by the helper on the next read.
     let onboarding = Address::generate(&env);
     client.set_onboarding_contract(&onboarding);
 
-    let configured = CraftNexusContract::get_onboarding_client(&env);
-    assert!(configured.is_some());
-    let (address, _client) = configured.unwrap();
+    let configured = env.as_contract(&client.address, || {
+        CraftNexusContract::get_onboarding_client(&env)
+    });
+    let (address, _client) = configured.expect("configured address should resolve");
     assert_eq!(address, onboarding);
 }
 
@@ -3158,7 +3166,7 @@ fn test_verify_metadata_reveal_authorized_emits_metadata_verified_event() {
         last_event.1,
         vec![
             &env,
-            Symbol::new(&env, "metadata_verified").into_val(&env),
+            Symbol::new(&env, "escrow_metadata_verified").into_val(&env),
             (1u64).into_val(&env),
         ]
     );
@@ -3183,7 +3191,7 @@ fn test_set_paused_emits_platform_status_events() {
         last_event.1,
         vec![
             &env,
-            Symbol::new(&env, "platform_paused").into_val(&env),
+            Symbol::new(&env, "admin_platform_paused").into_val(&env),
             admin.clone().into_val(&env),
         ]
     );
@@ -3200,7 +3208,7 @@ fn test_set_paused_emits_platform_status_events() {
         last_event.1,
         vec![
             &env,
-            Symbol::new(&env, "platform_unpaused").into_val(&env),
+            Symbol::new(&env, "admin_platform_unpaused").into_val(&env),
             admin.clone().into_val(&env),
         ]
     );

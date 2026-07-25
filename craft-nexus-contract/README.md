@@ -627,15 +627,28 @@ Notes:
 
 ### Escrow Events (Indexer-Facing)
 
-Escrow events publish with topics `(event_symbol, order_id)` and typed event bodies:
+Escrow events publish with topics `(event_symbol, order_id)` and typed event bodies.
+
+Soroban `Symbol`s only accept `[a-zA-Z0-9_]`, so the `escrow` / `admin` / `stake`
+namespace prefix is joined with an underscore rather than a dot:
 
 | Event Symbol | Data Struct |
 |-------------|-------------|
-| `escrow.created` | `EscrowCreatedEvent { escrow_id, buyer, seller, amount, token, release_window, ipfs_hash, metadata_hash }` |
-| `escrow.released` | `FundsReleasedEvent { escrow_id, amount }` |
-| `escrow.refunded` | `FundsRefundedEvent { escrow_id, amount }` |
-| `escrow.disputed` | `EscrowDisputedEvent { escrow_id, dispute_reason }` |
-| `escrow.resolved` | `EscrowResolvedEvent { escrow_id, resolution }` |
+| `escrow` | `EscrowCreatedEvent { escrow_id, buyer, seller, amount, token, release_window, ipfs_hash, metadata_hash }` |
+| `escrow_resolved` | `EscrowResolvedEvent { escrow_id, resolution }` |
+| `escrow_metadata_verified` | `MetadataVerifiedEvent { order_id, verifier, timestamp }` |
+
+### Admin / Stake Events
+
+| Event Symbol | Data Struct |
+|-------------|-------------|
+| `admin_changed` | `(previous_admin, new_admin)` |
+| `admin_config_updated` | `ConfigUpdatedEvent { field_name, old_value, new_value }` |
+| `admin_config_recovered` | recovery notice string |
+| `admin_fee_tier_updated` | `ArtisanFeeTierUpdatedEvent { artisan, fee_bps }` |
+| `admin_platform_paused` | `PlatformPausedEvent { initiator, timestamp }` |
+| `admin_platform_unpaused` | `PlatformUnpausedEvent { initiator, timestamp }` |
+| `stake_reputation_update` | `ReputationUpdateEvent { address, .. }` |
 
 ### Onboarding Events
 
@@ -948,13 +961,10 @@ for (const evt of ledgerEvents) {
   const eventName = evt.topic[0].toString();
   const orderId = evt.topic[1]?.toString();
 
-  if (eventName === "escrow.created") {
+  if (eventName === "escrow") {
     const data = parseEscrowCreatedEvent(evt.value);
     saveEscrowCreated(orderId, data.buyer, data.seller, data.amount, data.token);
-  } else if (eventName === "escrow.disputed") {
-    const data = parseEscrowDisputedEvent(evt.value);
-    saveEscrowDispute(orderId, data.dispute_reason);
-  } else if (eventName === "escrow.resolved") {
+  } else if (eventName === "escrow_resolved") {
     const data = parseEscrowResolvedEvent(evt.value);
     saveEscrowResolution(orderId, data.resolution);
   }

@@ -1369,7 +1369,7 @@ impl CraftNexusContract {
             Self::extend_persistent(env, &DataKey::FallbackAdmin);
             // Emit recovery event for audit trail
             env.events().publish(
-                (Symbol::new(env, "admin.config_recovered"), true),
+                (Symbol::new(env, "admin_config_recovered"), true),
                 String::from_str(env, "Using fallback admin after config corruption detected"),
             );
             // Return a minimal valid config with fallback admin
@@ -1402,7 +1402,7 @@ impl CraftNexusContract {
         change_type: &str,
     ) {
         env.events().publish(
-            (Symbol::new(env, "admin.changed"), change_type.as_bytes()),
+            (Symbol::new(env, "admin_changed"), change_type.as_bytes()),
             (previous_admin, new_admin),
         );
     }
@@ -1425,7 +1425,7 @@ impl CraftNexusContract {
 
     fn emit_escrow_resolved_event(env: &Env, event: EscrowResolvedEvent) {
         env.events().publish(
-            (Symbol::new(env, "escrow.resolved"), event.escrow_id),
+            (Symbol::new(env, "escrow_resolved"), event.escrow_id),
             event,
         );
     }
@@ -1433,7 +1433,7 @@ impl CraftNexusContract {
     fn emit_reputation_update(env: &Env, event: ReputationUpdateEvent) {
         env.events().publish(
             (
-                Symbol::new(env, "stake.reputation_update"),
+                Symbol::new(env, "stake_reputation_update"),
                 event.address.clone(),
             ),
             event,
@@ -1448,7 +1448,7 @@ impl CraftNexusContract {
     ) {
         env.events().publish(
             (
-                Symbol::new(env, "admin.config_updated"),
+                Symbol::new(env, "admin_config_updated"),
                 Symbol::new(env, field_name),
             ),
             ConfigUpdatedEvent {
@@ -1461,7 +1461,7 @@ impl CraftNexusContract {
 
     fn emit_artisan_fee_tier_updated(env: &Env, artisan: Address, fee_bps: u32) {
         env.events().publish(
-            (Symbol::new(env, "admin.fee_tier_updated"), artisan.clone()),
+            (Symbol::new(env, "admin_fee_tier_updated"), artisan.clone()),
             ArtisanFeeTierUpdatedEvent { artisan, fee_bps },
         );
     }
@@ -1469,7 +1469,7 @@ impl CraftNexusContract {
     fn emit_metadata_verified(env: &Env, order_id: u32, verifier: Address) {
         env.events().publish(
             (
-                Symbol::new(env, "escrow.metadata_verified"),
+                Symbol::new(env, "escrow_metadata_verified"),
                 (order_id as u64),
             ),
             MetadataVerifiedEvent {
@@ -1482,7 +1482,7 @@ impl CraftNexusContract {
 
     fn emit_platform_paused(env: &Env, initiator: Address) {
         env.events().publish(
-            (Symbol::new(env, "admin.platform_paused"), initiator.clone()),
+            (Symbol::new(env, "admin_platform_paused"), initiator.clone()),
             PlatformPausedEvent {
                 initiator,
                 timestamp: env.ledger().timestamp(),
@@ -1493,7 +1493,7 @@ impl CraftNexusContract {
     fn emit_platform_unpaused(env: &Env, initiator: Address) {
         env.events().publish(
             (
-                Symbol::new(env, "admin.platform_unpaused"),
+                Symbol::new(env, "admin_platform_unpaused"),
                 initiator.clone(),
             ),
             PlatformUnpausedEvent {
@@ -1868,7 +1868,7 @@ impl CraftNexusContract {
             return true;
         }
 
-        let (onboarding_address, onboarding) = match Self::get_onboarding_client(env) {
+        let (onboarding_address, _onboarding) = match Self::get_onboarding_client(env) {
             Some(client) => client,
             None => return false,
         };
