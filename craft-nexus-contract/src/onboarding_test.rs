@@ -1,10 +1,7 @@
 use super::decimal_test_token::{DecimalTestToken, DecimalTestTokenClient};
 use super::*;
 use crate::alloc::string::ToString;
-use soroban_sdk::{
-    testutils::{storage::Persistent as _, Address as _},
-    token, Address, Bytes, Env, String, Symbol,
-};
+use soroban_sdk::testutils::{storage::Persistent as _, Address as _};
 
 fn register_decimal_test_token(env: &Env, decimals: u32) -> Address {
     let admin = Address::generate(env);
