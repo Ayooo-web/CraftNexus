@@ -3119,7 +3119,7 @@ impl OnboardingContract {
             profile.is_verified = true;
             Self::persist_public_user_profile(env, &address, &profile);
 
-            // Emit distinct AutoVerifiedEvent to fulfill #654 architecture requirements
+            // auto-verification triggered — emit AutoVerifiedEvent (#713)
             env.events().publish(
                 (Symbol::new(env, "AutoVerifiedEvent"), address.clone()),
                 AutoVerifiedEvent {
