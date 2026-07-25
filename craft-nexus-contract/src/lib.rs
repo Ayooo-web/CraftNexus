@@ -388,6 +388,8 @@ pub enum DataKey {
     NextRecurringEscrowId,
     /// Count of currently active (non-released, non-refunded) escrows or recurring escrows for a user address.
     ActiveObligations(Address),
+    /// Total gross escrow volume ever created across all tokens.
+    TotalVolume,
     /// Required number of distinct signer approvals before a WASM upgrade proposal is committed.
     UpgradeThreshold,
     /// Per-hash list of addresses that have approved a pending WASM upgrade hash.
@@ -452,6 +454,16 @@ pub struct RecurringEscrowEvent {
     pub artisan: Address,
     pub amount: i128,
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct PlatformStats {
+    pub total_volume: i128,
+    pub total_escrows: u32,
+    pub active_users: u32,
+    pub whitelist_count: u32,
 }
 
 #[contracttype]
@@ -1159,6 +1171,8 @@ pub trait OnboardingInterface {
     /// `delta` should be `+1` when an escrow becomes active and `-1` when the
     /// escrow closes. The onboarding contract rejects underflows.
     fn update_active_contracts(env: Env, user: Address, delta: i32);
+    /// Number of onboarding profiles whose status is currently active.
+    fn get_active_user_count(env: Env) -> u32;
     /// Refresh the persistent TTL for a user's profile entry.
     fn bump_user_profile_ttl(env: Env, user: Address) -> bool;
     /// Refresh the persistent TTL for a user's activity metrics entry.
@@ -1647,6 +1661,25 @@ impl CraftNexusContract {
         let new_total = current.saturating_add(delta);
         env.storage().persistent().set(&key, &new_total);
         Self::extend_persistent(env, &key);
+    }
+
+    fn update_total_volume(env: &Env, delta: i128) {
+        let key = DataKey::TotalVolume;
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_total = current.saturating_add(delta);
+        env.storage().persistent().set(&key, &new_total);
+        Self::extend_persistent(env, &key);
+    }
+
+    fn get_total_volume(env: &Env) -> i128 {
+        let key = DataKey::TotalVolume;
+        match env.storage().persistent().get(&key) {
+            Some(total) => {
+                Self::extend_persistent(env, &key);
+                total
+            }
+            None => 0,
+        }
     }
 
     fn update_total_staked(env: &Env, token: &Address, delta: i128) {
@@ -5059,6 +5092,7 @@ impl CraftNexusContract {
 
         // Track locked funds (#212)
         Self::update_total_locked(env, &params.token, params.amount);
+        Self::update_total_volume(env, params.amount);
 
         Self::emit_escrow_created(
             env,
@@ -5217,9 +5251,8 @@ impl CraftNexusContract {
                         let seller_key = params.seller.clone();
 
                         if !buyer_next_counts.contains_key(buyer_key.clone()) {
-                            let existing_count = buyer_count_state
-                                .get(buyer_key.clone())
-                                .unwrap_or(0u32);
+                            let existing_count =
+                                buyer_count_state.get(buyer_key.clone()).unwrap_or(0u32);
                             buyer_next_counts.set(buyer_key.clone(), existing_count);
                         }
                         let buyer_count = buyer_next_counts.get(buyer_key.clone()).unwrap();
@@ -5233,9 +5266,8 @@ impl CraftNexusContract {
                         buyer_next_counts.set(buyer_key, buyer_count + 1);
 
                         if !seller_next_counts.contains_key(seller_key.clone()) {
-                            let existing_count = seller_count_state
-                                .get(seller_key.clone())
-                                .unwrap_or(0u32);
+                            let existing_count =
+                                seller_count_state.get(seller_key.clone()).unwrap_or(0u32);
                             seller_next_counts.set(seller_key.clone(), existing_count);
                         }
                         let seller_count = seller_next_counts.get(seller_key.clone()).unwrap();
@@ -6059,6 +6091,23 @@ impl CraftNexusContract {
     pub fn get_escrow_count(env: Env) -> u32 {
         Self::migrate_legacy_all_escrow_ids(&env);
         Self::get_persistent_u32(&env, &DataKey::EscrowCount)
+    }
+
+    /// Return dashboard-level platform stats in one read-only contract call.
+    pub fn get_platform_stats(env: Env) -> PlatformStats {
+        Self::migrate_legacy_all_escrow_ids(&env);
+        Self::migrate_legacy_whitelisted_tokens(&env);
+
+        let active_users = Self::get_onboarding_client(&env)
+            .map(|(_, onboarding)| onboarding.get_active_user_count())
+            .unwrap_or(0);
+
+        PlatformStats {
+            total_volume: Self::get_total_volume(&env),
+            total_escrows: Self::get_persistent_u32(&env, &DataKey::EscrowCount),
+            active_users,
+            whitelist_count: Self::get_whitelist_count(&env),
+        }
     }
 
     /// Returns a page of all escrow order IDs created on the platform, in creation order.
