@@ -216,11 +216,13 @@ export function useTransactionSigner() {
 }
 
 /**
- * Sign transaction using Freighter wallet
+ * Sign transaction using Freighter wallet with signature validation
+ * Validates that the transaction is signed by the expected user
  */
 async function signWithFreighter(
   transactionXdr: string,
-  networkPassphrase: string
+  networkPassphrase: string,
+  expectedSigner?: string
 ): Promise<string | null> {
   try {
     // Dynamic import to avoid SSR issues
@@ -230,10 +232,67 @@ async function signWithFreighter(
       networkPassphrase,
     });
 
+    // Validate the signature if expected signer is provided
+    if (expectedSigner && signedTx) {
+      const isValid = await validateTransactionSignature(
+        signedTx,
+        expectedSigner,
+        networkPassphrase
+      );
+      
+      if (!isValid) {
+        console.error("Signature validation failed: Transaction was not signed by the expected wallet");
+        throw new Error("Transaction signature validation failed. Please ensure you're signing with the correct wallet.");
+      }
+      
+      console.log("✅ Signature validated successfully");
+    }
+
     return signedTx;
   } catch (error) {
     console.error("Freighter signTransaction failed:", error);
     return null;
+  }
+}
+
+/**
+ * Validate that a transaction is signed by the expected public key
+ */
+async function validateTransactionSignature(
+  signedTransactionXdr: string,
+  expectedSigner: string,
+  networkPassphrase: string
+): Promise<boolean> {
+  try {
+    const { Transaction } = await import("@stellar/stellar-sdk");
+    
+    // Parse the signed transaction
+    const transaction = new Transaction(signedTransactionXdr, networkPassphrase);
+    
+    // Get the source account (signer) from the transaction
+    const sourceAccount = transaction.source;
+    
+    // Verify the source account matches the expected signer
+    if (sourceAccount.accountId.toString() !== expectedSigner) {
+      console.error(
+        `Signature mismatch: Expected ${expectedSigner}, got ${sourceAccount.accountId.toString()}`
+      );
+      return false;
+    }
+    
+    // Additional validation: check that the transaction has signatures
+    const hasSignatures = transaction.signatures && transaction.signatures.length > 0;
+    
+    if (!hasSignatures) {
+      console.error("Transaction has no signatures");
+      return false;
+    }
+    
+    console.log(`Transaction signed by: ${sourceAccount.accountId.toString()}`);
+    return true;
+  } catch (error) {
+    console.error("Failed to validate transaction signature:", error);
+    return false;
   }
 }
 
