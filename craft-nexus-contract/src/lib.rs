@@ -11,6 +11,8 @@ use soroban_sdk::{
 extern crate alloc;
 
 #[cfg(test)]
+mod bench_batch_escrow;
+#[cfg(test)]
 mod enhanced_features_test;
 #[cfg(test)]
 mod event_snapshot_test;
