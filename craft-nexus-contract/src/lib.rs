@@ -140,6 +140,8 @@ pub enum Error {
     AlreadyApproved = 43,
     /// Token decimal places are outside the supported range (0–18)
     InvalidTokenDecimals = 44,
+    /// Provided service agreement hash is invalid (must be exactly 32 bytes)
+    InvalidServiceAgreementHash = 45,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -244,7 +246,7 @@ const ABSOLUTE_MAX_RELEASE_WINDOW: u32 = 365 * 24 * 60 * 60;
 /// Maximum platform fee in basis points (10000 = 100%)
 const MAX_PLATFORM_FEE_BPS: u32 = 1000; // 10% max
 const MAX_TOTAL_RELEASE_WINDOW: u32 = 2592000; // 30 days
-const CURRENT_ESCROW_VERSION: u32 = 4;
+const CURRENT_ESCROW_VERSION: u32 = 5;
 /// Maximum number of escrows per batch operation (Issue #111)
 // Conservative batch size to avoid exceeding instruction/read-write limits
 // observed on Soroban testnets. Reduced from 100 to 20 (Issue #198).
@@ -504,6 +506,9 @@ pub struct Escrow {
     /// if it has not yet been funded. Set to created_at + UNFUNDED_CANCEL_TIMEOUT
     /// for unfunded escrows; None for escrows that were funded at creation (#656).
     pub funding_deadline: Option<u64>,
+    /// Optional 32-byte SHA-256 hash of a custom JSON service agreement (#708).
+    /// Off-chain content can be verified via the commit-reveal pattern.
+    pub service_agreement_hash: Option<Bytes>,
 }
 
 #[contracttype]
@@ -541,6 +546,30 @@ struct EscrowWithoutBatch {
     pub metadata_hash: Option<Bytes>,
     pub dispute_reason: Option<String>,
     pub dispute_initiated_at: Option<u64>,
+}
+
+/// Escrow format before service_agreement_hash was added (#708).
+/// Used for backward-compatible deserialization during v4→v5 migration.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+struct EscrowV4 {
+    pub version: u32,
+    pub id: u64,
+    pub batch_id: Option<u64>,
+    pub buyer: Address,
+    pub seller: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub status: EscrowStatus,
+    pub release_window: u32,
+    pub created_at: u32,
+    pub ipfs_hash: Option<String>,
+    pub metadata_hash: Option<Bytes>,
+    pub dispute_reason: Option<Symbol>,
+    pub dispute_initiated_at: Option<u64>,
+    pub funded: bool,
+    pub funding_deadline: Option<u64>,
 }
 
 #[contracttype]
@@ -826,6 +855,7 @@ pub struct PlatformUnpausedEvent {
 pub struct EscrowMetadata {
     pub ipfs_hash: Option<String>,
     pub metadata_hash: Option<Bytes>,
+    pub service_agreement_hash: Option<Bytes>,
 }
 
 /// Metadata reveal proof for privacy verification (Issue #122)
@@ -984,6 +1014,7 @@ pub struct EscrowCreateParams {
     pub release_window: Option<u32>,
     pub ipfs_hash: Option<String>,
     pub metadata_hash: Option<Bytes>,
+    pub service_agreement_hash: Option<Bytes>,
 }
 
 /// Policy for handling fees when a dispute expires without arbitrator resolution.
@@ -1313,6 +1344,16 @@ impl CraftNexusContract {
         if let Some(hash) = metadata_hash {
             if hash.len() != 32 {
                 env.panic_with_error(crate::Error::InvalidMetadataHash);
+            }
+        }
+    }
+
+    /// Validate an optional 32-byte service agreement hash (#708).
+    /// Panics with `InvalidServiceAgreementHash` if present but not exactly 32 bytes.
+    fn validate_optional_service_agreement_hash(env: &Env, hash: &Option<Bytes>) {
+        if let Some(h) = hash {
+            if h.len() != 32 {
+                env.panic_with_error(crate::Error::InvalidServiceAgreementHash);
             }
         }
     }
@@ -2673,6 +2714,7 @@ impl CraftNexusContract {
             release_window,
             None,
             None,
+            None,
         )
     }
 
@@ -2687,6 +2729,7 @@ impl CraftNexusContract {
         release_window: Option<u32>,
         ipfs_hash: Option<String>,
         metadata_hash: Option<Bytes>,
+        service_agreement_hash: Option<Bytes>,
     ) -> Escrow {
         let _guard = ReentryGuardScope::new(&env);
         Self::check_not_paused(&env);
@@ -2741,6 +2784,7 @@ impl CraftNexusContract {
         let created_at = created_at_u64 as u32;
         Self::validate_optional_ipfs_hash(&env, &ipfs_hash);
         Self::validate_optional_metadata_hash(&env, &metadata_hash);
+        Self::validate_optional_service_agreement_hash(&env, &service_agreement_hash);
 
         let escrow = Escrow {
             version: CURRENT_ESCROW_VERSION,
@@ -2759,6 +2803,7 @@ impl CraftNexusContract {
             dispute_initiated_at: None,
             funded: true,
             funding_deadline: None, // Immediately funded; no deadline required (#656)
+            service_agreement_hash: service_agreement_hash.clone(),
         };
 
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
@@ -2844,6 +2889,7 @@ impl CraftNexusContract {
         window: u32,
         ipfs_hash: Option<String>,
         metadata_hash: Option<Bytes>,
+        service_agreement_hash: Option<Bytes>,
     ) -> Escrow {
         let _guard = ReentryGuardScope::new(&env);
 
@@ -2867,6 +2913,7 @@ impl CraftNexusContract {
         let created_at = created_at_u64 as u32;
         Self::validate_optional_ipfs_hash(&env, &ipfs_hash);
         Self::validate_optional_metadata_hash(&env, &metadata_hash);
+        Self::validate_optional_service_agreement_hash(&env, &service_agreement_hash);
 
         // Compute the deadline after which any party may cancel the unfunded stub (#656).
         let funding_deadline = created_at_u64 + UNFUNDED_CANCEL_TIMEOUT;
@@ -2888,6 +2935,7 @@ impl CraftNexusContract {
             dispute_initiated_at: None,
             funded: false,
             funding_deadline: Some(funding_deadline), // Deadline for funding; parties may cancel after this (#656)
+            service_agreement_hash: service_agreement_hash.clone(),
         };
 
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
@@ -3289,11 +3337,18 @@ impl CraftNexusContract {
         if map.contains_key(version_key) {
             let batch_id_key = Symbol::new(env, "batch_id");
             if map.contains_key(batch_id_key) {
-                let mut escrow = Escrow::try_from_val(env, &stored).expect("");
+                // Detect v5 (has service_agreement_hash) vs v4 (does not)
+                let sah_key = Symbol::new(env, "service_agreement_hash");
+                let mut escrow = if map.contains_key(sah_key) {
+                    Escrow::try_from_val(env, &stored).expect("")
+                } else {
+                    let v4 = EscrowV4::try_from_val(env, &stored).expect("");
+                    Self::escrow_from_v4(v4)
+                };
                 if escrow.version < CURRENT_ESCROW_VERSION {
                     escrow.version = CURRENT_ESCROW_VERSION;
                 }
-                Self::extend_persistent(env, &key); // OPTIMIZED: Ensure TTL extension on read
+                Self::extend_persistent(env, &key);
                 return escrow;
             }
 
@@ -3302,7 +3357,7 @@ impl CraftNexusContract {
             if escrow.version < CURRENT_ESCROW_VERSION {
                 escrow.version = CURRENT_ESCROW_VERSION;
             }
-            Self::extend_persistent(env, &key); // OPTIMIZED: Ensure TTL extension on read
+            Self::extend_persistent(env, &key);
             return escrow;
         }
 
@@ -3335,6 +3390,7 @@ impl CraftNexusContract {
             dispute_initiated_at: legacy.dispute_initiated_at,
             funded: true,
             funding_deadline: None, // Legacy escrows were funded at creation
+            service_agreement_hash: None,
         };
         Self::extend_persistent(env, &key); // OPTIMIZED: Ensure TTL extension on read
         upgraded
@@ -3353,7 +3409,14 @@ impl CraftNexusContract {
         if map.contains_key(version_key) {
             let batch_id_key = Symbol::new(env, "batch_id");
             let escrow = if map.contains_key(batch_id_key) {
-                Escrow::try_from_val(env, &stored).expect("")
+                // Detect v5 (has service_agreement_hash) vs v4 (does not)
+                let sah_key = Symbol::new(env, "service_agreement_hash");
+                if map.contains_key(sah_key) {
+                    Escrow::try_from_val(env, &stored).expect("")
+                } else {
+                    let v4 = EscrowV4::try_from_val(env, &stored).expect("");
+                    Self::escrow_from_v4(v4)
+                }
             } else {
                 let previous = EscrowWithoutBatch::try_from_val(env, &stored).expect("");
                 Self::escrow_from_without_batch(env, previous)
@@ -3391,6 +3454,7 @@ impl CraftNexusContract {
             dispute_initiated_at: legacy.dispute_initiated_at,
             funded: true,
             funding_deadline: None, // Legacy escrows were funded at creation
+            service_agreement_hash: None,
         };
         env.storage().persistent().set(&key, &upgraded);
         Self::extend_persistent(env, &key);
@@ -3448,10 +3512,34 @@ impl CraftNexusContract {
             created_at: escrow.created_at,
             ipfs_hash: escrow.ipfs_hash,
             metadata_hash: escrow.metadata_hash,
-            dispute_reason: dispute_symbol, // Map to lightweight Symbol
+            dispute_reason: dispute_symbol,
             dispute_initiated_at: escrow.dispute_initiated_at,
             funded: true,
-            funding_deadline: None, // Legacy escrows were funded at creation
+            funding_deadline: None,
+            service_agreement_hash: None,
+        }
+    }
+
+    /// Convert an EscrowV4 (pre-#708) to the current Escrow format.
+    fn escrow_from_v4(escrow: EscrowV4) -> Escrow {
+        Escrow {
+            version: escrow.version,
+            id: escrow.id,
+            batch_id: escrow.batch_id,
+            buyer: escrow.buyer,
+            seller: escrow.seller,
+            token: escrow.token,
+            amount: escrow.amount,
+            status: escrow.status,
+            release_window: escrow.release_window,
+            created_at: escrow.created_at,
+            ipfs_hash: escrow.ipfs_hash,
+            metadata_hash: escrow.metadata_hash,
+            dispute_reason: escrow.dispute_reason,
+            dispute_initiated_at: escrow.dispute_initiated_at,
+            funded: escrow.funded,
+            funding_deadline: escrow.funding_deadline,
+            service_agreement_hash: None,
         }
     }
 
@@ -4467,6 +4555,7 @@ impl CraftNexusContract {
         EscrowMetadata {
             ipfs_hash: escrow.ipfs_hash,
             metadata_hash: escrow.metadata_hash,
+            service_agreement_hash: escrow.service_agreement_hash,
         }
     }
 
@@ -4995,6 +5084,12 @@ impl CraftNexusContract {
             }
         }
 
+        if let Some(hash) = &params.service_agreement_hash {
+            if hash.len() != 32 {
+                return Err(Error::InvalidServiceAgreementHash);
+            }
+        }
+
         Ok(())
     }
 
@@ -5020,6 +5115,7 @@ impl CraftNexusContract {
 
         // Validate metadata (validate_escrow_params already checked ipfs_hash via validate_optional_ipfs_hash)
         Self::validate_optional_metadata_hash(env, &params.metadata_hash);
+        Self::validate_optional_service_agreement_hash(env, &params.service_agreement_hash);
 
         let escrow = Escrow {
             version: CURRENT_ESCROW_VERSION,
@@ -5038,6 +5134,7 @@ impl CraftNexusContract {
             dispute_initiated_at: None,
             funded: true,
             funding_deadline: None, // Immediately funded; no deadline required (#656)
+            service_agreement_hash: params.service_agreement_hash.clone(),
         };
 
         env.storage()

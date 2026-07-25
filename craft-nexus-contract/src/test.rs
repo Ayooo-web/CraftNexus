@@ -1396,6 +1396,7 @@ fn test_create_escrow_with_metadata_success_cid_v0() {
         &None,
         &Some(ipfs_hash.clone()),
         &Some(metadata_hash.clone()),
+        &None,
     );
     assert_eq!(escrow.id, 1);
     assert_eq!(escrow.ipfs_hash, Some(ipfs_hash.clone()));
@@ -1427,6 +1428,7 @@ fn test_create_escrow_with_metadata_success_cid_v1() {
         &None,
         &Some(ipfs_hash.clone()),
         &None,
+        &None,
     );
 
     assert_eq!(escrow.ipfs_hash, Some(ipfs_hash));
@@ -1448,6 +1450,7 @@ fn test_create_escrow_with_invalid_cid_fails() {
         &1,
         &None,
         &Some(String::from_str(&env, "a".repeat(129).as_str())),
+        &None,
         &None,
     );
 }
@@ -1471,8 +1474,127 @@ fn test_create_escrow_with_invalid_metadata_hash_length_fails() {
         &None,
         &None,
         &Some(invalid_hash),
+        &None,
     );
 }
+
+// ===== Service Agreement Hash Tests (#708) =====
+
+#[test]
+fn test_create_escrow_with_service_agreement_hash() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let service_agreement_hash = Bytes::from_array(
+        &env,
+        &[
+            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+            2, 2, 2, 2,
+        ],
+    );
+
+    let escrow = client.create_escrow_with_metadata(
+        &buyer,
+        &seller,
+        &token_id,
+        &10_000_000,
+        &1,
+        &None,
+        &None,
+        &None,
+        &Some(service_agreement_hash.clone()),
+    );
+    assert_eq!(escrow.service_agreement_hash, Some(service_agreement_hash.clone()));
+
+    let metadata = client.get_escrow_metadata(&1);
+    assert_eq!(metadata.service_agreement_hash, Some(service_agreement_hash));
+    assert_eq!(metadata.ipfs_hash, None);
+    assert_eq!(metadata.metadata_hash, None);
+}
+
+#[test]
+#[should_panic]
+fn test_create_escrow_with_invalid_service_agreement_hash_length() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let invalid_hash = Bytes::from_array(&env, &[9; 31]); // 31 bytes, not 32
+
+    client.create_escrow_with_metadata(
+        &buyer,
+        &seller,
+        &token_id,
+        &10_000_000,
+        &1,
+        &None,
+        &None,
+        &None,
+        &Some(invalid_hash),
+    );
+}
+
+#[test]
+fn test_create_escrow_with_all_metadata_fields() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let ipfs_hash = String::from_str(&env, "QmYwAPJzv5CZsnAzt8auVTL3u2M6YvM7NfF4hB9m8C3vM9");
+    let metadata_hash = Bytes::from_array(
+        &env,
+        &[
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1,
+        ],
+    );
+    let service_agreement_hash = Bytes::from_array(
+        &env,
+        &[
+            3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+            3, 3, 3, 3,
+        ],
+    );
+
+    let escrow = client.create_escrow_with_metadata(
+        &buyer,
+        &seller,
+        &token_id,
+        &10_000_000,
+        &1,
+        &None,
+        &Some(ipfs_hash.clone()),
+        &Some(metadata_hash.clone()),
+        &Some(service_agreement_hash.clone()),
+    );
+    assert_eq!(escrow.ipfs_hash, Some(ipfs_hash.clone()));
+    assert_eq!(escrow.metadata_hash, Some(metadata_hash.clone()));
+    assert_eq!(escrow.service_agreement_hash, Some(service_agreement_hash.clone()));
+
+    let metadata = client.get_escrow_metadata(&1);
+    assert_eq!(metadata.ipfs_hash, Some(ipfs_hash));
+    assert_eq!(metadata.metadata_hash, Some(metadata_hash));
+    assert_eq!(metadata.service_agreement_hash, Some(service_agreement_hash));
+}
+
+#[test]
+fn test_create_escrow_without_service_agreement_hash_defaults_none() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let escrow = client.create_escrow(&buyer, &seller, &token_id, &500, &1, &Some(3600));
+    assert_eq!(escrow.service_agreement_hash, None);
+
+    let metadata = client.get_escrow_metadata(&1);
+    assert_eq!(metadata.service_agreement_hash, None);
+}
+
 // ===== Search and Pagination Tests =====
 
 #[test]
@@ -1945,6 +2067,7 @@ fn test_create_batch_escrow_success() {
             release_window: Some(3600),
             ipfs_hash: None,
             metadata_hash: None,
+            service_agreement_hash: None,
         },
         EscrowCreateParams {
             buyer: buyer.clone(),
@@ -1955,6 +2078,7 @@ fn test_create_batch_escrow_success() {
             release_window: Some(7200),
             ipfs_hash: None,
             metadata_hash: None,
+            service_agreement_hash: None,
         },
         EscrowCreateParams {
             buyer: buyer.clone(),
@@ -1965,6 +2089,7 @@ fn test_create_batch_escrow_success() {
             release_window: None, // Uses default
             ipfs_hash: None,
             metadata_hash: None,
+            service_agreement_hash: None,
         },
     ];
 
@@ -2031,6 +2156,7 @@ fn test_create_batch_escrow_fails_on_invalid_amount() {
             release_window: Some(3600),
             ipfs_hash: None,
             metadata_hash: None,
+            service_agreement_hash: None,
         },
     ];
 
@@ -2058,6 +2184,7 @@ fn test_create_batch_escrow_fails_same_buyer_seller() {
             release_window: Some(3600),
             ipfs_hash: None,
             metadata_hash: None,
+            service_agreement_hash: None,
         },
     ];
 
@@ -2086,6 +2213,7 @@ fn test_create_batch_escrow_requires_authorization_for_each_distinct_buyer() {
             release_window: Some(3600),
             ipfs_hash: None,
             metadata_hash: None,
+            service_agreement_hash: None,
         },
         EscrowCreateParams {
             buyer: second_buyer.clone(),
@@ -2096,6 +2224,7 @@ fn test_create_batch_escrow_requires_authorization_for_each_distinct_buyer() {
             release_window: Some(3600),
             ipfs_hash: None,
             metadata_hash: None,
+            service_agreement_hash: None,
         },
     ];
 
@@ -2305,6 +2434,7 @@ fn test_reentrancy_guard_cleared_after_batch_create_error() {
             release_window: Some(3600),
             ipfs_hash: None,
             metadata_hash: None,
+            service_agreement_hash: None,
         },
     ];
 
@@ -2792,6 +2922,7 @@ fn test_batch_escrow_non_whitelisted_token_rejected() {
             release_window: Some(3600),
             ipfs_hash: None,
             metadata_hash: None,
+            service_agreement_hash: None,
         },
     ];
     let result = client.try_create_batch_escrow(&1u64, &params);
@@ -3178,6 +3309,7 @@ fn test_create_batch_escrow_consolidates_storage() {
             release_window: Some(3600),
             ipfs_hash: None,
             metadata_hash: None,
+            service_agreement_hash: None,
         });
     }
 
@@ -3220,6 +3352,7 @@ fn test_verify_metadata_reveal_success() {
         &Some(3600),
         &None,
         &Some(content_hash_bytes.clone()),
+        &None,
     );
 
     assert_eq!(escrow.metadata_hash, Some(content_hash_bytes));
@@ -3255,6 +3388,7 @@ fn test_verify_metadata_reveal_authorized_emits_metadata_verified_event() {
         &Some(3600),
         &None,
         &Some(content_hash_bytes.clone()),
+        &None,
     );
 
     let proof = MetadataRevealProof {
@@ -3345,6 +3479,7 @@ fn test_verify_metadata_reveal_invalid_content() {
         &Some(3600),
         &None,
         &Some(content_hash_bytes),
+        &None,
     );
 
     // Try to verify with different content
@@ -3402,6 +3537,7 @@ fn test_get_escrow_metadata_privacy() {
         &Some(3600),
         &None,
         &Some(content_hash_bytes.clone()),
+        &None,
     );
 
     let metadata = client.get_escrow_metadata(&1);
@@ -3434,6 +3570,7 @@ fn test_create_escrow_with_ipfs_hash_validation() {
         &Some(3600),
         &Some(ipfs_hash.clone()),
         &None,
+        &None,
     );
 
     assert_eq!(escrow.ipfs_hash, Some(ipfs_hash));
@@ -3462,6 +3599,7 @@ fn test_create_escrow_with_both_metadata_types() {
         &Some(3600),
         &Some(ipfs_hash.clone()),
         &Some(metadata_hash_bytes.clone()),
+        &None,
     );
 
     assert_eq!(escrow.ipfs_hash, Some(ipfs_hash));
@@ -3492,6 +3630,7 @@ fn test_create_batch_escrow_with_metadata() {
             release_window: Some(3600),
             ipfs_hash: None,
             metadata_hash: Some(metadata_hash_bytes.clone()),
+            service_agreement_hash: None,
         });
     }
 
@@ -3524,6 +3663,7 @@ fn test_validate_batch_creation() {
         release_window: Some(3600),
         ipfs_hash: None,
         metadata_hash: None,
+        service_agreement_hash: None,
     };
 
     let invalid_parties = EscrowCreateParams {
@@ -3535,6 +3675,7 @@ fn test_validate_batch_creation() {
         release_window: Some(3600),
         ipfs_hash: None,
         metadata_hash: None,
+        service_agreement_hash: None,
     };
 
     let valid_param = EscrowCreateParams {
@@ -3546,6 +3687,7 @@ fn test_validate_batch_creation() {
         release_window: Some(3600),
         ipfs_hash: None,
         metadata_hash: None,
+        service_agreement_hash: None,
     };
 
     let mut batch_params = soroban_sdk::Vec::new(&env);
@@ -3577,6 +3719,7 @@ fn test_validate_batch_creation_rejects_invalid_metadata_hash_length() {
         release_window: Some(3600),
         ipfs_hash: None,
         metadata_hash: Some(Bytes::from_array(&env, &[9; 31])),
+        service_agreement_hash: None,
     });
 
     let errors = client.validate_batch_creation(&batch_params);
@@ -3601,6 +3744,7 @@ fn test_validate_batch_creation_exceeds_limit() {
         release_window: Some(3600),
         ipfs_hash: None,
         metadata_hash: None,
+        service_agreement_hash: None,
     };
 
     let mut batch_params = soroban_sdk::Vec::new(&env);
@@ -3775,6 +3919,7 @@ fn test_get_escrow_count_batch_creation() {
         release_window: Some(3600),
         ipfs_hash: None,
         metadata_hash: None,
+        service_agreement_hash: None,
     };
 
     let mut batch = soroban_sdk::Vec::new(&env);
@@ -4062,6 +4207,7 @@ fn test_validate_ipfs_cid_v0_and_v1_accepts_valid_cids() {
         &Some(3600),
         &Some(cid_v0.clone()),
         &None,
+        &None,
     );
     let escrow_v1 = client.create_escrow_with_metadata(
         &buyer,
@@ -4071,6 +4217,7 @@ fn test_validate_ipfs_cid_v0_and_v1_accepts_valid_cids() {
         &2,
         &Some(3600),
         &Some(cid_v1.clone()),
+        &None,
         &None,
     );
 
@@ -4096,6 +4243,7 @@ fn test_validate_ipfs_cid_v1_stricter() {
             "QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco",
         )),
         &None,
+        &None,
     );
 
     // Valid CIDv1 base32 (sha256) - 59 chars, starts with 'ba'
@@ -4110,6 +4258,7 @@ fn test_validate_ipfs_cid_v1_stricter() {
             &env,
             "bafybeigdyrzt5scf7nqm765as5a42n367d5e46as5a42n367d5e46as5a4",
         )),
+        &None,
         &None,
     );
 }
@@ -4131,6 +4280,7 @@ fn test_validate_ipfs_cid_v1_too_short() {
         &1,
         &Some(3600),
         &Some(String::from_str(&env, "bafybeigdy")),
+        &None,
         &None,
     );
 }
@@ -4155,6 +4305,7 @@ fn test_validate_ipfs_cid_v1_wrong_version() {
             &env,
             "bbfybeigdyrzt5scf7nqm765as5a42n367d5e46as5a42n367d5e46as5a4",
         )),
+        &None,
         &None,
     );
 }
@@ -4261,6 +4412,7 @@ fn create_unfunded(
         token,
         &1_000_000i128,
         &3600u32, // 1-hour release window
+        &None,
         &None,
         &None,
     )
@@ -4382,6 +4534,7 @@ fn test_auto_cancel_unfunded_batch() {
             &3600u32,
             &None,
             &None,
+            &None,
         );
     }
 
@@ -4408,6 +4561,7 @@ fn test_auto_cancel_unfunded_skips_fresh_escrows() {
         &token_id,
         &1_000_000i128,
         &3600u32,
+        &None,
         &None,
         &None,
     );
