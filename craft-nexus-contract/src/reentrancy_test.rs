@@ -165,6 +165,11 @@ fn test_resolve_dispute_cei_pattern() {
     // Raise dispute
     client.dispute_escrow(&order_id, &Symbol::new(&env, "Issue"), &buyer);
 
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
+
     // Resolve dispute - 50/50 split
     client.resolve_dispute(&order_id, &Resolution::ReleaseToSeller, &arbitrator);
 

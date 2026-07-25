@@ -11,11 +11,15 @@ use soroban_sdk::{
 extern crate alloc;
 
 #[cfg(test)]
+mod arbitration_escalation_test;
+#[cfg(test)]
 mod enhanced_features_test;
 #[cfg(test)]
 mod event_snapshot_test;
 #[cfg(test)]
 mod expired_dispute_fee_test;
+#[cfg(test)]
+mod migration_toolkit_test;
 #[cfg(test)]
 mod min_release_window_test;
 #[cfg(test)]
@@ -140,6 +144,24 @@ pub enum Error {
     AlreadyApproved = 43,
     /// Token decimal places are outside the supported range (0–18)
     InvalidTokenDecimals = 44,
+    // ── Arbitration / Evidence / Rate limiting (45+): fix caller input or retry after gate ──
+    //
+    // NOTE: `Error` is capped at 50 cases by the Soroban contract spec XDR type
+    // (`ScSpecUdtErrorEnumV0.cases: VecM<_, 50>`); this enum is now at that cap.
+    // Adding a new variant requires retiring/merging an existing one first.
+    /// Dispute cannot be escalated yet; the escalation window has not elapsed
+    EscalationWindowActive = 45,
+    /// Evidence challenge window is still open; the dispute cannot be finalized yet
+    ChallengeWindowActive = 46,
+    /// Caller has exceeded the configured rate limit for this operation
+    RateLimitExceeded = 47,
+    /// Referenced platform config backup does not exist
+    BackupNotFound = 48,
+    /// Contract/schema version does not match the expected pre-migration version
+    VersionMismatch = 49,
+    /// Dispute lifecycle action invalid in the current context: dispute already
+    /// escalated, or a `parent_evidence_id` does not reference existing evidence
+    InvalidDisputeAction = 50,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -162,6 +184,9 @@ pub fn is_retryable(error: Error) -> bool {
             | Error::UpgradeCooldownActive
             | Error::CycleNotReady
             | Error::BatchLimitExceeded
+            | Error::EscalationWindowActive
+            | Error::ChallengeWindowActive
+            | Error::RateLimitExceeded
     )
 }
 
@@ -241,6 +266,20 @@ const DEFAULT_MIN_RELEASE_WINDOW: u32 = 24 * 60 * 60;
 /// Absolute safety ceiling for admin-configurable max release window (365 days).
 const ABSOLUTE_MAX_RELEASE_WINDOW: u32 = 365 * 24 * 60 * 60;
 
+/// Default window after `dispute_initiated_at` before a dispute may be
+/// escalated via `escalate_dispute` (3 days in seconds) (#941).
+const DEFAULT_DISPUTE_ESCALATION_WINDOW: u32 = 3 * 24 * 60 * 60;
+
+/// Default evidence/counter-evidence challenge window (2 days in seconds) (#942).
+const DEFAULT_EVIDENCE_CHALLENGE_WINDOW: u32 = 2 * 24 * 60 * 60;
+
+/// Default sliding window used to evaluate per-account rate limits (1 hour in seconds) (#943).
+const DEFAULT_RATE_LIMIT_WINDOW: u32 = 60 * 60;
+
+/// Default maximum calls per account per `rate_limit_window` for a rate-limited
+/// operation (#943).
+const DEFAULT_RATE_LIMIT_MAX_CALLS: u32 = 5;
+
 /// Maximum platform fee in basis points (10000 = 100%)
 const MAX_PLATFORM_FEE_BPS: u32 = 1000; // 10% max
 const MAX_TOTAL_RELEASE_WINDOW: u32 = 2592000; // 30 days
@@ -265,6 +304,12 @@ const MAX_RECURRING_ESCROW_ID: u64 = u64::MAX - 1;
 /// records are dropped FIFO once the cap is reached. Sized so a contract
 /// upgraded twice a year for ~16 years still has full visibility.
 const MAX_UPGRADE_HISTORY: u32 = 32;
+/// Maximum number of evidence/counter-evidence entries retained per disputed
+/// order. Older entries are dropped FIFO once the cap is reached (#942).
+const MAX_EVIDENCE_PER_DISPUTE: u32 = 20;
+/// Maximum number of `PlatformConfig` backups retained. Older backups are
+/// dropped FIFO once the cap is reached (#944).
+const MAX_CONFIG_BACKUPS: u32 = 10;
 
 /// Symbol topics emitted alongside `UpgradeProposalEvent`.
 const UPGRADE_PROPOSED: Symbol = symbol_short!("UPG_PROP");
@@ -306,17 +351,6 @@ pub enum DataKey {
     ArtisanFeeTier(Address),
     /// Staked token amount and asset for an artisan
     ArtisanStake(Address),
-    StakeCooldownEnd(Address),
-    /// DEPRECATED single-cooldown timestamp for an artisan.
-    ///
-    /// Active stake/unstake logic uses [`DataKey::ArtisanStakeQueue`]; this
-    /// key is **never read** by any code path in the live contract and
-    /// cannot influence cooldown decisions. It is updated alongside the
-    /// queue (set to the latest `cooldown_end`) purely so older read-only
-    /// clients still see a meaningful value. Once a queue is fully
-    /// drained the key is removed in `unstake_tokens`.
-    ///
-    ///
     /// Per-deposit stake queue for an artisan. Each entry represents an
     /// individual deposit and its cooldown end timestamp. This allows
     /// accurate tracking of staking timeframes when multiple deposits
@@ -397,6 +431,23 @@ pub enum DataKey {
     /// Ledger timestamp (u64) recorded when the last upgrade proposal was
     /// cancelled. Used to enforce CANCEL_REPROPOSE_COOLDOWN (Issue #618).
     LastUpgradeCancelledAt,
+    // NOTE: `DataKey` is capped at 50 cases by the Soroban contract spec XDR
+    // type (`ScSpecUdtUnionV0.cases: VecM<_, 50>`); this enum is now at that
+    // cap. Adding a new variant requires retiring/merging an existing one
+    // first (e.g. folding a bounded log into a single Vec-valued key, as done
+    // below for `Evidence` and `PlatformConfigBackups`).
+    /// Escalation checkpoint state for a disputed order (#941)
+    DisputeEscalation(u32),
+    /// Bounded log of evidence/counter-evidence entries for a disputed order,
+    /// keyed by `order_id`. Stores a `Vec<Evidence>` capped at
+    /// `MAX_EVIDENCE_PER_DISPUTE` (#942)
+    Evidence(u32),
+    /// Sliding rate-limit window state for (account, action) (#943)
+    RateLimit(Address, RateLimitAction),
+    /// Bounded log of `PlatformConfig` backups taken by the admin ahead of a
+    /// migration. Stores a `Vec<PlatformConfigBackupEntry>` capped at
+    /// `MAX_CONFIG_BACKUPS` (#944)
+    PlatformConfigBackups,
 }
 
 #[contracttype]
@@ -971,6 +1022,41 @@ pub struct VersionInfo {
     pub upgrade_count: u32,
 }
 
+/// One entry in the bounded `PlatformConfigBackups` log (#944).
+///
+/// `id` is a monotonically increasing identifier assigned at backup time; it
+/// keeps rolling back to a specific backup unambiguous even after older
+/// entries have been trimmed FIFO from the log.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct PlatformConfigBackupEntry {
+    pub id: u32,
+    pub config: PlatformConfig,
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted whenever an admin snapshots `PlatformConfig` before a migration (#944).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct PlatformConfigBackupEvent {
+    pub backup_id: u32,
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted whenever an admin restores `PlatformConfig` from a prior backup (#944).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct PlatformConfigRolledBackEvent {
+    pub backup_id: u32,
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
 /// Parameters for batch escrow creation
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
@@ -1051,6 +1137,20 @@ pub struct PlatformConfig {
     pub expired_dispute_fee_policy: ExpiredDisputeFeePolicy,
     /// Minimum release window to prevent "flash" auto-releases (default: 1 day)
     pub min_release_window: u32,
+    /// Seconds after `dispute_initiated_at` before a dispute becomes eligible
+    /// for `escalate_dispute` (default: 3 days). Must be strictly less than
+    /// `max_dispute_duration` so escalation always precedes the hard timeout (#941).
+    pub dispute_escalation_window: u32,
+    /// Seconds after `dispute_initiated_at` during which evidence and
+    /// counter-evidence may be submitted; `resolve_dispute` is blocked until
+    /// this window elapses (default: 2 days) (#942).
+    pub evidence_challenge_window: u32,
+    /// Sliding window length (seconds) used to evaluate per-account rate
+    /// limits on sensitive operations (default: 1 hour) (#943).
+    pub rate_limit_window: u32,
+    /// Maximum number of calls a single account may make to a rate-limited
+    /// operation within `rate_limit_window` (default: 5) (#943).
+    pub rate_limit_max_calls: u32,
 }
 
 /// Partial refund proposal created during a dispute (Issue #101)
@@ -1062,6 +1162,90 @@ pub struct PartialRefundProposal {
     pub refund_amount: i128,
     pub proposed_by: Address,
     pub proposed_at: u64,
+}
+
+/// Escalation checkpoint for a disputed order (#941).
+///
+/// A dispute can be escalated exactly once, after `dispute_escalation_window`
+/// seconds have elapsed since `dispute_initiated_at`. Escalation does not by
+/// itself change who may resolve the dispute (the arbitrator/moderator/admin
+/// can always call `resolve_dispute`); it exists purely as a permissioned,
+/// auditable checkpoint that off-chain monitors and priority queues can key
+/// off of, ahead of the hard `max_dispute_duration` timeout that forces a
+/// deterministic outcome via `resolve_expired_dispute`.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct DisputeEscalation {
+    pub order_id: u32,
+    pub escalated_by: Address,
+    pub escalated_at: u64,
+}
+
+/// Emitted when a dispute is escalated (#941).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct DisputeEscalatedEvent {
+    pub order_id: u64,
+    pub escalated_by: Address,
+    pub timestamp: u64,
+}
+
+/// A single piece of evidence (or counter-evidence) submitted against a
+/// disputed order (#942).
+///
+/// `parent_evidence_id` links counter-evidence back to the original
+/// submission it is rebutting; `None` for an initial/independent submission.
+/// Entries are content-addressed via `evidence_hash` (e.g. an IPFS CID or
+/// document hash) â€” the contract never stores raw evidence content on-chain.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct Evidence {
+    pub id: u32,
+    pub order_id: u32,
+    pub submitter: Address,
+    pub evidence_hash: String,
+    pub parent_evidence_id: Option<u32>,
+    pub submitted_at: u64,
+}
+
+/// Emitted whenever evidence or counter-evidence is submitted for a dispute (#942).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct EvidenceSubmittedEvent {
+    pub order_id: u64,
+    pub evidence_id: u32,
+    pub submitter: Address,
+    pub parent_evidence_id: Option<u32>,
+    pub timestamp: u64,
+}
+
+/// Sensitive operations subject to per-account rate limiting (#943).
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+#[repr(u32)]
+pub enum RateLimitAction {
+    /// Opening a new dispute (`dispute_escrow`)
+    DisputeCreation = 0,
+    /// Admin/signer submissions such as `propose_upgrade_wasm`
+    AdminSubmission = 1,
+}
+
+/// Fixed-window rate limit counter for a single `(account, action)` pair (#943).
+///
+/// `window_start` is the ledger timestamp the current window began; `count`
+/// is the number of calls recorded since then. When a call arrives after
+/// `window_start + rate_limit_window` has elapsed, the window resets.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct RateLimitState {
+    pub window_start: u64,
+    pub count: u32,
 }
 
 /// User roles in the CraftNexus platform
@@ -1390,6 +1574,10 @@ impl CraftNexusContract {
                 stake_cooldown: DEFAULT_STAKE_COOLDOWN,
                 expired_dispute_fee_policy: ExpiredDisputeFeePolicy::RefundFullNoPlatformFee,
                 min_release_window: DEFAULT_MIN_RELEASE_WINDOW,
+                dispute_escalation_window: DEFAULT_DISPUTE_ESCALATION_WINDOW,
+                evidence_challenge_window: DEFAULT_EVIDENCE_CHALLENGE_WINDOW,
+                rate_limit_window: DEFAULT_RATE_LIMIT_WINDOW,
+                rate_limit_max_calls: DEFAULT_RATE_LIMIT_MAX_CALLS,
             });
         }
 
@@ -1668,6 +1856,49 @@ impl CraftNexusContract {
         env.storage()
             .persistent()
             .extend_ttl(key, READ_TTL_THRESHOLD, TTL_EXTENSION);
+    }
+
+    /// Enforce a per-account fixed-window rate limit on a sensitive operation (#943).
+    ///
+    /// Tracks `(account, action)` call counts in a window of
+    /// `config.rate_limit_window` seconds. Once the window elapses since it
+    /// was opened, the counter resets rather than sliding, so legitimate
+    /// bursts spread across window boundaries are never permanently blocked.
+    /// A `rate_limit_window` of `0` disables the limiter (unbounded calls).
+    fn enforce_rate_limit(
+        env: &Env,
+        account: &Address,
+        action: RateLimitAction,
+    ) -> Result<(), Error> {
+        let config = Self::get_platform_config_internal(env);
+        if config.rate_limit_window == 0 {
+            return Ok(());
+        }
+
+        let key = DataKey::RateLimit(account.clone(), action);
+        let now = env.ledger().timestamp();
+        let mut state: RateLimitState =
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(RateLimitState {
+                    window_start: now,
+                    count: 0,
+                });
+
+        if now >= state.window_start + config.rate_limit_window as u64 {
+            state.window_start = now;
+            state.count = 0;
+        }
+
+        if state.count >= config.rate_limit_max_calls {
+            return Err(Error::RateLimitExceeded);
+        }
+
+        state.count += 1;
+        env.storage().persistent().set(&key, &state);
+        Self::extend_persistent(env, &key);
+        Ok(())
     }
 
     /// Read a persistent `u32` and extend its TTL when the key exists (#515).
@@ -2358,6 +2589,10 @@ impl CraftNexusContract {
             stake_cooldown: DEFAULT_STAKE_COOLDOWN,
             expired_dispute_fee_policy: ExpiredDisputeFeePolicy::RefundFullNoPlatformFee,
             min_release_window: DEFAULT_MIN_RELEASE_WINDOW,
+            dispute_escalation_window: DEFAULT_DISPUTE_ESCALATION_WINDOW,
+            evidence_challenge_window: DEFAULT_EVIDENCE_CHALLENGE_WINDOW,
+            rate_limit_window: DEFAULT_RATE_LIMIT_WINDOW,
+            rate_limit_max_calls: DEFAULT_RATE_LIMIT_MAX_CALLS,
         };
 
         env.storage()
@@ -4014,6 +4249,8 @@ impl CraftNexusContract {
     ) -> Result<(), Error> {
         signer.require_auth();
 
+        Self::enforce_rate_limit(&env, &signer, RateLimitAction::AdminSubmission)?;
+
         Self::validate_upgrade_hash(&env, &new_wasm_hash)?;
 
         // Issue #618: Prevent cancel-and-repropose from resetting the review
@@ -4342,6 +4579,122 @@ impl CraftNexusContract {
         }
     }
 
+    // â”€â”€ Migration Toolkit / Rollback Plan (#944) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Assert the contract is at `expected_version` before proceeding with a
+    /// migration step.
+    ///
+    /// Intended as the first call in any migration script/runbook step (see
+    /// `docs/versioned-state-migration.md`): it fails fast with
+    /// `Error::VersionMismatch` if a previous step was skipped or already
+    /// applied, rather than letting a migration silently run twice or out of
+    /// order against the wrong schema version.
+    pub fn pre_migration_check(env: Env, expected_version: u32) -> Result<(), Error> {
+        if Self::get_version(env) != expected_version {
+            return Err(Error::VersionMismatch);
+        }
+        Ok(())
+    }
+
+    /// Snapshot the current `PlatformConfig` before running a migration (admin only).
+    ///
+    /// Returns the assigned backup id, which `rollback_platform_config` later
+    /// takes to restore this exact snapshot. Backups are stored in a bounded
+    /// FIFO log capped at `MAX_CONFIG_BACKUPS`; taking a backup is cheap and
+    /// is the recommended first step before any migration that touches
+    /// `PlatformConfig` (fee changes, cooldown/window tuning, admin rotation, etc).
+    pub fn backup_platform_config(env: Env) -> Result<u32, Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+
+        let config = Self::get_platform_config_internal(&env);
+        let mut backups = Self::get_platform_config_backups_internal(&env);
+        let next_id = backups.last().map(|b| b.id + 1).unwrap_or(0);
+        let now = env.ledger().timestamp();
+
+        backups.push_back(PlatformConfigBackupEntry {
+            id: next_id,
+            config,
+            admin: admin.clone(),
+            timestamp: now,
+        });
+        while backups.len() > MAX_CONFIG_BACKUPS {
+            backups.pop_front();
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlatformConfigBackups, &backups);
+        Self::extend_persistent(&env, &DataKey::PlatformConfigBackups);
+
+        env.events().publish(
+            (Symbol::new(&env, "platform_config_backup"), next_id),
+            PlatformConfigBackupEvent {
+                backup_id: next_id,
+                admin,
+                timestamp: now,
+            },
+        );
+
+        Ok(next_id)
+    }
+
+    /// Restore `PlatformConfig` from a previously taken backup (admin only).
+    ///
+    /// This is the rollback half of the migration toolkit: if a migration
+    /// step leaves `PlatformConfig` in an unexpected state, the admin can
+    /// recover the exact pre-migration snapshot rather than reconstructing
+    /// it by hand. Returns `Error::BackupNotFound` if `backup_id` has been
+    /// trimmed from the bounded log or was never taken.
+    pub fn rollback_platform_config(env: Env, backup_id: u32) -> Result<(), Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+
+        let backups = Self::get_platform_config_backups_internal(&env);
+        let entry = backups
+            .iter()
+            .find(|b| b.id == backup_id)
+            .ok_or(Error::BackupNotFound)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformConfig, &entry.config);
+
+        let now = env.ledger().timestamp();
+        env.events().publish(
+            (Symbol::new(&env, "platform_config_rolled_back"), backup_id),
+            PlatformConfigRolledBackEvent {
+                backup_id,
+                admin,
+                timestamp: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    fn get_platform_config_backups_internal(env: &Env) -> Vec<PlatformConfigBackupEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PlatformConfigBackups)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Returns the bounded log of `PlatformConfig` backups, newest last (#944).
+    pub fn get_platform_config_backups(env: Env) -> Vec<PlatformConfigBackupEntry> {
+        Self::get_platform_config_backups_internal(&env)
+    }
+
+    /// Returns a single `PlatformConfig` backup by id, if still retained (#944).
+    pub fn get_platform_config_backup(
+        env: Env,
+        backup_id: u32,
+    ) -> Option<PlatformConfigBackupEntry> {
+        Self::get_platform_config_backups_internal(&env)
+            .iter()
+            .find(|b| b.id == backup_id)
+    }
+
     /// Refund funds to buyer (admin only)
     ///
     /// # Arguments
@@ -4580,6 +4933,9 @@ impl CraftNexusContract {
     ) {
         authorized_address.require_auth();
 
+        Self::enforce_rate_limit(&env, &authorized_address, RateLimitAction::DisputeCreation)
+            .unwrap_or_else(|e| env.panic_with_error(e));
+
         let escrow_for_auth = Self::get_stored_escrow(&env, order_id);
 
         // Allow buyer or seller to dispute
@@ -4644,6 +5000,16 @@ impl CraftNexusContract {
 
         if escrow.status != EscrowStatus::Disputed {
             env.panic_with_error(crate::Error::InvalidEscrowState);
+        }
+
+        // Evidence challenge period (#942): the arbitrator cannot finalize a
+        // dispute until the challenge window has elapsed since it was opened,
+        // giving both parties a guaranteed opportunity to submit counter-evidence.
+        let initiated_at = escrow
+            .dispute_initiated_at
+            .unwrap_or_else(|| env.panic_with_error(crate::Error::InvalidEscrowState));
+        if env.ledger().timestamp() < initiated_at + config.evidence_challenge_window as u64 {
+            env.panic_with_error(crate::Error::ChallengeWindowActive);
         }
 
         // CRITICAL: Update status BEFORE external calls (CEI pattern)
@@ -4780,6 +5146,10 @@ impl CraftNexusContract {
             stake_cooldown: config.stake_cooldown,
             expired_dispute_fee_policy: config.expired_dispute_fee_policy,
             min_release_window: config.min_release_window,
+            dispute_escalation_window: config.dispute_escalation_window,
+            evidence_challenge_window: config.evidence_challenge_window,
+            rate_limit_window: config.rate_limit_window,
+            rate_limit_max_calls: config.rate_limit_max_calls,
         };
 
         env.storage()
@@ -4815,6 +5185,10 @@ impl CraftNexusContract {
             stake_cooldown: config.stake_cooldown,
             expired_dispute_fee_policy: config.expired_dispute_fee_policy,
             min_release_window: config.min_release_window,
+            dispute_escalation_window: config.dispute_escalation_window,
+            evidence_challenge_window: config.evidence_challenge_window,
+            rate_limit_window: config.rate_limit_window,
+            rate_limit_max_calls: config.rate_limit_max_calls,
         };
 
         env.storage()
@@ -5622,6 +5996,284 @@ impl CraftNexusContract {
             },
         );
 
+        Ok(())
+    }
+
+    // â”€â”€ Dispute Arbitration Escalation (#941) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Escalate a stalled dispute to a priority checkpoint.
+    ///
+    /// This does not change *who* may resolve the dispute â€” the arbitrator,
+    /// moderator, and admin can always call `resolve_dispute` â€” but it records
+    /// a permissioned, auditable checkpoint once `dispute_escalation_window`
+    /// seconds have elapsed since `dispute_initiated_at`. Off-chain monitors
+    /// and priority queues key off `DisputeEscalatedEvent` / `get_dispute_escalation`
+    /// to surface disputes that are approaching the hard `max_dispute_duration`
+    /// timeout enforced by `resolve_expired_dispute`.
+    ///
+    /// # Authorization
+    /// Callable by either party to the dispute (buyer/seller) or platform
+    /// staff (admin/arbitrator/moderator).
+    ///
+    /// # Errors
+    /// * [`Error::InvalidEscrowState`] â€” the order is not currently `Disputed`.
+    /// * [`Error::Unauthorized`] â€” caller is not a party to the dispute or platform staff.
+    /// * [`Error::EscalationWindowActive`] â€” `dispute_escalation_window` has not elapsed yet.
+    /// * [`Error::InvalidDisputeAction`] â€” the dispute has already been escalated.
+    pub fn escalate_dispute(env: Env, order_id: u32, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+
+        let escrow = Self::get_stored_escrow(&env, order_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+
+        let config = Self::get_platform_config_internal(&env);
+        let is_authorized = caller == escrow.buyer
+            || caller == escrow.seller
+            || caller == config.admin
+            || caller == config.arbitrator
+            || Some(caller.clone()) == config.moderator;
+        if !is_authorized {
+            return Err(Error::Unauthorized);
+        }
+
+        let initiated_at = escrow
+            .dispute_initiated_at
+            .ok_or(Error::InvalidEscrowState)?;
+        let now = env.ledger().timestamp();
+        if now < initiated_at + config.dispute_escalation_window as u64 {
+            return Err(Error::EscalationWindowActive);
+        }
+
+        let key = DataKey::DisputeEscalation(order_id);
+        if env.storage().persistent().has(&key) {
+            return Err(Error::InvalidDisputeAction);
+        }
+
+        env.storage().persistent().set(
+            &key,
+            &DisputeEscalation {
+                order_id,
+                escalated_by: caller.clone(),
+                escalated_at: now,
+            },
+        );
+        Self::extend_persistent(&env, &key);
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_escalated"), order_id as u64),
+            DisputeEscalatedEvent {
+                order_id: order_id as u64,
+                escalated_by: caller,
+                timestamp: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Returns the escalation checkpoint for a disputed order, if any (#941).
+    pub fn get_dispute_escalation(env: Env, order_id: u32) -> Option<DisputeEscalation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeEscalation(order_id))
+    }
+
+    /// Admin sets the dispute escalation window (in seconds) (#941).
+    pub fn set_dispute_escalation_window(env: Env, window_seconds: u32) -> Result<(), Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+
+        let mut config = Self::get_platform_config_internal(&env);
+        let old_value = config.dispute_escalation_window;
+        config.dispute_escalation_window = window_seconds;
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformConfig, &config);
+
+        Self::emit_config_updated(
+            &env,
+            "dispute_escalation_window",
+            ConfigValue::U32(old_value),
+            ConfigValue::U32(window_seconds),
+        );
+        Ok(())
+    }
+
+    // â”€â”€ Dispute Evidence Challenge Period (#942) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Submit initial evidence for a disputed order.
+    ///
+    /// Either party to the dispute (buyer or seller) may call this while the
+    /// order is `Disputed`. `evidence_hash` is a content address (e.g. an IPFS
+    /// CID or document hash) â€” the contract never stores raw evidence content.
+    /// Returns the assigned evidence id, which callers pass as
+    /// `parent_evidence_id` to `submit_counter_evidence`.
+    pub fn submit_evidence(
+        env: Env,
+        order_id: u32,
+        submitter: Address,
+        evidence_hash: String,
+    ) -> Result<u32, Error> {
+        submitter.require_auth();
+
+        let escrow = Self::get_stored_escrow(&env, order_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+        if !(submitter == escrow.buyer || submitter == escrow.seller) {
+            return Err(Error::Unauthorized);
+        }
+
+        Self::append_evidence(&env, order_id, submitter, evidence_hash, None)
+    }
+
+    /// Submit counter-evidence rebutting a previously submitted evidence entry.
+    ///
+    /// `parent_evidence_id` must reference an existing entry for the same
+    /// `order_id`, linking the rebuttal back to the original submission (#942).
+    pub fn submit_counter_evidence(
+        env: Env,
+        order_id: u32,
+        submitter: Address,
+        evidence_hash: String,
+        parent_evidence_id: u32,
+    ) -> Result<u32, Error> {
+        submitter.require_auth();
+
+        let escrow = Self::get_stored_escrow(&env, order_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+        if !(submitter == escrow.buyer || submitter == escrow.seller) {
+            return Err(Error::Unauthorized);
+        }
+
+        let existing = Self::get_evidence_list(&env, order_id);
+        if !existing.iter().any(|e| e.id == parent_evidence_id) {
+            return Err(Error::InvalidDisputeAction);
+        }
+
+        Self::append_evidence(
+            &env,
+            order_id,
+            submitter,
+            evidence_hash,
+            Some(parent_evidence_id),
+        )
+    }
+
+    /// Appends an evidence entry to the bounded per-order log, trimming FIFO
+    /// once `MAX_EVIDENCE_PER_DISPUTE` is exceeded.
+    fn append_evidence(
+        env: &Env,
+        order_id: u32,
+        submitter: Address,
+        evidence_hash: String,
+        parent_evidence_id: Option<u32>,
+    ) -> Result<u32, Error> {
+        let key = DataKey::Evidence(order_id);
+        let mut list = Self::get_evidence_list(env, order_id);
+        let next_id = list.last().map(|e| e.id + 1).unwrap_or(0);
+        let now = env.ledger().timestamp();
+
+        list.push_back(Evidence {
+            id: next_id,
+            order_id,
+            submitter: submitter.clone(),
+            evidence_hash,
+            parent_evidence_id,
+            submitted_at: now,
+        });
+        while list.len() > MAX_EVIDENCE_PER_DISPUTE {
+            list.pop_front();
+        }
+
+        env.storage().persistent().set(&key, &list);
+        Self::extend_persistent(env, &key);
+
+        env.events().publish(
+            (
+                Symbol::new(env, "dispute_evidence_submitted"),
+                order_id as u64,
+            ),
+            EvidenceSubmittedEvent {
+                order_id: order_id as u64,
+                evidence_id: next_id,
+                submitter,
+                parent_evidence_id,
+                timestamp: now,
+            },
+        );
+
+        Ok(next_id)
+    }
+
+    /// Returns the bounded evidence/counter-evidence log for a disputed order (#942).
+    pub fn get_evidence(env: Env, order_id: u32) -> Vec<Evidence> {
+        Self::get_evidence_list(&env, order_id)
+    }
+
+    fn get_evidence_list(env: &Env, order_id: u32) -> Vec<Evidence> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Evidence(order_id))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Admin sets the evidence/counter-evidence challenge window (in seconds) (#942).
+    pub fn set_evidence_challenge_window(env: Env, window_seconds: u32) -> Result<(), Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+
+        let mut config = Self::get_platform_config_internal(&env);
+        let old_value = config.evidence_challenge_window;
+        config.evidence_challenge_window = window_seconds;
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformConfig, &config);
+
+        Self::emit_config_updated(
+            &env,
+            "evidence_challenge_window",
+            ConfigValue::U32(old_value),
+            ConfigValue::U32(window_seconds),
+        );
+        Ok(())
+    }
+
+    // â”€â”€ Rate Limiting for Sensitive Operations (#943) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Admin sets the sliding-window rate limit applied to sensitive
+    /// operations (`dispute_escrow`, `propose_upgrade_wasm`).
+    ///
+    /// `window_seconds` is the length of each fixed window; `max_calls` is
+    /// the maximum number of calls a single account may make within that
+    /// window before being rejected with `Error::RateLimitExceeded`. Setting
+    /// `window_seconds` to `0` disables rate limiting entirely.
+    pub fn set_rate_limit_config(
+        env: Env,
+        window_seconds: u32,
+        max_calls: u32,
+    ) -> Result<(), Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+
+        let mut config = Self::get_platform_config_internal(&env);
+        let old_window = config.rate_limit_window;
+        config.rate_limit_window = window_seconds;
+        config.rate_limit_max_calls = max_calls;
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformConfig, &config);
+
+        Self::emit_config_updated(
+            &env,
+            "rate_limit_window",
+            ConfigValue::U32(old_window),
+            ConfigValue::U32(window_seconds),
+        );
         Ok(())
     }
 
