@@ -140,6 +140,8 @@ pub enum Error {
     AlreadyApproved = 43,
     /// Token decimal places are outside the supported range (0–18)
     InvalidTokenDecimals = 44,
+    /// Platform wallet address is invalid (zero address, contract's own address, etc.)
+    InvalidPlatformWallet = 45,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -1348,6 +1350,22 @@ impl CraftNexusContract {
         Ok(())
     }
 
+    /// Validates a proposed platform wallet address (#707).
+    ///
+    /// Rejects addresses that would cause `transfer_platform_fee` to panic at
+    /// the host level — specifically the contract's own address, which is
+    /// structurally valid but semantically meaningless as a fee destination and
+    /// would lock collected fees inside the escrow contract forever.
+    ///
+    /// Called by both `initialize` and `update_platform_wallet` so the
+    /// invariant is enforced at every write point rather than only at read time.
+    fn validate_platform_wallet(env: &Env, wallet: &Address) -> Result<(), Error> {
+        if wallet == &env.current_contract_address() {
+            return Err(Error::InvalidPlatformWallet);
+        }
+        Ok(())
+    }
+
     /// Gets platform configuration with fallback mechanism for corruption recovery (#240)
     /// Returns the primary config if valid, falls back to last-known good state if corrupted
     #[allow(dead_code)]
@@ -2342,6 +2360,12 @@ impl CraftNexusContract {
         // Validate fee is within bounds
         if platform_fee_bps > MAX_PLATFORM_FEE_BPS {
             env.panic_with_error(crate::Error::InvalidFee);
+        }
+
+        // Validate platform_wallet — reject the contract's own address to prevent
+        // fee transfers from panicking at the host level (#707).
+        if let Err(e) = Self::validate_platform_wallet(&env, &platform_wallet) {
+            env.panic_with_error(e);
         }
 
         let config = PlatformConfig {
@@ -4800,6 +4824,11 @@ impl CraftNexusContract {
     pub fn update_platform_wallet(env: Env, new_wallet: Address) {
         let config = Self::get_platform_config_internal(&env);
         config.admin.require_auth();
+
+        // Reject invalid wallet addresses before writing to storage (#707).
+        if let Err(e) = Self::validate_platform_wallet(&env, &new_wallet) {
+            env.panic_with_error(e);
+        }
 
         let new_config = PlatformConfig {
             platform_fee_bps: config.platform_fee_bps,

@@ -4484,3 +4484,62 @@ fn test_get_escrows_pagination_large_dataset() {
     let seller_page1 = client.get_escrows_by_seller(&seller, &1, &50, &false);
     assert_eq!(seller_page1.len(), 50, "seller page1 should have 50 items");
 }
+
+// ── #707 platform_wallet validation ──────────────────────────────────────────
+
+/// `initialize` must reject the contract's own address as platform_wallet.
+/// Allowing it would cause every fee transfer to panic at the host level.
+#[test]
+fn test_initialize_rejects_contract_address_as_platform_wallet() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.budget().reset_unlimited();
+
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+
+    // Pass the contract's own address as the platform wallet — must be rejected.
+    let result = client.try_initialize(
+        &contract_id,  // <-- invalid: contract's own address
+        &admin,
+        &arbitrator,
+        &500,
+        &None,
+    );
+
+    assert!(
+        result.is_err(),
+        "initialize must reject the contract address as platform_wallet"
+    );
+}
+
+/// `update_platform_wallet` must reject the contract's own address.
+#[test]
+fn test_update_platform_wallet_rejects_contract_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    // Attempting to set the wallet to the contract itself must fail.
+    let result = client.try_update_platform_wallet(&client.address);
+
+    assert!(
+        result.is_err(),
+        "update_platform_wallet must reject the contract address"
+    );
+}
+
+/// `update_platform_wallet` must accept a valid external address.
+#[test]
+fn test_update_platform_wallet_accepts_valid_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    let new_wallet = Address::generate(&env);
+    // Should succeed without panicking.
+    client.update_platform_wallet(&new_wallet);
+}
