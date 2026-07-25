@@ -620,6 +620,20 @@ Notes:
 | `DataKey::UserProfile(Address)` | Persistent | `UserProfile { address, role, username, registered_at, is_verified }` |
 | `DataKey::Username(String)` | Persistent | `Address` owner of normalized username |
 | `DataKey::Config` | Persistent | `OnboardingConfig { require_username, min_username_length, max_username_length, platform_admin }` |
+| `DataKey::VerificationHistoryCount(Address)` | Persistent | `u32` logical length of the active verification-history buffer |
+| `DataKey::VerificationHistoryIndexed(Address, u32)` | Persistent | `CompactVerificationEntry` stored in a bounded circular buffer of up to 10 slots |
+
+#### Verification History Circular-Buffer Pattern
+
+Verification history is stored as a bounded ring buffer, not as an unbounded vector. Developers should treat the count key as the source of truth:
+
+1. Read `DataKey::VerificationHistoryCount(user)` first. It stores the current logical length `count` in the range `0..=10`.
+2. When appending a new entry:
+   - if `count < 10`, write the entry to slot `count` and increment the count.
+   - if `count == 10`, shift existing slots `1..=9` down to `0..=8`, write the new entry to slot `9`, and keep the count at `10`.
+3. When reading history, iterate over slots `0..count-1` and read `DataKey::VerificationHistoryIndexed(user, slot)`.
+
+Do not infer slot numbers from timestamps or write directly to an arbitrary slot after the buffer is full. That would overwrite the historical record or leave gaps in the logical order.
 
 ---
 
