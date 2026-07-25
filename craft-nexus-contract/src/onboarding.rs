@@ -82,8 +82,8 @@
 
 use crate::alloc::string::ToString;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, Env, Map, String,
-    Symbol, TryFromVal, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env,
+    Map, String, Symbol, TryFromVal, Val, Vec,
 };
 
 /// Standard TTL threshold for persistent storage (approx 14 hours at 5s ledger)
@@ -1054,11 +1054,7 @@ pub struct OnboardingContract;
 #[contractimpl]
 impl OnboardingContract {
     fn get_queue_pointer(env: &Env, key: &DataKey) -> u64 {
-        let pointer = env.storage().persistent().get(key).unwrap_or(0u64);
-        if env.storage().persistent().has(key) {
-            Self::extend_persistent(env, key);
-        }
-        pointer
+        Self::read_persistent(env, key).unwrap_or(0u64)
     }
 
     fn set_queue_pointer(env: &Env, key: DataKey, value: u64) {
@@ -1122,12 +1118,7 @@ impl OnboardingContract {
     }
 
     fn read_username_fee_token(env: &Env) -> Option<Address> {
-        let key = DataKey::UsernameChangeFeeToken;
-        let token = env.storage().persistent().get(&key);
-        if env.storage().persistent().has(&key) {
-            Self::extend_persistent(env, &key);
-        }
-        token
+        Self::read_persistent(env, &DataKey::UsernameChangeFeeToken)
     }
 
     /// Resolve the wallet that receives username-change fees.
@@ -1135,28 +1126,18 @@ impl OnboardingContract {
     /// Reads `DataKey::UsernameChangeFeeWallet`; when unset, falls back to
     /// `config.platform_admin`. Extends TTL when the key exists.
     fn read_username_fee_wallet(env: &Env, config: &OnboardingConfig) -> Address {
-        let key = DataKey::UsernameChangeFeeWallet;
-        if let Some(wallet) = env.storage().persistent().get(&key) {
-            Self::extend_persistent(env, &key);
-            wallet
-        } else {
-            config.platform_admin.clone()
-        }
+        Self::read_persistent(env, &DataKey::UsernameChangeFeeWallet)
+            .unwrap_or_else(|| config.platform_admin.clone())
     }
 
     /// Load persisted activity metrics for `address`, or zeroed defaults.
     ///
     /// Extends TTL on `DataKey::UserMetrics(address)` when an entry exists.
     fn read_user_metrics(env: &Env, address: &Address) -> UserMetrics {
-        let key = DataKey::UserMetrics(address.clone());
-        let metrics = env.storage().persistent().get(&key).unwrap_or(UserMetrics {
+        Self::read_persistent(env, &DataKey::UserMetrics(address.clone())).unwrap_or(UserMetrics {
             total_escrow_count: 0,
             total_volume: 0,
-        });
-        if env.storage().persistent().has(&key) {
-            Self::extend_persistent(env, &key);
-        }
-        metrics
+        })
     }
 
     /// Map a compact verification action code to its canonical string label.
@@ -1165,9 +1146,9 @@ impl OnboardingContract {
     /// [`VerificationEntry::action`] via [`OnboardingContract::get_verification_history`].
     fn verification_action_to_string(env: &Env, action: VerificationActionCode) -> Symbol {
         match action {
-            VerificationActionCode::Requested => Symbol::new(env, "requested"),
-            VerificationActionCode::Approved => Symbol::new(env, "approved"),
-            VerificationActionCode::Rejected => Symbol::new(env, "rejected"),
+            VerificationActionCode::Requested => symbol_short!("requested"),
+            VerificationActionCode::Approved => symbol_short!("approved"),
+            VerificationActionCode::Rejected => symbol_short!("rejected"),
             VerificationActionCode::AutoVerified => Symbol::new(env, "auto_verified"),
             VerificationActionCode::UsernameChangedRevoked => Symbol::new(env, "username_revoked"),
         }
@@ -1241,11 +1222,11 @@ impl OnboardingContract {
     /// This prevents reentrancy where malicious callers trigger intermediate states
     /// via callbacks on arbitrary token contracts before final balance settlement.
     fn parse_verification_action(env: &Env, action: &Symbol) -> VerificationActionCode {
-        if action == &Symbol::new(env, "requested") {
+        if action == &symbol_short!("requested") {
             VerificationActionCode::Requested
-        } else if action == &Symbol::new(env, "approved") {
+        } else if action == &symbol_short!("approved") {
             VerificationActionCode::Approved
-        } else if action == &Symbol::new(env, "rejected") {
+        } else if action == &symbol_short!("rejected") {
             VerificationActionCode::Rejected
         } else if action == &Symbol::new(env, "auto_verified") {
             VerificationActionCode::AutoVerified
@@ -1453,12 +1434,7 @@ impl OnboardingContract {
         }
     }
     fn read_portfolio_cid(env: &Env, user: &Address) -> Option<Bytes> {
-        let key = DataKey::UserPortfolio(user.clone());
-        let portfolio = env.storage().persistent().get(&key);
-        if env.storage().persistent().has(&key) {
-            Self::extend_persistent(env, &key);
-        }
-        portfolio
+        Self::read_persistent(env, &DataKey::UserPortfolio(user.clone()))
     }
 
     fn write_portfolio_cid(env: &Env, user: &Address, portfolio_cid: Option<Bytes>) {
@@ -1537,7 +1513,7 @@ impl OnboardingContract {
         let key = DataKey::UserProfile(user.clone());
         let stored: Val = env.storage().persistent().get(&key)?;
         let map = Map::<Symbol, Val>::try_from_val(env, &stored).expect("");
-        let version_key = Symbol::new(env, "version");
+        let version_key = symbol_short!("version");
         let portfolio_key = Symbol::new(env, "portfolio_cid");
 
         if !map.contains_key(version_key) {
@@ -1605,6 +1581,30 @@ impl OnboardingContract {
         env.storage()
             .persistent()
             .extend_ttl(key, READ_TTL_THRESHOLD, TTL_EXTENSION);
+    }
+
+    /// Load a persistent entry and refresh its TTL in a single storage pass
+    /// (Issue #447).
+    ///
+    /// The canonical "read and keep alive" idiom in this contract used to be
+    /// `get(..)` followed by `has(..)` before calling `extend_persistent`. The
+    /// `has` probe is pure overhead: `get` already reports presence through its
+    /// `Option`, so the extra probe charges a second ledger-entry read on every
+    /// read-path invocation without changing behaviour. Routing reads through
+    /// this helper keeps the TTL refresh guaranteed (`extend_ttl` on an absent
+    /// key traps, so it must stay guarded) while paying for exactly one read.
+    ///
+    /// Returns `None` — leaving TTL untouched — when the entry does not exist.
+    fn read_persistent<K, V>(env: &Env, key: &K) -> Option<V>
+    where
+        K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+        V: TryFromVal<Env, Val>,
+    {
+        let value = env.storage().persistent().get::<K, V>(key);
+        if value.is_some() {
+            Self::extend_persistent(env, key);
+        }
+        value
     }
 
     /// TTL-bump variant that first checks the entry exists (Issue #82 optimization).
@@ -2310,14 +2310,8 @@ impl OnboardingContract {
     /// None — always returns a `bool`.
     pub fn is_onboarded(env: Env, user: Address) -> bool {
         user.require_auth();
-        let key = DataKey::UserProfile(user.clone());
-        // Issue #423/#435: extend TTL on read to prevent storage expiry
-        if env.storage().persistent().has(&key) {
-            Self::extend_persistent(&env, &key);
-            true
-        } else {
-            false
-        }
+        // Issue #423/#435: extend TTL on read to prevent storage expiry.
+        Self::extend_persistent_if_present(&env, &DataKey::UserProfile(user))
     }
 
     /// Get a user's role.
@@ -2904,19 +2898,7 @@ impl OnboardingContract {
     pub fn get_user_metrics(env: Env, address: Address) -> UserMetrics {
         // Issue #426/#434: require auth to prevent unauthorized access to user activity data
         address.require_auth();
-        let metrics_key = DataKey::UserMetrics(address.clone());
-        let metrics = env
-            .storage()
-            .persistent()
-            .get::<DataKey, UserMetrics>(&metrics_key)
-            .unwrap_or(UserMetrics {
-                total_escrow_count: 0,
-                total_volume: 0,
-            });
-        if env.storage().persistent().has(&metrics_key) {
-            Self::extend_persistent(&env, &metrics_key);
-        }
-        metrics
+        Self::read_user_metrics(&env, &address)
     }
 
     /// Increment a user's activity metrics (called by the escrow contract).
@@ -3063,15 +3045,13 @@ impl OnboardingContract {
             None => config.platform_admin.require_auth(),
         }
 
+        // A single `get` both yields the counter and tells us whether the entry
+        // exists, so the removal below needs no extra `has` probe. The TTL is
+        // not refreshed here either: this write path always ends by either
+        // removing the entry or rewriting it with a fresh TTL (#447).
         let key = DataKey::ActiveContractCount(user.clone());
-        let current = env
-            .storage()
-            .persistent()
-            .get::<_, u32>(&key)
-            .unwrap_or(0u32);
-        if env.storage().persistent().has(&key) {
-            Self::extend_persistent(&env, &key);
-        }
+        let stored = env.storage().persistent().get::<_, u32>(&key);
+        let current = stored.unwrap_or(0u32);
 
         let next = if delta > 0 {
             current.saturating_add(delta as u32)
@@ -3084,7 +3064,7 @@ impl OnboardingContract {
         };
 
         if next == 0 {
-            if env.storage().persistent().has(&key) {
+            if stored.is_some() {
                 env.storage().persistent().remove(&key);
             }
         } else {
@@ -3399,25 +3379,19 @@ impl OnboardingContract {
         Self::migrate_legacy_verification_history(&env, &user);
 
         let count_key = DataKey::VerificationHistoryCount(user.clone());
-        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        if env.storage().persistent().has(&count_key) {
-            Self::extend_persistent(&env, &count_key);
-        }
+        let count: u32 = Self::read_persistent(&env, &count_key).unwrap_or(0);
 
         let mut result = Vec::new(&env);
         for index in 0..count {
             let entry_key = DataKey::VerificationHistoryIndexed(user.clone(), index);
-            if let Some(compact) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, CompactVerificationEntry>(&entry_key)
+            if let Some(compact) =
+                Self::read_persistent::<_, CompactVerificationEntry>(&env, &entry_key)
             {
                 result.push_back(VerificationEntry {
                     timestamp: compact.timestamp,
                     action: Self::verification_action_to_string(&env, compact.action),
                     by: compact.by,
                 });
-                Self::extend_persistent(&env, &entry_key);
             }
         }
         result
@@ -3457,12 +3431,12 @@ impl OnboardingContract {
         let mut queue = Vec::new(&env);
 
         for index in head..tail {
+            // Issue #447: every slot walked here has its TTL refreshed, not just
+            // the head slot that `advance_verification_head` touches. Without
+            // this, a queue entry sitting behind a long-lived head request could
+            // be archived and silently drop its user from the queue.
             let queue_index_key = DataKey::VerificationQueueIndex(index);
-            if let Some(user) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, Address>(&queue_index_key)
-            {
+            if let Some(user) = Self::read_persistent::<_, Address>(&env, &queue_index_key) {
                 if Self::is_verification_pending_internal(&env, &user) {
                     queue.push_back(user);
                 }
@@ -3654,14 +3628,7 @@ impl OnboardingContract {
 
         // Enforce cooldown between username changes for the same user.
         let cooldown_key = DataKey::LastUsernameChange(user.clone());
-        if let Some(last_change) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, u64>(&cooldown_key)
-        {
-            if env.storage().persistent().has(&cooldown_key) {
-                Self::extend_persistent(&env, &cooldown_key);
-            }
+        if let Some(last_change) = Self::read_persistent::<_, u64>(&env, &cooldown_key) {
             let current_time = env.ledger().timestamp();
             assert!(
                 current_time > last_change.saturating_add(USERNAME_CHANGE_COOLDOWN),
@@ -3894,12 +3861,7 @@ impl OnboardingContract {
     /// # Errors
     /// None.
     pub fn get_username_change_fee(env: Env) -> i128 {
-        let fee_key = DataKey::UsernameChangeFee;
-        let fee = env.storage().persistent().get(&fee_key).unwrap_or(0);
-        if env.storage().persistent().has(&fee_key) {
-            Self::extend_persistent(&env, &fee_key);
-        }
-        fee
+        Self::read_persistent(&env, &DataKey::UsernameChangeFee).unwrap_or(0)
     }
 
     /// Get the configured token used for username change fees.
