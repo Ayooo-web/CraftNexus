@@ -4476,7 +4476,6 @@ impl CraftNexusContract {
         let fee_amount = Self::calculate_fee(env, escrow.amount, fee_bps);
         let seller_amount = escrow.amount - fee_amount;
 
-        let token_client = token::Client::new(env, &escrow.token);
         if fee_amount > 0 {
             Self::transfer_platform_fee(env, &escrow.token, &config.platform_wallet, fee_amount);
         }
@@ -4488,10 +4487,47 @@ impl CraftNexusContract {
     }
 
     fn refund_funds_to_buyer(env: &Env, escrow: &Escrow) {
-        let token_client = token::Client::new(env, &escrow.token);
         Self::transfer_tokens_and_record_audit(env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(env, "refund"), escrow.amount);
 
         // Track locked funds (#212)
+        Self::update_total_locked(env, &escrow.token, -escrow.amount);
+    }
+
+    /// Split escrow between buyer and seller, charging platform fee once on
+    /// the seller's portion only.
+    fn release_funds_partial(env: &Env, escrow: &Escrow, buyer_amount: i128) {
+        let config = Self::get_platform_config_internal(env);
+        let seller_gross = escrow.amount - buyer_amount;
+        let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
+        let fee_amount = Self::calculate_fee(env, seller_gross, fee_bps);
+        let seller_net = seller_gross - fee_amount;
+
+        if fee_amount > 0 {
+            Self::transfer_platform_fee(env, &escrow.token, &config.platform_wallet, fee_amount);
+        }
+
+        Self::transfer_tokens_and_record_audit(
+            env,
+            &escrow.token,
+            &env.current_contract_address(),
+            &escrow.buyer,
+            buyer_amount,
+            &escrow.buyer,
+            Symbol::new(env, "partial_release_buyer"),
+            buyer_amount,
+        );
+
+        Self::transfer_tokens_and_record_audit(
+            env,
+            &escrow.token,
+            &env.current_contract_address(),
+            &escrow.seller,
+            seller_net,
+            &escrow.seller,
+            Symbol::new(env, "partial_release_seller"),
+            seller_net,
+        );
+
         Self::update_total_locked(env, &escrow.token, -escrow.amount);
     }
 
@@ -4847,6 +4883,102 @@ impl CraftNexusContract {
                 );
             }
         }
+    }
+
+    /// Resolve a dispute by splitting funds between buyer and seller.
+    ///
+    /// `buyer_amount` is the gross amount returned to the buyer. The platform
+    /// fee is charged once on the seller's portion only, matching the logic of
+    /// a normal release but applied to a reduced seller share.
+    pub fn resolve_dispute_partial(
+        env: Env,
+        order_id: u32,
+        buyer_amount: i128,
+        authorized_address: Address,
+    ) {
+        let _guard = ReentryGuardScope::new(&env);
+        let config = Self::get_platform_config_internal(&env);
+        authorized_address.require_auth();
+        let is_authorized = authorized_address == config.admin
+            || Some(authorized_address.clone()) == config.moderator
+            || authorized_address == config.arbitrator;
+        if !is_authorized {
+            env.panic_with_error(crate::Error::Unauthorized);
+        }
+
+        let mut escrow = Self::get_stored_escrow(&env, order_id);
+
+        if escrow.status != EscrowStatus::Disputed {
+            env.panic_with_error(crate::Error::InvalidEscrowState);
+        }
+
+        if buyer_amount <= 0 || buyer_amount >= escrow.amount {
+            env.panic_with_error(crate::Error::InvalidRefundAmount);
+        }
+
+        escrow.status = EscrowStatus::Resolved;
+        env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+
+        let proposal_key = DataKey::PartialRefundProposal(order_id);
+        env.storage().persistent().remove(&proposal_key);
+
+        Self::update_active_obligations(&env, &escrow.buyer, -1);
+        Self::update_active_obligations(&env, &escrow.seller, -1);
+        Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
+        Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
+
+        Self::release_funds_partial(&env, &escrow, buyer_amount);
+
+        Self::emit_escrow_created(
+            &env,
+            EscrowEvent {
+                escrow_id: order_id as u64,
+                action: EscrowAction::Resolved,
+                buyer: escrow.buyer.clone(),
+                seller: escrow.seller.clone(),
+                amount: escrow.amount,
+                token: escrow.token.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Self::emit_escrow_resolved_event(
+            &env,
+            EscrowResolvedEvent {
+                escrow_id: order_id as u64,
+                buyer: escrow.buyer.clone(),
+                seller: escrow.seller.clone(),
+                arbitrator: authorized_address.clone(),
+                amount: escrow.amount,
+                token: escrow.token.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        let ts = env.ledger().timestamp();
+        Self::emit_reputation_update(
+            &env,
+            ReputationUpdateEvent {
+                address: escrow.seller.clone(),
+                successful_delta: 1,
+                disputed_delta: 0,
+                metrics_sales_delta: 1,
+                metrics_amount: buyer_amount,
+                token: escrow.token.clone(),
+                timestamp: ts,
+            },
+        );
+        Self::emit_reputation_update(
+            &env,
+            ReputationUpdateEvent {
+                address: escrow.buyer.clone(),
+                successful_delta: 1,
+                disputed_delta: 0,
+                metrics_sales_delta: 0,
+                metrics_amount: 0,
+                token: escrow.token.clone(),
+                timestamp: ts,
+            },
+        );
     }
 
     /// Update platform fee percentage (admin only)
@@ -6190,9 +6322,9 @@ impl CraftNexusContract {
     /// Accept the outstanding partial refund proposal for a disputed escrow.
     ///
     /// The counterparty (the party that did NOT submit the proposal) calls this function.
-    /// Funds are distributed from a gross refund model: buyer receives
-    /// `refund_amount - refund_fee`, seller receives the remainder minus seller-side
-    /// platform fee. The escrow status is set to Resolved.
+    /// Funds are distributed from a gross refund model: buyer receives the full
+    /// proposed refund amount, seller receives the remainder minus a single
+    /// platform fee on the seller's portion. The escrow status is set to Resolved.
     pub fn accept_partial_refund(env: Env, order_id: u32) -> Result<(), Error> {
         let escrow_opt: Option<Escrow> = env.storage().persistent().get(&(ESCROW, order_id));
         if escrow_opt.is_none() {
@@ -6220,16 +6352,13 @@ impl CraftNexusContract {
         }
 
         let refund_amount_gross = proposal.refund_amount;
-        let refund_fee = Self::calculate_partial_refund_fee(&env, refund_amount_gross);
-        let refund_amount_net = refund_amount_gross - refund_fee;
         let seller_gross = escrow.amount - refund_amount_gross;
 
-        // Deduct platform fee from seller's portion using effective fee bps
+        // Platform fee is charged once on the seller's portion only.
         let config = Self::get_platform_config_internal(&env);
         let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
         let seller_fee = Self::calculate_fee(&env, seller_gross, fee_bps);
         let seller_net = seller_gross - seller_fee;
-        let total_platform_fee = refund_fee.saturating_add(seller_fee);
 
         // CEI Pattern: EFFECTS - Update state BEFORE external calls
         escrow.status = EscrowStatus::Resolved;
@@ -6246,20 +6375,19 @@ impl CraftNexusContract {
         Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
 
         // CEI Pattern: INTERACTIONS - External calls AFTER state updates
-        let token_client = token::Client::new(&env, &escrow.token);
 
         // Refund buyer and record audit
-        if refund_amount_net > 0 {
-            Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, refund_amount_net, &escrow.buyer, Symbol::new(&env, "partial_refund_buyer"), refund_amount_net);
+        if refund_amount_gross > 0 {
+            Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, refund_amount_gross, &escrow.buyer, Symbol::new(&env, "partial_refund_buyer"), refund_amount_gross);
         }
 
-        // Pay platform fee
-        if total_platform_fee > 0 {
+        // Pay platform fee (single deduction on seller's portion only)
+        if seller_fee > 0 {
             Self::transfer_platform_fee(
                 &env,
                 &escrow.token,
                 &config.platform_wallet,
-                total_platform_fee,
+                seller_fee,
             );
         }
 
@@ -6322,23 +6450,9 @@ impl CraftNexusContract {
         Ok(())
     }
 
-    /// Returns the currently configured refund-side fee basis points.
-    ///
-    /// Today this is intentionally fixed at 0 bps. A future governance feature
-    /// can replace this implementation with configurable storage without changing
-    /// partial-refund validation semantics.
-    fn get_refund_fee_bps(_env: &Env) -> u32 {
-        0
-    }
-
-    /// Calculate refund-side fee charged against a proposed gross partial refund.
-    fn calculate_partial_refund_fee(env: &Env, gross_refund_amount: i128) -> i128 {
-        let refund_fee_bps = Self::get_refund_fee_bps(env);
-        Self::calculate_fee(env, gross_refund_amount, refund_fee_bps)
-    }
-
-    /// Validate gross partial refund amount against escrow solvency including any
-    /// potential refund-side fee that may apply.
+    /// Validate gross partial refund amount against escrow solvency.
+    /// The buyer receives the full gross refund; the platform fee is charged
+    /// once on the seller's remaining portion.
     fn is_valid_partial_refund_gross_amount(
         env: &Env,
         escrow: &Escrow,
@@ -6347,8 +6461,10 @@ impl CraftNexusContract {
         if gross_refund <= 0 || gross_refund > escrow.amount {
             return false;
         }
-        let potential_refund_fee = Self::calculate_partial_refund_fee(env, gross_refund);
-        gross_refund.saturating_add(potential_refund_fee) <= escrow.amount
+        let seller_gross = escrow.amount - gross_refund;
+        let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
+        let seller_fee = Self::calculate_fee(env, seller_gross, fee_bps);
+        seller_gross >= seller_fee
     }
 
     /// Create a new recurring escrow for recurring payments/subscriptions.
