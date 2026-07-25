@@ -138,6 +138,8 @@ pub enum Error {
     NotAnUpgradeSigner = 42,
     /// The same signer already approved this WASM upgrade hash
     AlreadyApproved = 43,
+    /// Token decimal places are outside the supported range (0–18)
+    InvalidTokenDecimals = 44,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -2084,9 +2086,24 @@ impl CraftNexusContract {
     /// Once at least one token is whitelisted, only whitelisted tokens may be
     /// used in escrow creation. The check is skipped when the whitelist is empty,
     /// preserving backward compatibility.
-    pub fn whitelist_token(env: Env, token: Address) {
+    ///
+    /// # Decimal validation
+    ///
+    /// The token's `decimals()` value must be in the range 0–18 (inclusive).
+    /// Tokens with more than 18 decimal places would overflow the volume
+    /// normalization arithmetic in the onboarding contract and are rejected
+    /// with [`Error::InvalidTokenDecimals`].
+    pub fn whitelist_token(env: Env, token: Address) -> Result<(), Error> {
         let config = Self::get_platform_config_internal(&env);
         config.admin.require_auth();
+
+        // Validate token decimals before storing; tokens with > 18 decimals would
+        // overflow the i128 volume normalization in the onboarding contract.
+        let token_client = token::Client::new(&env, &token);
+        let decimals = token_client.decimals();
+        if decimals > 18 {
+            return Err(Error::InvalidTokenDecimals);
+        }
 
         Self::migrate_legacy_whitelisted_tokens(&env);
         let token_key = DataKey::WhitelistedTokenIndexed(token.clone());
@@ -2098,6 +2115,7 @@ impl CraftNexusContract {
             count += 1;
             Self::set_whitelist_count(&env, count);
         }
+        Ok(())
     }
 
     /// Remove a token from the platform whitelist (admin only).
