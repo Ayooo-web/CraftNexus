@@ -166,6 +166,26 @@ fn test_release_funds_success() {
 }
 
 #[test]
+fn test_fund_movements_create_audit_records() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+
+    let history = client.get_fund_audit_history(&buyer);
+    assert_eq!(history.len(), 1);
+
+    let entry = history.get(0).unwrap();
+    assert_eq!(entry.actor, buyer);
+    assert_eq!(entry.amount, 50_000_000);
+    assert_eq!(entry.reason, Symbol::new(&env, "escrow_funding"));
+    assert_eq!(entry.balance_impact, -50_000_000);
+    assert!(entry.timestamp > 0);
+}
+
+#[test]
 #[should_panic]
 fn test_release_funds_already_processed() {
     let env = Env::default();
