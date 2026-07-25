@@ -4519,6 +4519,43 @@ impl CraftNexusContract {
         history
     }
 
+    /// Read the total number of fund-movement audit entries for an account.
+    pub fn get_fund_audit_count(env: Env, actor: Address) -> u32 {
+        let count_key = DataKey::FundAuditCount(actor);
+        env.storage().persistent().get(&count_key).unwrap_or(0)
+    }
+
+    /// Read a paginated slice of the fund-movement audit history for an account.
+    ///
+    /// # Arguments
+    /// * `actor` - Account address to query audit history for
+    /// * `start_index` - Starting zero-based index of audit records to read
+    /// * `limit` - Maximum number of entries to return
+    pub fn get_fund_audit_history_paginated(
+        env: Env,
+        actor: Address,
+        start_index: u32,
+        limit: u32,
+    ) -> Vec<FundMovementAuditEntry> {
+        let count_key = DataKey::FundAuditCount(actor.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let mut history = Vec::new(&env);
+
+        if start_index >= count || limit == 0 {
+            return history;
+        }
+
+        let end_index = start_index.saturating_add(limit).min(count);
+        for index in start_index..end_index {
+            let entry_key = DataKey::FundAuditIndexed(actor.clone(), index);
+            if let Some(entry) = env.storage().persistent().get::<DataKey, FundMovementAuditEntry>(&entry_key) {
+                history.push_back(entry);
+            }
+        }
+
+        history
+    }
+
     /// Get escrow metadata fields only.
     pub fn get_escrow_metadata(env: Env, order_id: u32) -> EscrowMetadata {
         let escrow = Self::get_escrow(env, order_id);
