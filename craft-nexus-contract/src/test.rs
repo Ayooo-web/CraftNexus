@@ -2876,6 +2876,111 @@ fn test_whitelist_stores_tokens_as_individual_keys() {
 }
 
 // ============================================================
+// Decimal validation on whitelist_token
+// ============================================================
+
+/// Tokens with 0 decimals (minimum boundary) are accepted.
+#[test]
+fn test_whitelist_token_accepts_zero_decimals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    use crate::onboarding::decimal_test_token::{DecimalTestToken, DecimalTestTokenClient};
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, DecimalTestToken);
+    DecimalTestTokenClient::new(&env, &contract_id).initialize(&admin, &0u32);
+
+    client.whitelist_token(&contract_id);
+    assert!(client.is_token_whitelisted(&contract_id));
+}
+
+/// Tokens with 7 decimals (standard Stellar) are accepted.
+#[test]
+fn test_whitelist_token_accepts_seven_decimals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    use crate::onboarding::decimal_test_token::{DecimalTestToken, DecimalTestTokenClient};
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, DecimalTestToken);
+    DecimalTestTokenClient::new(&env, &contract_id).initialize(&admin, &7u32);
+
+    client.whitelist_token(&contract_id);
+    assert!(client.is_token_whitelisted(&contract_id));
+}
+
+/// Tokens with 18 decimals (maximum boundary) are accepted.
+#[test]
+fn test_whitelist_token_accepts_eighteen_decimals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    use crate::onboarding::decimal_test_token::{DecimalTestToken, DecimalTestTokenClient};
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, DecimalTestToken);
+    DecimalTestTokenClient::new(&env, &contract_id).initialize(&admin, &18u32);
+
+    client.whitelist_token(&contract_id);
+    assert!(client.is_token_whitelisted(&contract_id));
+}
+
+/// Tokens with 19 decimals (one above the maximum) are rejected with
+/// InvalidTokenDecimals; the token must not appear in the whitelist.
+#[test]
+fn test_whitelist_token_rejects_nineteen_decimals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    use crate::onboarding::decimal_test_token::{DecimalTestToken, DecimalTestTokenClient};
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, DecimalTestToken);
+    DecimalTestTokenClient::new(&env, &contract_id).initialize(&admin, &19u32);
+
+    let result = client.try_whitelist_token(&contract_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::InvalidTokenDecimals)),
+        "expected InvalidTokenDecimals for 19-decimal token"
+    );
+    // Token must not have been added to the whitelist
+    assert_eq!(
+        client.get_whitelisted_token_count(),
+        0,
+        "whitelist count must stay 0 after rejection"
+    );
+}
+
+/// Tokens reporting 255 decimals (malformed metadata) are rejected with
+/// InvalidTokenDecimals.
+#[test]
+fn test_whitelist_token_rejects_255_decimals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    use crate::onboarding::decimal_test_token::{DecimalTestToken, DecimalTestTokenClient};
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, DecimalTestToken);
+    DecimalTestTokenClient::new(&env, &contract_id).initialize(&admin, &255u32);
+
+    let result = client.try_whitelist_token(&contract_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::InvalidTokenDecimals)),
+        "expected InvalidTokenDecimals for 255-decimal token"
+    );
+    assert_eq!(
+        client.get_whitelisted_token_count(),
+        0,
+        "whitelist count must stay 0 after rejection"
+    );
+}
+
+// ============================================================
 // Issue #643 – Fee token config migration audit
 // ============================================================
 

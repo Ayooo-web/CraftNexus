@@ -402,7 +402,13 @@ fn test_no_storage_limit_with_indexed_pattern() {
 #[test]
 fn test_whitelisted_tokens_individual_storage() {
     let (env, client, _, _, token1, _, _, _) = setup_test();
-    let token2 = Address::generate(&env);
+    // token2 must be a real contract so whitelist_token can call decimals() on it.
+    let token2_admin = Address::generate(&env);
+    let token2 = env
+        .register_stellar_asset_contract_v2(token2_admin.clone())
+        .address();
+    // token3 is only used with is_token_whitelisted, not whitelist_token, so a
+    // bare address is fine here.
     let token3 = Address::generate(&env);
 
     // Initially no tokens are whitelisted (count should be 0)
@@ -450,10 +456,14 @@ fn test_whitelisted_tokens_individual_storage() {
 fn test_whitelisted_tokens_scalability() {
     let (env, client, _, _, _, _admin, _, _) = setup_test();
 
-    // Create many tokens to test scalability
+    // Create many tokens to test scalability.
+    // Each token must be a real contract so whitelist_token can call decimals() on it.
     let mut tokens = soroban_sdk::Vec::new(&env);
     for _ in 0..100 {
-        let token = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         tokens.push_back(token.clone());
         client.whitelist_token(&token);
     }
