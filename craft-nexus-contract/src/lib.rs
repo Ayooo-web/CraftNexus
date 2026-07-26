@@ -6543,9 +6543,12 @@ impl CraftNexusContract {
 
     /// Prune matured stake deposits from the queue to prevent storage bloat.
     ///
-    /// Removes deposits where cooldown_end <= current_time and compacts the queue
-    /// by shifting remaining deposits to fill gaps. This maintains queue ordering
-    /// while keeping storage bounded.
+    /// Removes deposits where `cooldown_end <= now` and compacts the queue by
+    /// shifting the surviving (non-matured) deposits down to fill the freed
+    /// slots. After compaction the new count is written and **every index key
+    /// at position `new_count..old_count` is explicitly removed**, guaranteeing
+    /// that no stale `ArtisanStakeQueueIndexed` entries linger beyond the new
+    /// logical end of the queue (fix for #703).
     fn prune_matured_stake_deposits(env: &Env, artisan: &Address) {
         let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
         let current_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
@@ -6557,7 +6560,8 @@ impl CraftNexusContract {
         let now = env.ledger().timestamp();
         let mut write_index = 0u32;
 
-        // Compact queue by moving non-matured deposits to fill gaps
+        // Pass 1 – compact: move every non-matured deposit to the front of the
+        // queue, overwriting the gaps left by matured entries.
         for read_index in 0..current_count {
             let deposit_key = DataKey::ArtisanStakeQueueIndexed(artisan.clone(), read_index);
 
@@ -6567,26 +6571,37 @@ impl CraftNexusContract {
                 .get::<DataKey, StakeDeposit>(&deposit_key)
             {
                 if deposit.cooldown_end > now {
-                    // Deposit is not matured, keep it
+                    // Non-matured: keep it. Move only if it needs to shift down.
                     if write_index != read_index {
-                        // Move deposit to new position
                         let new_key =
                             DataKey::ArtisanStakeQueueIndexed(artisan.clone(), write_index);
                         env.storage().persistent().set(&new_key, &deposit);
                         Self::extend_persistent(env, &new_key);
+                        // Remove the now-vacated source slot immediately.
+                        env.storage().persistent().remove(&deposit_key);
                     }
                     write_index += 1;
-                }
-
-                // Remove old entry if we moved it or if it was matured
-                if write_index != read_index + 1 {
+                } else {
+                    // Matured: drop it.
                     env.storage().persistent().remove(&deposit_key);
                 }
             }
         }
 
-        // Update count to reflect pruned queue. If nothing remains, remove the
-        // count entry rather than leaving a stale counter behind.
+        // Pass 2 – tail cleanup: remove every index key in the range
+        // [write_index, current_count) that was not already cleaned in pass 1.
+        // This covers slots whose source entries were moved earlier in the loop
+        // (write_index caught back up to read_index) and any other edge case
+        // that could leave a stale key beyond the new logical queue end.
+        for tail_index in write_index..current_count {
+            let tail_key = DataKey::ArtisanStakeQueueIndexed(artisan.clone(), tail_index);
+            if env.storage().persistent().has(&tail_key) {
+                env.storage().persistent().remove(&tail_key);
+            }
+        }
+
+        // Update count to reflect the compacted queue, or remove the count key
+        // entirely when nothing remains.
         if write_index > 0 {
             env.storage().persistent().set(&count_key, &write_index);
             Self::extend_persistent(env, &count_key);
