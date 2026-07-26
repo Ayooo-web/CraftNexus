@@ -1117,6 +1117,8 @@ pub struct UserProfile {
     pub disputed_trades: u32,
     /// Portfolio CID for artisan showcase (IPFS) - Issue #112
     pub portfolio_cid: Option<String>,
+    /// Profile picture CID for the user (IPFS) - Issue #723
+    pub profile_pic_cid: Option<String>,
     /// Status of the user profile - Issue #113
     pub status: ProfileStatus,
 }
