@@ -11,11 +11,13 @@ name = "craft_nexus_contract"
 testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
-soroban-sdk = { version = "21.0.0" }
+soroban-sdk = { version = "21.7.7" }
 wee_alloc = "0.4.5"
+# Pin dalek 2.x: ed25519-dalek 3.x breaks soroban-env-host 21.2.1 testutils (CryptoRng bound).
+ed25519-dalek = "=2.2.0"
 
 [dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+soroban-sdk = { version = "21.7.7", features = ["testutils"] }
 
 [profile.release]
 opt-level = "z"
