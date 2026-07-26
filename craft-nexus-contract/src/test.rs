@@ -4649,3 +4649,88 @@ fn test_fund_audit_pagination_and_immutability() {
     assert_eq!(page_oob.len(), 0);
 }
 
+// ── Admin Force Refund for Long-Stalled Disputes (#712) ───────────
+
+#[test]
+fn test_force_refund_dispute_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, admin) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "Unresponsive_arbitrator"), &buyer);
+
+    // Fast-forward past the 90-day threshold
+    env.ledger().with_mut(|li| {
+        li.timestamp += 90 * 24 * 60 * 60 + 1;
+    });
+
+    let buyer_balance_before = token::Client::new(&env, &token_id).balance(&buyer);
+
+    client.force_refund_dispute(&1);
+
+    let escrow = client.get_escrow(&1);
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
+
+    let token_client = token::Client::new(&env, &token_id);
+    assert_eq!(token_client.balance(&buyer), buyer_balance_before + 50_000_000);
+}
+
+#[test]
+fn test_force_refund_dispute_not_stalled_long_enough() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _admin) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "Late_shipping"), &buyer);
+
+    // Only 30 days elapsed — below 90-day threshold
+    env.ledger().with_mut(|li| {
+        li.timestamp += 30 * 24 * 60 * 60;
+    });
+
+    let res = client.try_force_refund_dispute(&1);
+    assert!(matches!(res, Err(Ok(crate::Error::DisputeNotStalledLongEnough))));
+}
+
+#[test]
+fn test_force_refund_dispute_not_disputed_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _admin) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+
+    // No dispute raised — escrow is Active
+    env.ledger().with_mut(|li| {
+        li.timestamp += 91 * 24 * 60 * 60;
+    });
+
+    let res = client.try_force_refund_dispute(&1);
+    assert!(matches!(res, Err(Ok(crate::Error::InvalidEscrowState))));
+}
+
+#[test]
+fn test_force_refund_dispute_non_admin_unauthorized() {
+    let env = Env::default();
+    let (client, buyer, seller, token_id, token_admin, _, _admin) = setup_test(&env, false);
+
+    token_admin.mint(&buyer, &100_000_000);
+    env.mock_all_auths();
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "Late_shipping"), &buyer);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += 91 * 24 * 60 * 60;
+    });
+
+    let unauthorized = Address::generate(&env);
+    let res = client.try_force_refund_dispute(&1);
+    // Should fail auth since unauthorized is not the admin
+    assert!(res.is_err());
+}
+

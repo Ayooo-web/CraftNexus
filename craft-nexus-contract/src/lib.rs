@@ -140,6 +140,8 @@ pub enum Error {
     AlreadyApproved = 43,
     /// Token decimal places are outside the supported range (0–18)
     InvalidTokenDecimals = 44,
+    /// Dispute has not been open long enough for admin force-refund (#712)
+    DisputeNotStalledLongEnough = 45,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -232,6 +234,11 @@ const CANCEL_REPROPOSE_COOLDOWN: u64 = 7 * 24 * 60 * 60; // 7 days
 
 /// Default maximum duration a dispute can remain open before it can be force-resolved (30 days in seconds)
 const DEFAULT_MAX_DISPUTE_DURATION: u32 = 30 * 24 * 60 * 60;
+
+/// Minimum time (seconds) a dispute must remain open before admin can force-refund
+/// bypassing an unresponsive arbitrator (90 days). This is intentionally 3× the normal
+/// max dispute duration to ensure only genuinely stalled disputes qualify.
+const ADMIN_FORCE_REFUND_THRESHOLD: u64 = 90 * 24 * 60 * 60;
 
 /// Default cooldown period after staking before tokens can be unstaked (7 days in seconds)
 const DEFAULT_STAKE_COOLDOWN: u32 = 7 * 24 * 60 * 60;
@@ -5701,7 +5708,127 @@ impl CraftNexusContract {
         Ok(())
     }
 
-    // â”€â”€ Staking Requirement for Artisans (#99) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    /// Admin-only force refund for long-stalled disputes (#712).
+    ///
+    /// When a dispute remains open for more than 90 days and the arbitrator is
+    /// unresponsive, the platform admin can bypass the arbitrator and trigger a
+    /// full refund to the buyer.
+    ///
+    /// # Arguments
+    /// * `order_id` - The ID of the disputed escrow.
+    ///
+    /// # Requirements
+    /// * Caller must be the platform admin (`config.admin`).
+    /// * Escrow must be in `Disputed` status.
+    /// * The dispute must have been open for at least `ADMIN_FORCE_REFUND_THRESHOLD` (90 days).
+    ///
+    /// # Effects
+    /// * Refunds the full escrow amount to the buyer (no platform fee).
+    /// * Transitions escrow status to `Resolved`.
+    /// * Decrements active obligations for both buyer and seller.
+    pub fn force_refund_dispute(env: Env, order_id: u32) -> Result<(), Error> {
+        let _guard = ReentryGuardScope::new(&env);
+        let config = Self::get_platform_config_internal(&env);
+        config.admin.require_auth();
+
+        let mut escrow: Escrow = Self::get_stored_escrow(&env, order_id);
+
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+
+        let initiated_at = escrow
+            .dispute_initiated_at
+            .ok_or(Error::InvalidEscrowState)?;
+
+        let current_time = env.ledger().timestamp();
+
+        if initiated_at + ADMIN_FORCE_REFUND_THRESHOLD > current_time {
+            return Err(Error::DisputeNotStalledLongEnough);
+        }
+
+        // CEI: update state BEFORE external calls
+        escrow.status = EscrowStatus::Resolved;
+        env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+
+        Self::update_active_obligations(&env, &escrow.buyer, -1);
+        Self::update_active_obligations(&env, &escrow.seller, -1);
+
+        let proposal_key = DataKey::PartialRefundProposal(order_id);
+        env.storage().persistent().remove(&proposal_key);
+
+        Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
+        Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
+
+        // Full refund to buyer — no platform fee on admin force-refund
+        Self::transfer_tokens_and_record_audit(
+            &env,
+            &escrow.token,
+            &env.current_contract_address(),
+            &escrow.buyer,
+            escrow.amount,
+            &escrow.buyer,
+            Symbol::new(&env, "force_refund"),
+            escrow.amount,
+        );
+
+        Self::update_total_locked(&env, &escrow.token, -escrow.amount);
+
+        Self::emit_escrow_created(
+            &env,
+            EscrowEvent {
+                escrow_id: order_id as u64,
+                action: EscrowAction::Resolved,
+                buyer: escrow.buyer.clone(),
+                seller: escrow.seller.clone(),
+                amount: escrow.amount,
+                token: escrow.token.clone(),
+                timestamp: current_time,
+            },
+        );
+        Self::emit_escrow_resolved_event(
+            &env,
+            EscrowResolvedEvent {
+                escrow_id: order_id as u64,
+                buyer: escrow.buyer.clone(),
+                seller: escrow.seller.clone(),
+                arbitrator: config.admin.clone(),
+                amount: escrow.amount,
+                token: escrow.token.clone(),
+                timestamp: current_time,
+            },
+        );
+
+        // Reputation updates — disputed trade for both parties
+        Self::emit_reputation_update(
+            &env,
+            ReputationUpdateEvent {
+                address: escrow.seller.clone(),
+                successful_delta: 0,
+                disputed_delta: 1,
+                metrics_sales_delta: 0,
+                metrics_amount: 0,
+                token: escrow.token.clone(),
+                timestamp: current_time,
+            },
+        );
+        Self::emit_reputation_update(
+            &env,
+            ReputationUpdateEvent {
+                address: escrow.buyer.clone(),
+                successful_delta: 0,
+                disputed_delta: 1,
+                metrics_sales_delta: 0,
+                metrics_amount: 0,
+                token: escrow.token.clone(),
+                timestamp: current_time,
+            },
+        );
+
+        Ok(())
+    }
+
+    // ── Staking Requirement for Artisans (#99) ────────────────────────
 
     /// Stake tokens to satisfy the platform's minimum stake requirement.
     ///
