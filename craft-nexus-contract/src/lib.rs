@@ -140,6 +140,8 @@ pub enum Error {
     AlreadyApproved = 43,
     /// Token decimal places are outside the supported range (0–18)
     InvalidTokenDecimals = 44,
+    /// Persisted storage is on a legacy layout that must be migrated first.
+    StorageLayoutMismatch = 45,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -245,6 +247,12 @@ const ABSOLUTE_MAX_RELEASE_WINDOW: u32 = 365 * 24 * 60 * 60;
 const MAX_PLATFORM_FEE_BPS: u32 = 1000; // 10% max
 const MAX_TOTAL_RELEASE_WINDOW: u32 = 2592000; // 30 days
 const CURRENT_ESCROW_VERSION: u32 = 4;
+/// Explicit storage layout version for persisted contract state.
+///
+/// New deployments initialize this to `CURRENT_STORAGE_LAYOUT_VERSION`; legacy
+/// deployments without the key must run `migrate_storage_layout` before any
+/// WASM upgrade can be executed.
+const CURRENT_STORAGE_LAYOUT_VERSION: u32 = 1;
 /// Maximum number of escrows per batch operation (Issue #111)
 // Conservative batch size to avoid exceeding instruction/read-write limits
 // observed on Soroban testnets. Reduced from 100 to 20 (Issue #198).
@@ -302,6 +310,8 @@ pub enum DataKey {
     ContractVersion,
     /// Platform configuration storage key
     PlatformConfig,
+    /// Explicit storage layout version for persisted state.
+    StorageLayoutVersion,
     /// Custom fee tier for an artisan (basis points)
     ArtisanFeeTier(Address),
     /// Staked token amount and asset for an artisan
@@ -2409,6 +2419,13 @@ impl CraftNexusContract {
             .set(&DataKey::ContractVersion, &1u32);
         Self::extend_persistent(&env, &DataKey::ContractVersion);
 
+        // Initialize storage layout version so future upgrades can validate the
+        // on-disk schema before applying new logic.
+        env.storage()
+            .persistent()
+            .set(&DataKey::StorageLayoutVersion, &CURRENT_STORAGE_LAYOUT_VERSION);
+        Self::extend_persistent(&env, &DataKey::StorageLayoutVersion);
+
         // Set the onboarding contract address to enable reputation tracking (optional)
         if let Some(ref addr) = onboarding_contract {
             env.storage()
@@ -4231,6 +4248,57 @@ impl CraftNexusContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Return the persisted storage layout version.
+    pub fn get_storage_layout_version(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StorageLayoutVersion)
+            .unwrap_or(0)
+    }
+
+    /// Migrate persisted storage to the current layout version.
+    ///
+    /// This is an explicit, admin-gated migration path for legacy deployments.
+    /// Existing state is preserved by running the existing lazy migration helpers
+    /// before recording the new layout version.
+    pub fn migrate_storage_layout(env: Env) -> u32 {
+        let admin = Self::get_admin(&env).unwrap_or_else(|_| {
+            env.panic_with_error(crate::Error::PlatformNotInitialized)
+        });
+        admin.require_auth();
+
+        let current_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StorageLayoutVersion)
+            .unwrap_or(0);
+        if current_version == CURRENT_STORAGE_LAYOUT_VERSION {
+            return 0;
+        }
+
+        Self::migrate_legacy_all_escrow_ids(&env);
+        Self::migrate_legacy_whitelisted_tokens(&env);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::StorageLayoutVersion, &CURRENT_STORAGE_LAYOUT_VERSION);
+        Self::extend_persistent(&env, &DataKey::StorageLayoutVersion);
+
+        1
+    }
+
+    fn ensure_storage_layout_compatible(env: &Env) -> Result<(), Error> {
+        let stored_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StorageLayoutVersion)
+            .unwrap_or(0);
+        if stored_version != CURRENT_STORAGE_LAYOUT_VERSION {
+            return Err(Error::StorageLayoutMismatch);
+        }
+        Ok(())
+    }
+
     /// Upgrade the contract's WASM code after the grace period has elapsed.
     ///
     /// The caller passes the `expected_wasm_hash` they think is pending; if it
@@ -4243,6 +4311,8 @@ impl CraftNexusContract {
     /// On success a new `UpgradeRecord` is appended to `UpgradeHistory`,
     /// `ContractVersion` is bumped, and the proposal is cleared atomically.
     pub fn execute_upgrade(env: Env, expected_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::ensure_storage_layout_compatible(&env)?;
+
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 

@@ -1787,6 +1787,45 @@ fn test_get_version_initially() {
     assert_eq!(client.get_version(), 1);
 }
 
+#[test]
+fn test_execute_upgrade_rejects_legacy_storage_layout_without_migration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::StorageLayoutVersion);
+    });
+
+    let hash = BytesN::from_array(&env, &[9u8; 32]);
+    let result = client.try_execute_upgrade(&hash);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), Error::StorageLayoutMismatch);
+}
+
+#[test]
+fn test_migrate_storage_layout_marks_current_layout_and_preserves_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::StorageLayoutVersion);
+    });
+
+    let migrated = client.migrate_storage_layout();
+    assert_eq!(migrated, 1);
+    assert_eq!(client.get_storage_layout_version(), CURRENT_STORAGE_LAYOUT_VERSION);
+
+    let escrow = client.get_escrow(&1);
+    assert_eq!(escrow.buyer, buyer);
+    assert_eq!(escrow.amount, 50_000_000);
+    assert_eq!(escrow.status, EscrowStatus::Active);
+}
+
 // ===== Multi-sig upgrade tests =====
 
 #[test]
