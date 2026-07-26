@@ -823,18 +823,22 @@ Primary artifact:
 ### Required Secrets
 
 To deploy contracts, you will need:
-- **Source Account Secret Key**: The private key of the account that will deploy and pay for the contract. Keep this secret!
+- **Source Account Secret Key**: The private key or identity of the account that will deploy and pay for the contract. Keep this secret!
+- **Environment Configuration**: Refer to `.env.example` in this directory to set optional overrides (`STELLAR_SECRET_KEY`, `NETWORK_PASSPHRASE`, `RPC_URL`).
 
 ### Automated Deployment (Recommended)
 
-A deployment script is provided in this repository:
+A deployment script with environment variable validation and dry-run support is provided:
 
 ```bash
-./scripts/deploy.sh [testnet|mainnet] <YOUR_IDENTITY_NAME>
+./scripts/deploy.sh [testnet|mainnet] <YOUR_IDENTITY_NAME> [--dry-run]
 ```
 
-Example:
+Examples:
 ```bash
+# Validate environment and configuration without deploying (dry-run)
+./scripts/deploy.sh testnet alice --dry-run
+
 # Deploy to testnet using identity 'alice'
 ./scripts/deploy.sh testnet alice
 
@@ -843,10 +847,12 @@ Example:
 ```
 
 The script will:
-1. Run `./scripts/build.sh` with optimization, size check, and tests
-2. Configure the selected network if needed
-3. Deploy `craft_nexus_contract.wasm`
-4. Output the deployed contract ID
+1. Validate required environment variables (`STELLAR_SECRET_KEY`/`<SOURCE_ACCOUNT>`, `NETWORK_PASSPHRASE`, `RPC_URL`)
+2. Run `./scripts/build.sh` with optimization, size check, and tests
+3. Configure the selected network if needed
+4. Deploy `craft_nexus_contract.wasm` on-chain
+5. Output the deployed contract ID
+
 
 ### Manual Deployment
 
