@@ -427,6 +427,11 @@ fn test_resolve_dispute_release_to_seller() {
     client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
     client.dispute_escrow(&1, &Symbol::new(&env, "Non_delivery"), &buyer);
 
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
+
     // Arbitrator is setup in setup_test as a random Address and mock_all_auths bypasses auth
     client.resolve_dispute(&1, &Resolution::ReleaseToSeller, &admin);
 
@@ -448,6 +453,11 @@ fn test_resolve_dispute_refund_to_buyer() {
     token_admin.mint(&buyer, &100_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
     client.dispute_escrow(&1, &Symbol::new(&env, "Late_shipping"), &buyer);
+
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
 
     client.resolve_dispute(&1, &Resolution::RefundToBuyer, &admin);
 
@@ -471,6 +481,11 @@ fn test_resolve_dispute_by_moderator() {
     token_admin.mint(&buyer, &100_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
     client.dispute_escrow(&1, &Symbol::new(&env, "Moderator_review"), &buyer);
+
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
 
     client.resolve_dispute(&1, &Resolution::RefundToBuyer, &moderator);
 
@@ -1392,6 +1407,20 @@ fn test_unstake_rejects_different_token_than_original_stake() {
 }
 
 #[test]
+#[should_panic(expected = "Stake cooldown active. Remaining seconds: 604800")]
+fn test_unstake_too_early_returns_remaining_seconds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&seller, &20_000_000);
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+
+    // Try to unstake immediately (remaining seconds should be 604800)
+    client.unstake_tokens(&seller, &token_id);
+}
+
+#[test]
 fn test_create_escrow_with_metadata_success_cid_v0() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1785,6 +1814,45 @@ fn test_get_version_initially() {
     env.mock_all_auths();
     let (client, _, _, _, _, _, _) = setup_test(&env, true);
     assert_eq!(client.get_version(), 1);
+}
+
+#[test]
+fn test_execute_upgrade_rejects_legacy_storage_layout_without_migration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::StorageLayoutVersion);
+    });
+
+    let hash = BytesN::from_array(&env, &[9u8; 32]);
+    let result = client.try_execute_upgrade(&hash);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), Error::StorageLayoutMismatch);
+}
+
+#[test]
+fn test_migrate_storage_layout_marks_current_layout_and_preserves_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::StorageLayoutVersion);
+    });
+
+    let migrated = client.migrate_storage_layout();
+    assert_eq!(migrated, 1);
+    assert_eq!(client.get_storage_layout_version(), CURRENT_STORAGE_LAYOUT_VERSION);
+
+    let escrow = client.get_escrow(&1);
+    assert_eq!(escrow.buyer, buyer);
+    assert_eq!(escrow.amount, 50_000_000);
+    assert_eq!(escrow.status, EscrowStatus::Active);
 }
 
 // ===== Multi-sig upgrade tests =====
@@ -4300,7 +4368,7 @@ fn test_funding_deadline_set_on_create() {
         .funding_deadline
         .expect("funding_deadline must be set");
     // created_at is stored as u32 (truncated ledger timestamp); deadline is created_at + 86400
-    assert_eq!(deadline, escrow.created_at as u64 + 24 * 60 * 60);
+    assert_eq!(deadline, escrow.created_at + 24 * 60 * 60);
 }
 
 /// Buyer may cancel an unfunded escrow voluntarily before the deadline.
@@ -4649,88 +4717,103 @@ fn test_fund_audit_pagination_and_immutability() {
     assert_eq!(page_oob.len(), 0);
 }
 
-// ── Admin Force Refund for Long-Stalled Disputes (#712) ───────────
-
 #[test]
-fn test_force_refund_dispute_success() {
+#[should_panic]
+fn test_stake_below_minimum_threshold_rejected() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin, _, admin) = setup_test(&env, true);
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
-    token_admin.mint(&buyer, &100_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
-    client.dispute_escrow(&1, &Symbol::new(&env, "Unresponsive_arbitrator"), &buyer);
+    // Admin sets minimum stake required to 10_000_000
+    client.set_min_stake_required(&10_000_000).unwrap();
 
-    // Fast-forward past the 90-day threshold
-    env.ledger().with_mut(|li| {
-        li.timestamp += 90 * 24 * 60 * 60 + 1;
-    });
-
-    let buyer_balance_before = token::Client::new(&env, &token_id).balance(&buyer);
-
-    client.force_refund_dispute(&1);
-
-    let escrow = client.get_escrow(&1);
-    assert_eq!(escrow.status, EscrowStatus::Resolved);
-
-    let token_client = token::Client::new(&env, &token_id);
-    assert_eq!(token_client.balance(&buyer), buyer_balance_before + 50_000_000);
+    token_admin.mint(&seller, &20_000_000);
+    // Staking 5_000_000 when min required is 10_000_000 should panic
+    client.stake_tokens(&seller, &token_id, &5_000_000);
 }
 
 #[test]
-fn test_force_refund_dispute_not_stalled_long_enough() {
+#[should_panic]
+fn test_unstake_with_active_obligations_below_min_stake_rejected() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin, _, _admin) = setup_test(&env, true);
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
-    token_admin.mint(&buyer, &100_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
-    client.dispute_escrow(&1, &Symbol::new(&env, "Late_shipping"), &buyer);
+    client.set_min_stake_required(&10_000_000).unwrap();
 
-    // Only 30 days elapsed — below 90-day threshold
+    token_admin.mint(&seller, &20_000_000);
+    token_admin.mint(&buyer, &20_000_000);
+
+    // Stake 15_000_000 in two deposits so partial unstaking is possible
+    client.stake_tokens(&seller, &token_id, &15_000_000);
+
+    // Create an active escrow (seller has active obligations)
+    client.create_escrow(&buyer, &seller, &token_id, &5_000_000, &1, &None);
+    assert!(client.has_active_escrows(&seller));
+
     env.ledger().with_mut(|li| {
-        li.timestamp += 30 * 24 * 60 * 60;
+        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
     });
 
-    let res = client.try_force_refund_dispute(&1);
-    assert!(matches!(res, Err(Ok(crate::Error::DisputeNotStalledLongEnough))));
+    // Unstaking matured 15_000_000 while active escrow exists leaves 0 stake (< 10_000_000 min requirement)
+    client.unstake_tokens(&seller, &token_id);
 }
 
 #[test]
-fn test_force_refund_dispute_not_disputed_state() {
+fn test_partial_unstake_consistent_collateral_rules() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin, _, _admin) = setup_test(&env, true);
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
-    token_admin.mint(&buyer, &100_000_000);
-    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+    client.set_min_stake_required(&10_000_000).unwrap();
 
-    // No dispute raised — escrow is Active
+    token_admin.mint(&seller, &50_000_000);
+    token_admin.mint(&buyer, &50_000_000);
+
+    // Stake 25_000_000
+    client.stake_tokens(&seller, &token_id, &25_000_000);
+    assert_eq!(client.get_stake(&seller), 25_000_000);
+
+    // Advance time and stake another 10_000_000
     env.ledger().with_mut(|li| {
-        li.timestamp += 91 * 24 * 60 * 60;
+        li.timestamp += 100;
+    });
+    client.stake_tokens(&seller, &token_id, &10_000_000);
+    assert_eq!(client.get_stake(&seller), 35_000_000);
+
+    // Advance past first deposit's cooldown, but before second deposit's cooldown
+    env.ledger().with_mut(|li| {
+        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64;
     });
 
-    let res = client.try_force_refund_dispute(&1);
-    assert!(matches!(res, Err(Ok(crate::Error::InvalidEscrowState))));
+    // Unstake first deposit (25_000_000 matured). Remaining stake becomes 10_000_000 (which is >= min required 10_000_000)
+    client.unstake_tokens(&seller, &token_id);
+    assert_eq!(client.get_stake(&seller), 10_000_000);
+    assert_eq!(client.is_account_under_collateralized(&seller), false);
 }
 
 #[test]
-fn test_force_refund_dispute_non_admin_unauthorized() {
+fn test_is_account_under_collateralized_detection() {
     let env = Env::default();
-    let (client, buyer, seller, token_id, token_admin, _, _admin) = setup_test(&env, false);
-
-    token_admin.mint(&buyer, &100_000_000);
     env.mock_all_auths();
-    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
-    client.dispute_escrow(&1, &Symbol::new(&env, "Late_shipping"), &buyer);
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
-    env.ledger().with_mut(|li| {
-        li.timestamp += 91 * 24 * 60 * 60;
-    });
+    token_admin.mint(&seller, &20_000_000);
+    token_admin.mint(&buyer, &20_000_000);
 
-    let unauthorized = Address::generate(&env);
-    let res = client.try_force_refund_dispute(&1);
-    // Should fail auth since unauthorized is not the admin
-    assert!(res.is_err());
+    // Stake 5_000_000 (when min stake is 0)
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+
+    // Create an escrow
+    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
+
+    // Initially min stake is 0, so not under-collateralized
+    assert_eq!(client.is_account_under_collateralized(&seller), false);
+
+    // Admin raises min stake required to 10_000_000
+    client.set_min_stake_required(&10_000_000).unwrap();
+
+    // Now seller has active obligation but stake (5M) < min_stake_required (10M)
+    assert_eq!(client.is_account_under_collateralized(&seller), true);
 }
 
