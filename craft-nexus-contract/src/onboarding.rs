@@ -445,6 +445,10 @@ pub struct OnboardCallFailedEvent {
     pub timestamp: u64,
 }
 
+/// Event emitted when a user's metrics cross auto-verification thresholds.
+///
+/// Topic: `(symbol "AutoVerifiedEvent",)`; payload contains `user`,
+/// `escrow_count`, and `volume` (normalized stroop units).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoVerifiedEvent {

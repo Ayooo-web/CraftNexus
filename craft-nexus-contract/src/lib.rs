@@ -555,6 +555,10 @@ pub struct RecurringEscrow {
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+/// Event emitted for recurring-escrow lifecycle changes (create/release/cancel).
+///
+/// Topic: `(symbol "recurring_escrow", u64 id)`; payload carries the `id`,
+/// `action`, `buyer`, `artisan`, `amount`, and `timestamp`.
 pub struct RecurringEscrowEvent {
     pub id: u64,
     pub action: RecurringEscrowAction,
@@ -682,6 +686,13 @@ pub struct FundMovementAuditEntry {
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+/// Event emitted for escrow lifecycle changes (created, disputed, released, refunded).
+///
+/// Topic: `(symbol "escrow", u64 escrow_id)`; payload includes `escrow_id`,
+/// `action`, `buyer`, `seller`, `amount`, `token`, and `timestamp`.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 pub struct EscrowEvent {
     pub escrow_id: u64,
     pub action: EscrowAction,
@@ -695,6 +706,10 @@ pub struct EscrowEvent {
     pub timestamp: u64,
 }
 
+/// Event emitted when an escrow is resolved by an arbitrator or admin action.
+///
+/// Topic: `(symbol "escrow_resolved", u64 escrow_id)`; payload contains the
+/// `escrow_id`, `buyer`, `seller`, `arbitrator`, `amount`, `token`, and `timestamp`.
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -708,6 +723,11 @@ pub struct EscrowResolvedEvent {
     pub timestamp: u64,
 }
 
+/// Event emitted when a user's reputation counters or metrics are updated.
+///
+/// Topic: `(symbol "stake_reputation_update", Address)`; payload contains
+/// the affected `address`, deltas for `successful`/`disputed` trades, metric
+/// deltas and the associated `token` and `timestamp`.
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
