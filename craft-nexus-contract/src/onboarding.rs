@@ -91,7 +91,7 @@ const TTL_THRESHOLD: u32 = 10_000;
 const READ_TTL_THRESHOLD: u32 = 1_000;
 /// Standard TTL extension for persistent storage (approx 30 days)
 const TTL_EXTENSION: u32 = 518_400;
-const CURRENT_USER_PROFILE_VERSION: u32 = 5;
+const CURRENT_USER_PROFILE_VERSION: u32 = 6;
 
 const BASE58_BTC_CHARSET: [bool; 256] = {
     let mut chars = [false; 256];
@@ -169,6 +169,8 @@ pub enum DataKey {
     UserProfile(Address),
     /// Dedicated portfolio CID storage keyed by user to keep the main profile flat.
     UserPortfolio(Address),
+    /// Dedicated profile picture CID storage keyed by user (#723).
+    UserProfilePic(Address),
     /// Maps a normalized username to the owning address (uniqueness index)
     Username(String),
     /// Contract configuration ([`OnboardingConfig`])
@@ -298,6 +300,12 @@ pub struct UserProfile {
     /// this field from `get_user` / `get_user_by_username` responses or
     /// subscribe to `PortfolioUpdated` events for live updates.
     pub portfolio_cid: Option<Bytes>,
+    /// Optional IPFS content identifier for the user's profile picture (#723).
+    ///
+    /// `None` when unset or after removal via `update_profile_pic`. When
+    /// present, the CID must conform to the same validation rules as
+    /// portfolio CIDs (see `validate_ipfs_cid`).
+    pub profile_pic_cid: Option<Bytes>,
     /// Status of the user profile - Issue #113
     pub status: ProfileStatus,
 }
@@ -1444,7 +1452,11 @@ impl OnboardingContract {
         cid_bytes
     }
 
-    fn stored_to_public(stored: StoredUserProfile, portfolio_cid: Option<Bytes>) -> UserProfile {
+    fn stored_to_public(
+        stored: StoredUserProfile,
+        portfolio_cid: Option<Bytes>,
+        profile_pic_cid: Option<Bytes>,
+    ) -> UserProfile {
         UserProfile {
             version: stored.version,
             address: stored.address,
@@ -1455,6 +1467,7 @@ impl OnboardingContract {
             successful_trades: stored.successful_trades,
             disputed_trades: stored.disputed_trades,
             portfolio_cid,
+            profile_pic_cid,
             status: stored.status,
         }
     }
@@ -1489,6 +1502,23 @@ impl OnboardingContract {
         }
     }
 
+    fn read_profile_pic_cid(env: &Env, user: &Address) -> Option<Bytes> {
+        Self::read_persistent(env, &DataKey::UserProfilePic(user.clone()))
+    }
+
+    fn write_profile_pic_cid(env: &Env, user: &Address, cid: Option<Bytes>) {
+        let key = DataKey::UserProfilePic(user.clone());
+        match cid {
+            Some(cid) => {
+                env.storage().persistent().set(&key, &cid);
+                Self::extend_persistent(env, &key);
+            }
+            None => {
+                env.storage().persistent().remove(&key);
+            }
+        }
+    }
+
     fn persist_stored_user_profile(env: &Env, user: &Address, profile: &StoredUserProfile) {
         let key = DataKey::UserProfile(user.clone());
         env.storage().persistent().set(&key, profile);
@@ -1498,6 +1528,7 @@ impl OnboardingContract {
     fn persist_public_user_profile(env: &Env, user: &Address, profile: &UserProfile) {
         Self::persist_stored_user_profile(env, user, &Self::public_to_stored(profile));
         Self::write_portfolio_cid(env, user, profile.portfolio_cid.clone());
+        Self::write_profile_pic_cid(env, user, profile.profile_pic_cid.clone());
     }
 
     fn migrate_embedded_versioned_profile(
@@ -1507,6 +1538,9 @@ impl OnboardingContract {
     ) -> (StoredUserProfile, bool) {
         if profile.portfolio_cid.is_some() {
             Self::write_portfolio_cid(env, user, profile.portfolio_cid.clone());
+        }
+        if profile.profile_pic_cid.is_some() {
+            Self::write_profile_pic_cid(env, user, profile.profile_pic_cid.clone());
         }
 
         let stored = StoredUserProfile {
@@ -1589,7 +1623,8 @@ impl OnboardingContract {
     fn try_get_user_profile(env: &Env, user: Address) -> Option<UserProfile> {
         let (stored, _) = Self::try_get_stored_user_profile(env, user.clone())?;
         let portfolio_cid = Self::read_portfolio_cid(env, &user);
-        Some(Self::stored_to_public(stored, portfolio_cid))
+        let profile_pic_cid = Self::read_profile_pic_cid(env, &user);
+        Some(Self::stored_to_public(stored, portfolio_cid, profile_pic_cid))
     }
 
     fn get_user_profile(env: &Env, user: Address) -> UserProfile {
@@ -1887,6 +1922,7 @@ impl OnboardingContract {
             successful_trades: 0,
             disputed_trades: 0,
             portfolio_cid: None,
+            profile_pic_cid: None,
             status: ProfileStatus::Active,
         };
 
@@ -1999,7 +2035,7 @@ impl OnboardingContract {
     /// * [`Error::AlreadyOnboarded`] — the address already has a profile.
     /// * [`Error::UsernameTaken`] — the normalized username is in use.
     /// * [`Error::UsernameTooShort`] / [`Error::UsernameTooLong`].
-    pub fn onboard_user(env: Env, user: Address, username: String, role: UserRole) -> UserProfile {
+    pub fn onboard_user(env: Env, user: Address, username: String, role: UserRole, profile_pic_cid: Option<String>) -> UserProfile {
         // [SECURITY] Endpoint #93: The registering user must prove ownership of the
         // supplied address. Unauthorized invocation without a valid user signature is
         // rejected before any state mutation.
@@ -2009,6 +2045,15 @@ impl OnboardingContract {
         if role != UserRole::Buyer && role != UserRole::Artisan {
             Self::emit_onboard_failed_and_panic(&env, &user, Error::InvalidRole);
         }
+
+        // Validate profile picture CID format if provided (#723)
+        if let Some(ref cid) = profile_pic_cid {
+            if !validate_ipfs_cid(cid) {
+                Self::emit_onboard_failed_and_panic(&env, &user, Error::InvalidProfilePicCid);
+            }
+        }
+        let optimized_profile_pic_cid =
+            profile_pic_cid.map(|cid_str| Self::string_to_bytes(&env, &cid_str));
 
         // Get configuration
         let config: OnboardingConfig = env
@@ -2111,6 +2156,7 @@ impl OnboardingContract {
             successful_trades: 0,
             disputed_trades: 0,
             portfolio_cid: None,
+            profile_pic_cid: optimized_profile_pic_cid,
             status: ProfileStatus::Active,
         };
 
@@ -4142,6 +4188,41 @@ impl OnboardingContract {
         // Emit event
         env.events()
             .publish((Symbol::new(&env, "PortfolioUpdated"),), &user);
+
+        profile
+    }
+
+    /// Update a user's profile picture IPFS CID (#723).
+    ///
+    /// Sets or clears the IPFS content identifier for a user's profile
+    /// picture. Available to all onboarded users (both buyers and artisans).
+    /// When set, the CID must pass `validate_ipfs_cid` checks.
+    ///
+    /// # Arguments
+    /// * `user` - User's wallet address (must sign)
+    /// * `profile_pic_cid` - IPFS CID to set, or `None` to remove
+    ///
+    /// # Returns
+    /// Updated `UserProfile` reflecting the new `profile_pic_cid` value.
+    ///
+    /// # Reverts if
+    /// - User not onboarded (`Error::UserNotFound`)
+    /// - Invalid CID format when `profile_pic_cid` is `Some`
+    pub fn update_profile_pic(env: Env, user: Address, profile_pic_cid: Option<String>) -> UserProfile {
+        user.require_auth();
+
+        let mut profile = Self::get_user_profile(&env, user.clone());
+
+        if let Some(ref cid) = profile_pic_cid {
+            assert!(validate_ipfs_cid(cid), "Invalid profile picture CID format");
+        }
+        let optimized_cid = profile_pic_cid.map(|cid_str| Self::string_to_bytes(&env, &cid_str));
+
+        Self::write_profile_pic_cid(&env, &user, optimized_cid.clone());
+        profile.profile_pic_cid = optimized_cid;
+
+        env.events()
+            .publish((Symbol::new(&env, "ProfilePicUpdated"),), &user);
 
         profile
     }
