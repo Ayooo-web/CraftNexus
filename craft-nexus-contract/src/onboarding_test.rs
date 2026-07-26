@@ -2,7 +2,7 @@ use super::decimal_test_token::{DecimalTestToken, DecimalTestTokenClient};
 use super::*;
 use crate::alloc::string::ToString;
 use soroban_sdk::{
-    testutils::{storage::Persistent as _, Address as _},
+    testutils::{storage::Persistent as _, Address as _, Ledger},
     token, Address, Bytes, Env, String, Symbol,
 };
 
@@ -164,6 +164,114 @@ fn test_onboard_duplicate_user() {
     client.onboard_user(&user, &username1, &UserRole::Buyer, &None);
     let result = client.try_onboard_user(&user, &username2, &UserRole::Artisan, &None);
     assert!(result.is_err());
+}
+
+// ===== Rate limiting for onboard_user retries (#943) =====
+
+/// `onboard_user` panics rather than returning `Result`, so `try_onboard_user`
+/// surfaces contract errors as a raw `soroban_sdk::Error` code (not the typed
+/// `onboarding::Error` enum). Compare against the numeric contract error code
+/// to assert a specific failure reason.
+fn assert_onboard_error(
+    result: Result<
+        Result<UserProfile, soroban_sdk::ConversionError>,
+        Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
+    >,
+    expected: Error,
+) {
+    let expected = soroban_sdk::Error::from_contract_error(expected as u32);
+    match result {
+        Err(Ok(actual)) => assert_eq!(actual, expected),
+        other => panic!(
+            "expected contract error {:?}, got {:?}",
+            expected,
+            other.is_ok()
+        ),
+    }
+}
+
+/// Onboards `count` distinct new users, each a genuinely successful call.
+fn onboard_many(client: &OnboardingContractClient, env: &Env, count: u32) {
+    const NAMES: [&str; 8] = [
+        "rl_user_0",
+        "rl_user_1",
+        "rl_user_2",
+        "rl_user_3",
+        "rl_user_4",
+        "rl_user_5",
+        "rl_user_6",
+        "rl_user_7",
+    ];
+    assert!(
+        (count as usize) <= NAMES.len(),
+        "extend NAMES for larger counts"
+    );
+    for name in NAMES.iter().take(count as usize) {
+        let user = Address::generate(env);
+        let username = String::from_str(env, name);
+        onboard_user_success(client, &user, &username, &UserRole::Buyer);
+    }
+}
+
+#[test]
+fn test_onboard_user_rate_limited_after_max_calls() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_test(&env);
+
+    // The admin co-signs DEFAULT_RATE_LIMIT_MAX_CALLS distinct, successful
+    // onboardings within the window.
+    onboard_many(&client, &env, DEFAULT_RATE_LIMIT_MAX_CALLS);
+
+    // One more onboarding — for yet another new address — should now be
+    // rejected: the admin has exhausted its rate-limit window.
+    let extra_user = Address::generate(&env);
+    let extra_username = String::from_str(&env, "one_too_many");
+    let result = client.try_onboard_user(&extra_user, &extra_username, &UserRole::Buyer);
+    assert_onboard_error(result, Error::RateLimitExceeded);
+}
+
+#[test]
+fn test_onboard_user_rate_limit_resets_after_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_test(&env);
+
+    onboard_many(&client, &env, DEFAULT_RATE_LIMIT_MAX_CALLS);
+
+    let extra_user = Address::generate(&env);
+    let extra_username = String::from_str(&env, "blocked_for_now");
+    let result = client.try_onboard_user(&extra_user, &extra_username, &UserRole::Buyer);
+    assert_onboard_error(result, Error::RateLimitExceeded);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += DEFAULT_RATE_LIMIT_WINDOW as u64 + 1;
+    });
+
+    // After the window resets, the same admin can onboard again.
+    onboard_user_success(&client, &extra_user, &extra_username, &UserRole::Buyer);
+}
+
+#[test]
+fn test_onboard_user_rate_limit_is_per_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_a, _admin_a) = setup_test(&env);
+    let (client_b, _admin_b) = setup_test(&env);
+
+    onboard_many(&client_a, &env, DEFAULT_RATE_LIMIT_MAX_CALLS);
+
+    let extra_user = Address::generate(&env);
+    let extra_username = String::from_str(&env, "blocked_admin_a");
+    let result = client_a.try_onboard_user(&extra_user, &extra_username, &UserRole::Buyer);
+    assert_onboard_error(result, Error::RateLimitExceeded);
+
+    // A different contract instance (distinct platform admin) is unaffected
+    // by admin_a's exhausted limit.
+    onboard_user_success(&client_b, &extra_user, &extra_username, &UserRole::Buyer);
 }
 
 #[test]
@@ -840,6 +948,8 @@ fn test_process_verification_request_unauthorized() {
         min_escrow_count_for_verify: 5,
         min_volume_for_verify: 10_000_000_000,
         escrow_contract: None,
+        rate_limit_window: 0,
+        rate_limit_max_calls: 0,
     };
 
     env.as_contract(&client.address, || {
@@ -860,7 +970,7 @@ fn test_process_verification_request_unauthorized() {
             .set(&DataKey::UserProfile(user.clone()), &profile);
     });
 
-       // No platform-admin signature is present, so require_auth() must panic and
+    // No platform-admin signature is present, so require_auth() must panic and
     // the verification state transition must never execute.
     client.process_verification_request(&user, &true);
 }
@@ -1343,14 +1453,11 @@ fn test_change_username_with_special_characters() {
     client.onboard_user(&user, &String::from_str(&env, "original"), &UserRole::Buyer, &None);
 
     // Change to username with special characters (should be normalized)
-       let new_username = String::from_str(&env, "New-User_Name.123");
+    let new_username = String::from_str(&env, "New-User_Name.123");
     let updated = client.change_username(&user, &new_username);
 
     // Should be normalized with underscores
-    assert_eq!(
-        updated.username,
-        Symbol::new(&env, "new_user_name_123")
-    );
+    assert_eq!(updated.username, Symbol::new(&env, "new_user_name_123"));
 }
 
 #[test]
@@ -1405,6 +1512,8 @@ fn test_bump_user_profile_ttl_unauthorized() {
         min_escrow_count_for_verify: 5,
         min_volume_for_verify: 10_000_000_000,
         escrow_contract: None,
+        rate_limit_window: 0,
+        rate_limit_max_calls: 0,
     };
 
     env.as_contract(&client.address, || {
@@ -1450,6 +1559,8 @@ fn test_bump_user_metrics_ttl_unauthorized() {
         min_escrow_count_for_verify: 5,
         min_volume_for_verify: 10_000_000_000,
         escrow_contract: None,
+        rate_limit_window: 0,
+        rate_limit_max_calls: 0,
     };
 
     env.as_contract(&client.address, || {
@@ -2387,6 +2498,8 @@ fn test_get_verification_queue_unauthorized() {
         min_escrow_count_for_verify: 5,
         min_volume_for_verify: 10_000_000_000,
         escrow_contract: None,
+        rate_limit_window: 0,
+        rate_limit_max_calls: 0,
     };
     env.as_contract(&contract_id, || {
         env.storage().persistent().set(&DataKey::Config, &config);
@@ -2541,6 +2654,8 @@ fn test_get_verification_queue_non_admin_rejected() {
         min_escrow_count_for_verify: 5,
         min_volume_for_verify: 10_000_000_000,
         escrow_contract: None,
+        rate_limit_window: 0,
+        rate_limit_max_calls: 0,
     };
     env.as_contract(&contract_id, || {
         env.storage().persistent().set(&DataKey::Config, &config);
@@ -2605,6 +2720,8 @@ fn test_get_user_metrics_unauthorized() {
         min_escrow_count_for_verify: 5,
         min_volume_for_verify: 10_000_000_000,
         escrow_contract: None,
+        rate_limit_window: 0,
+        rate_limit_max_calls: 0,
     };
     env.as_contract(&contract_id, || {
         env.storage().persistent().set(&DataKey::Config, &config);
@@ -2635,6 +2752,8 @@ fn test_get_user_reputation_unauthorized() {
         min_escrow_count_for_verify: 5,
         min_volume_for_verify: 10_000_000_000,
         escrow_contract: None,
+        rate_limit_window: 0,
+        rate_limit_max_calls: 0,
     };
     env.as_contract(&contract_id, || {
         env.storage().persistent().set(&DataKey::Config, &config);
@@ -2685,6 +2804,8 @@ fn test_has_active_contracts_unauthorized() {
         min_escrow_count_for_verify: 5,
         min_volume_for_verify: 10_000_000_000,
         escrow_contract: None,
+        rate_limit_window: 0,
+        rate_limit_max_calls: 0,
     };
     env.as_contract(&contract_id, || {
         env.storage().persistent().set(&DataKey::Config, &config);
@@ -2760,12 +2881,8 @@ fn test_onboard_rejected_when_escrow_paused() {
     escrow_client.set_paused(&true);
 
     // Onboarding should be rejected
-    let result = client.try_onboard_user(
-        &user,
-        &String::from_str(&env, "newuser"),
-        &UserRole::Buyer,
-        &None,
-    );
+    let result =
+        client.try_onboard_user(&user, &String::from_str(&env, "newuser"), &UserRole::Buyer);
     assert!(result.is_err());
 }
 
