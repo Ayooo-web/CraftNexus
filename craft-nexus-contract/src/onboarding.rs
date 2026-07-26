@@ -197,6 +197,10 @@ pub enum DataKey {
     UsernameChangeFeeWallet,
     /// Timestamp of last username change per user - Issue #114
     LastUsernameChange(Address),
+    /// Global count of all user-onboarding events.
+    GlobalOnboardCount,
+    /// Global count of all username-change events.
+    GlobalUsernameChangeCount,
 }
 
 /// User roles in the CraftNexus platform.
@@ -2094,6 +2098,7 @@ impl OnboardingContract {
                 role,
             },
         );
+        Self::increment_persistent_u32(&env, &DataKey::GlobalOnboardCount);
 
         profile
     }
@@ -3725,6 +3730,7 @@ impl OnboardingContract {
 
         // Interaction (CEI pattern: external transfer is the last step)
         Self::collect_username_change_fee(&env, &user, &config, snapshotted_fee_token);
+        Self::increment_persistent_u32(&env, &DataKey::GlobalUsernameChangeCount);
 
         profile
     }
@@ -3778,6 +3784,7 @@ impl OnboardingContract {
         env.storage()
             .persistent()
             .set(&DataKey::UsernameChangeFee, &fee);
+        Self::increment_persistent_u32(&env, &DataKey::GlobalAdminActionCount);
         Self::extend_persistent(&env, &DataKey::UsernameChangeFee);
     }
 
@@ -3821,6 +3828,7 @@ impl OnboardingContract {
         env.storage()
             .persistent()
             .set(&DataKey::UsernameChangeFeeToken, &token);
+        Self::increment_persistent_u32(&env, &DataKey::GlobalAdminActionCount);
         Self::extend_persistent(&env, &DataKey::UsernameChangeFeeToken);
     }
 
@@ -3870,6 +3878,7 @@ impl OnboardingContract {
         env.storage()
             .persistent()
             .set(&DataKey::UsernameChangeFeeWallet, &wallet);
+        Self::increment_persistent_u32(&env, &DataKey::GlobalAdminActionCount);
         Self::extend_persistent(&env, &DataKey::UsernameChangeFeeWallet);
     }
 

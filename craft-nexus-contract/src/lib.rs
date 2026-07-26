@@ -1697,13 +1697,7 @@ impl CraftNexusContract {
     /// Read a persistent `u32` and extend its TTL when the key exists (#515).
     #[inline(always)]
     fn get_persistent_u32(env: &Env, key: &DataKey) -> u32 {
-        match env.storage().persistent().get(key) {
-            Some(value) => {
-                Self::extend_persistent(env, key);
-                value
-            }
-            None => 0u32,
-        }
+        Self::read_persistent(env, key).unwrap_or(0u32)
     }
 
     /// Read a persistent `u64` and extend its TTL when the key exists (#431 / key index #30).
@@ -1721,13 +1715,7 @@ impl CraftNexusContract {
     #[inline(always)]
     fn get_whitelist_count(env: &Env) -> u32 {
         let count_key = DataKey::WhitelistedTokenCount;
-        match env.storage().persistent().get(&count_key) {
-            Some(count) => {
-                Self::extend_persistent(env, &count_key);
-                count
-            }
-            None => 0u32,
-        }
+        Self::read_persistent(&env, &count_key).unwrap_or(0u32)
     }
 
     #[inline(always)]
@@ -1812,16 +1800,7 @@ impl CraftNexusContract {
     #[inline(always)]
     fn get_max_release_window(env: &Env) -> u32 {
         let key = DataKey::MaxReleaseWindow;
-        let value = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(MAX_TOTAL_RELEASE_WINDOW);
-        // Issue #423: extend TTL on read to prevent storage expiry
-        if env.storage().persistent().has(&key) {
-            Self::extend_persistent(env, &key);
-        }
-        value
+        Self::read_persistent(env, &key).unwrap_or(MAX_TOTAL_RELEASE_WINDOW)
     }
 
     /// Returns the configured onboarding contract address, if any (#243).
@@ -3292,13 +3271,21 @@ impl CraftNexusContract {
     }
 
     fn get_platform_config_internal(env: &Env) -> PlatformConfig {
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_EXTENSION);
-        env.storage()
-            .instance()
-            .get(&DataKey::PlatformConfig)
-            .unwrap_or_else(|| env.panic_with_error(crate::Error::PlatformNotInitialized))
+        let key = DataKey::PlatformConfig;
+        let stored: Val = env.storage().instance().get(&key).unwrap_or_else(|| {
+            env.panic_with_error(crate::Error::PlatformNotInitialized)
+        });
+
+        let map = Map::<Symbol, Val>::try_from_val(env, &stored).expect("Corrupted PlatformConfig");
+        let version_key = symbol_short!("version");
+
+        let config = if map.contains_key(version_key) {
+            PlatformConfig::try_from_val(env, &stored).expect("Corrupted PlatformConfig")
+        } else {
+            PlatformConfig::try_from_val(env, &stored).expect("Corrupted PlatformConfig")
+        };
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTENSION);
+        config
     }
 
     fn try_get_escrow_readonly(env: &Env, order_id: u32) -> Escrow {
