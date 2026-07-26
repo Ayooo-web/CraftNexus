@@ -6669,7 +6669,27 @@ impl CraftNexusContract {
         }
 
         if matured_amount <= 0 {
-            env.panic_with_error(crate::Error::StakeCooldownActive);
+            let mut min_remaining: u64 = u64::MAX;
+            for read_index in 0..current_count {
+                let deposit_key = DataKey::ArtisanStakeQueueIndexed(artisan.clone(), read_index);
+                if let Some(deposit) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, StakeDeposit>(&deposit_key)
+                {
+                    if deposit.cooldown_end > now {
+                        let remaining = deposit.cooldown_end - now;
+                        if remaining < min_remaining {
+                            min_remaining = remaining;
+                        }
+                    }
+                }
+            }
+            if min_remaining != u64::MAX {
+                panic!("Stake cooldown active. Remaining seconds: {}", min_remaining);
+            } else {
+                env.panic_with_error(crate::Error::StakeCooldownActive);
+            }
         }
 
         // Update queue count after processing
