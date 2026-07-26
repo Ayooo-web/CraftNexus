@@ -427,6 +427,11 @@ fn test_resolve_dispute_release_to_seller() {
     client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
     client.dispute_escrow(&1, &Symbol::new(&env, "Non_delivery"), &buyer);
 
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
+
     // Arbitrator is setup in setup_test as a random Address and mock_all_auths bypasses auth
     client.resolve_dispute(&1, &Resolution::ReleaseToSeller, &admin);
 
@@ -448,6 +453,11 @@ fn test_resolve_dispute_refund_to_buyer() {
     token_admin.mint(&buyer, &100_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
     client.dispute_escrow(&1, &Symbol::new(&env, "Late_shipping"), &buyer);
+
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
 
     client.resolve_dispute(&1, &Resolution::RefundToBuyer, &admin);
 
@@ -471,6 +481,11 @@ fn test_resolve_dispute_by_moderator() {
     token_admin.mint(&buyer, &100_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
     client.dispute_escrow(&1, &Symbol::new(&env, "Moderator_review"), &buyer);
+
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
 
     client.resolve_dispute(&1, &Resolution::RefundToBuyer, &moderator);
 
