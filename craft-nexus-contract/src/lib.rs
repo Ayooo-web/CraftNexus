@@ -1290,6 +1290,7 @@ impl CraftNexusContract {
         }
     }
 
+    #[inline(always)]
     fn is_base58_btc_char(byte: u8) -> bool {
         BASE58_BTC_CHARSET[byte as usize]
     }
@@ -1305,6 +1306,7 @@ impl CraftNexusContract {
     ///
     /// # Storage side-effects
     /// None â€” this is a pure validation helper with no storage reads or writes.
+    #[inline(always)]
     fn validate_optional_ipfs_hash(env: &Env, ipfs_hash: &Option<String>) {
         if let Some(cid) = ipfs_hash {
             if !Self::validate_ipfs_cid(cid) {
@@ -1324,6 +1326,7 @@ impl CraftNexusContract {
     ///
     /// # Storage side-effects
     /// None â€” this is a pure validation helper with no storage reads or writes.
+    #[inline(always)]
     fn validate_optional_metadata_hash(env: &Env, metadata_hash: &Option<Bytes>) {
         if let Some(hash) = metadata_hash {
             if hash.len() != 32 {
@@ -1332,6 +1335,7 @@ impl CraftNexusContract {
         }
     }
 
+    #[inline(always)]
     fn get_admin(env: &Env) -> Result<Address, Error> {
         let config: PlatformConfig = env
             .storage()
@@ -1644,6 +1648,7 @@ impl CraftNexusContract {
         }
     }
 
+    #[inline(always)]
     fn update_active_obligations(env: &Env, user: &Address, delta: i32) {
         let key = DataKey::ActiveObligations(user.clone());
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -1656,6 +1661,7 @@ impl CraftNexusContract {
         Self::extend_persistent(env, &key);
     }
 
+    #[inline(always)]
     fn update_total_locked(env: &Env, token: &Address, delta: i128) {
         let key = DataKey::TotalLocked(token.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -1664,6 +1670,7 @@ impl CraftNexusContract {
         Self::extend_persistent(env, &key);
     }
 
+    #[inline(always)]
     fn update_total_staked(env: &Env, token: &Address, delta: i128) {
         let key = DataKey::TotalStaked(token.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -1673,12 +1680,14 @@ impl CraftNexusContract {
     }
 
     /// Extend the TTL of a persistent storage entry using standardized values.
+    #[inline(always)]
     fn extend_persistent(env: &Env, key: &impl soroban_sdk::IntoVal<Env, soroban_sdk::Val>) {
         env.storage()
             .persistent()
             .extend_ttl(key, TTL_THRESHOLD, TTL_EXTENSION);
     }
 
+    #[inline(always)]
     fn extend_persistent_read(env: &Env, key: &impl soroban_sdk::IntoVal<Env, soroban_sdk::Val>) {
         env.storage()
             .persistent()
@@ -1686,6 +1695,7 @@ impl CraftNexusContract {
     }
 
     /// Read a persistent `u32` and extend its TTL when the key exists (#515).
+    #[inline(always)]
     fn get_persistent_u32(env: &Env, key: &DataKey) -> u32 {
         match env.storage().persistent().get(key) {
             Some(value) => {
@@ -1697,6 +1707,7 @@ impl CraftNexusContract {
     }
 
     /// Read a persistent `u64` and extend its TTL when the key exists (#431 / key index #30).
+    #[inline(always)]
     fn get_persistent_u64(env: &Env, key: &DataKey) -> u64 {
         match env.storage().persistent().get(key) {
             Some(value) => {
@@ -1707,6 +1718,7 @@ impl CraftNexusContract {
         }
     }
 
+    #[inline(always)]
     fn get_whitelist_count(env: &Env) -> u32 {
         let count_key = DataKey::WhitelistedTokenCount;
         match env.storage().persistent().get(&count_key) {
@@ -1718,6 +1730,7 @@ impl CraftNexusContract {
         }
     }
 
+    #[inline(always)]
     fn set_whitelist_count(env: &Env, count: u32) {
         let count_key = DataKey::WhitelistedTokenCount;
         env.storage().persistent().set(&count_key, &count);
@@ -1796,6 +1809,7 @@ impl CraftNexusContract {
 
     /// Returns the configured maximum release window (in seconds).
     /// Falls back to MAX_TOTAL_RELEASE_WINDOW (30 days) if not set by admin.
+    #[inline(always)]
     fn get_max_release_window(env: &Env) -> u32 {
         let key = DataKey::MaxReleaseWindow;
         let value = env
@@ -3467,6 +3481,7 @@ impl CraftNexusContract {
     }
 
     /// Calculate platform fee for a given amount.
+    #[inline(always)]
     fn try_calculate_fee(amount: i128, fee_bps: u32) -> Result<i128, Error> {
         if amount < 0 {
             return Err(Error::InvalidFee);
@@ -3478,6 +3493,7 @@ impl CraftNexusContract {
             .ok_or(Error::InvalidFee)
     }
 
+    #[inline(always)]
     fn calculate_fee(env: &Env, amount: i128, fee_bps: u32) -> i128 {
         Self::try_calculate_fee(amount, fee_bps).unwrap_or_else(|err| env.panic_with_error(err))
     }
@@ -3762,6 +3778,7 @@ impl CraftNexusContract {
         Self::record_total_fees(env, token, fee_amount);
     }
 
+    #[inline(always)]
     fn get_legacy_total_fees(env: &Env) -> i128 {
         env.storage().persistent().get(&TOTAL_FEES).unwrap_or(0)
     }
@@ -6339,6 +6356,7 @@ impl CraftNexusContract {
 
     /// Validate gross partial refund amount against escrow solvency including any
     /// potential refund-side fee that may apply.
+    #[inline(always)]
     fn is_valid_partial_refund_gross_amount(
         env: &Env,
         escrow: &Escrow,
