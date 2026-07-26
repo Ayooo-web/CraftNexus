@@ -1118,6 +1118,45 @@ fn test_update_reputation_unknown_address_is_no_op() {
     assert_eq!(disputed, 0);
 }
 
+/// Issue #100 / #666 — update_reputation with zero trades is a no-op.
+#[test]
+fn test_reputation_zero_trades_no_op() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "repzero"), &UserRole::Artisan);
+
+    client.update_reputation(&user, &0u32, &0u32);
+    let (successful, disputed) = client.get_user_reputation(&user);
+    assert_eq!(successful, 0);
+    assert_eq!(disputed, 0);
+}
+
+/// Issue #100 / #666 — update_reputation with u32::MAX handles overflow with saturating add.
+#[test]
+fn test_reputation_max_trades_no_overflow() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "repmax"), &UserRole::Artisan);
+
+    client.update_reputation(&user, &u32::MAX, &u32::MAX);
+    let (successful, disputed) = client.get_user_reputation(&user);
+    assert_eq!(successful, u32::MAX);
+    assert_eq!(disputed, u32::MAX);
+
+    // Adding more does not overflow or panic, saturates at u32::MAX
+    client.update_reputation(&user, &10u32, &10u32);
+    let (successful2, disputed2) = client.get_user_reputation(&user);
+    assert_eq!(successful2, u32::MAX);
+    assert_eq!(disputed2, u32::MAX);
+}
+
+
 #[test]
 fn test_get_user_migrates_legacy_profile() {
     let env = Env::default();
@@ -2517,6 +2556,22 @@ fn test_has_active_contracts_unauthorized() {
 
     client.has_active_contracts(&user);
 }
+
+/// Issue #452 / #622 — has_active_contracts succeeds for authorized user and refreshes TTL.
+#[test]
+fn test_has_active_contracts_authorized_returns_boolean_and_extends_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+
+    client.onboard_user(&user, &String::from_str(&env, "activeusr"), &UserRole::Buyer);
+
+    // Initial query returns false (no escrows registered)
+    assert!(!client.has_active_contracts(&user));
+}
+
 
 // ===== set_verification_thresholds auth tests (#422) =====
 

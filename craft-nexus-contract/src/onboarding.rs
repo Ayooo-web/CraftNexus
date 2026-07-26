@@ -1592,6 +1592,24 @@ impl OnboardingContract {
             .unwrap_or_else(|| env.panic_with_error(Error::UserNotFound))
     }
 
+    /// Assert that `user` is onboarded and their profile is currently active.
+    ///
+    /// Panics with [`Error::UserNotFound`] when no profile exists, or with
+    /// [`Error::ProfileDeactivated`] when the profile's status is
+    /// [`ProfileStatus::Deactivated`]. Used by state-mutating endpoints that
+    /// must not operate on deactivated accounts (e.g. `update_user_role`,
+    /// `deactivate_profile`).
+    ///
+    /// # Returns
+    /// The loaded [`UserProfile`] so callers do not have to fetch it again.
+    fn assert_user_onboarded_and_active(env: &Env, user: Address) -> UserProfile {
+        let profile = Self::get_user_profile(env, user);
+        if profile.status == ProfileStatus::Deactivated {
+            env.panic_with_error(Error::ProfileDeactivated);
+        }
+        profile
+    }
+
     /// Extend the TTL of a persistent storage entry using standardized values.
     ///
     /// Soroban charges rent per ledger entry, so persistent state for an
@@ -2512,8 +2530,8 @@ impl OnboardingContract {
             _ => {} // Proceed for Buyer, Artisan, Moderator
         }
 
-        // Fetch and validate existing profile before mutation
-        let mut profile = Self::get_user_profile(&env, user.clone());
+        // Fetch and validate existing profile; reject deactivated accounts before mutation
+        let mut profile = Self::assert_user_onboarded_and_active(&env, user.clone());
 
         // [SECURITY] Prevent unnecessary state mutations and replay attacks
         // by recording state transition audit trail for forensic analysis
@@ -2569,11 +2587,7 @@ impl OnboardingContract {
     /// - User is the admin
     pub fn deactivate_profile(env: Env, user: Address) {
         user.require_auth();
-        let mut profile = Self::get_user_profile(&env, user.clone());
-
-        if profile.status == ProfileStatus::Deactivated {
-            env.panic_with_error(Error::ProfileDeactivated);
-        }
+        let mut profile = Self::assert_user_onboarded_and_active(&env, user.clone());
 
         let username_string = String::from_str(&env, profile.username.to_string().as_ref());
         let normalized = normalize_username(&env, &username_string);
