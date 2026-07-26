@@ -404,8 +404,11 @@ pub enum DataKey {
     ActiveObligations(Address),
     /// Required number of distinct signer approvals before a WASM upgrade proposal is committed.
     UpgradeThreshold,
-    /// Per-hash list of addresses that have approved a pending WASM upgrade hash.
-    UpgradeApprovals(BytesN<32>),
+    /// Canonical per-round approval state (signers snapshot, threshold snapshot,
+    /// round nonce, and accumulated approvals).  Replaces the old hash-keyed
+    /// `UpgradeApprovals(BytesN<32>)` to prevent cross-round replay.
+    /// Always stored at index 0; the nonce lives inside the struct.
+    UpgradeApprovalState(u32),
     /// Ordered list of addresses authorized to co-sign WASM upgrade proposals.
     UpgradeSigners,
     /// Ledger timestamp (u64) recorded when the last upgrade proposal was
@@ -920,6 +923,41 @@ pub struct UpgradeRecord {
     pub wasm_hash: BytesN<32>,
     pub admin: Address,
     pub timestamp: u64,
+}
+
+/// Immutable per-round state for the multi-sig upgrade approval flow.
+///
+/// Written once on the **first** approval call for a given proposal nonce and
+/// never mutated except to append new approvals.  Keyed by
+/// `DataKey::UpgradeApprovalState(nonce)`.
+///
+/// # Security properties
+///
+/// * `signers`   — snapshotted from `UpgradeSigners` (or admin fallback) at
+///   round open.  Subsequent `set_upgrade_signers` calls cannot alter which
+///   addresses are eligible for this round, closing the signer-rotation race.
+///
+/// * `threshold` — snapshotted from `UpgradeThreshold` at round open.
+///   Mid-round `set_upgrade_threshold` calls therefore cannot lower the bar
+///   for the current round.
+///
+/// * `approvals` — grows monotonically as valid signers call
+///   `propose_upgrade_wasm`.  Only addresses present in `signers` may appear
+///   here; duplicates are rejected with `AlreadyApproved`.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct UpgradeApprovalState {
+    /// Monotonically increasing round counter.  Incremented on every
+    /// `cancel_upgrade_wasm` call so that residual state from a prior
+    /// round cannot be replayed in a subsequent round.
+    pub nonce: u32,
+    /// Signer set captured when the round was opened (first approval).
+    pub signers: Vec<Address>,
+    /// Approval threshold captured when the round was opened.
+    pub threshold: u32,
+    /// Addresses that have submitted a valid approval this round.
+    pub approvals: Vec<Address>,
 }
 
 /// Per-token fee configuration introduced for #239.
@@ -4126,61 +4164,86 @@ impl CraftNexusContract {
             return Err(Error::UpgradeProposalExists);
         }
 
-        // Authorised signers: explicit list or fallback to the admin address.
-        let signers: Vec<Address> = env
+        // -- Approval state (singleton key, nonce inside struct) ----------------
+        // Approval state is stored at a fixed slot UpgradeApprovalState(0).
+        // The `nonce` field inside the struct is incremented on every
+        // cancel_upgrade_wasm call, so a re-proposal after cancellation
+        // starts a fresh round with a different nonce, making the old
+        // approvals stale and detectable.
+        let state_key = DataKey::UpgradeApprovalState(0);
+
+        // Read the current nonce from any pre-existing state, or default to 0.
+        let current_nonce: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::UpgradeSigners)
-            .unwrap_or_else(|| {
-                let mut v = Vec::new(&env);
-                if let Ok(admin) = Self::get_admin(&env) {
-                    v.push_back(admin);
-                }
-                v
-            });
+            .get::<DataKey, UpgradeApprovalState>(&state_key)
+            .map(|s| s.nonce)
+            .unwrap_or(0u32);
 
-        if !signers.iter().any(|s| s == signer) {
+        // Helper closure: snapshot current live signers + threshold into a fresh state.
+        let fresh_state = |nonce: u32| -> UpgradeApprovalState {
+            let snapshotted_signers: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::UpgradeSigners)
+                .unwrap_or_else(|| {
+                    let mut v = Vec::new(&env);
+                    if let Ok(admin) = Self::get_admin(&env) {
+                        v.push_back(admin);
+                    }
+                    v
+                });
+            let snapshotted_threshold: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::UpgradeThreshold)
+                .unwrap_or(1u32);
+            UpgradeApprovalState {
+                nonce,
+                signers: snapshotted_signers,
+                threshold: snapshotted_threshold,
+                approvals: Vec::new(&env),
+            }
+        };
+
+        let mut state: UpgradeApprovalState = env
+            .storage()
+            .persistent()
+            .get(&state_key)
+            // Reuse stored state only when:
+            //  (a) it has the same nonce (was not left from a cancelled round), AND
+            //  (b) the round has already started (signers list is non-empty).
+            // A state with an empty signers list is a cancel-sentinel written by
+            // cancel_upgrade_wasm to carry the bumped nonce forward; it must not
+            // be treated as a live round.
+            .filter(|s: &UpgradeApprovalState| {
+                s.nonce == current_nonce && !s.signers.is_empty()
+            })
+            .unwrap_or_else(|| fresh_state(current_nonce));
+
+        // Validate against the *snapshotted* signer set -- live storage is
+        // intentionally not consulted here.
+        if !state.signers.iter().any(|s| s == signer) {
             return Err(Error::NotAnUpgradeSigner);
         }
 
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::UpgradeThreshold)
-            .unwrap_or(1u32);
-
-        let approvals_key = DataKey::UpgradeApprovals(new_wasm_hash.clone());
-        let mut approvals: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&approvals_key)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        if approvals.iter().any(|a| a == signer) {
+        if state.approvals.iter().any(|a| a == signer) {
             return Err(Error::AlreadyApproved);
         }
-        approvals.push_back(signer.clone());
+        state.approvals.push_back(signer.clone());
 
-        // Count only approvals from currently-authorised signers. This
-        // prevents removed or rotated signers from being counted towards the
-        // threshold if the signer list changes while approvals are pending.
-        let mut distinct_current_approvals: Vec<Address> = Vec::new(&env);
-        for a in approvals.iter() {
-            if signers.iter().any(|s| s == a) && !distinct_current_approvals.iter().any(|d| d == a)
-            {
-                distinct_current_approvals.push_back(a.clone());
-            }
-        }
-
-        if (distinct_current_approvals.len() as u32) < threshold {
-            // Threshold not yet met â€” persist partial approvals and return.
-            env.storage().persistent().set(&approvals_key, &approvals);
-            Self::extend_persistent(&env, &approvals_key);
+        // All entries in state.approvals were validated against state.signers
+        // when they were added, so a simple length check is sufficient.
+        if (state.approvals.len() as u32) < state.threshold {
+            // Threshold not yet met -- persist updated state and return.
+            env.storage().persistent().set(&state_key, &state);
+            Self::extend_persistent(&env, &state_key);
             return Ok(());
         }
 
-        // Threshold reached â€” commit the proposal and clean up approvals.
-        env.storage().persistent().remove(&approvals_key);
+        // Threshold reached -- commit the proposal and clean up approval state.
+        // Remove approval state for this nonce; it is no longer needed.
+        env.storage().persistent().remove(&state_key);
 
         let config = Self::get_platform_config_internal(&env);
         let proposed_at = env.ledger().timestamp();
@@ -4240,11 +4303,31 @@ impl CraftNexusContract {
             .unwrap_or(1u32)
     }
 
-    /// Returns the list of pending approvals for the given WASM hash.
-    pub fn get_upgrade_approvals(env: Env, wasm_hash: BytesN<32>) -> Vec<Address> {
+    /// Returns the current proposal round nonce.
+    ///
+    /// The nonce is incremented on every `cancel_upgrade_wasm` call.  Callers
+    /// can use it to look up the active `UpgradeApprovalState` via
+    /// `get_upgrade_approvals`.
+    pub fn get_upgrade_proposal_nonce(env: Env) -> u32 {
         env.storage()
             .persistent()
-            .get(&DataKey::UpgradeApprovals(wasm_hash))
+            .get::<DataKey, UpgradeApprovalState>(&DataKey::UpgradeApprovalState(0))
+            .map(|s| s.nonce)
+            .unwrap_or(0u32)
+    }
+
+    /// Returns the list of pending approvals for the given proposal nonce.
+    ///
+    /// Pass the value returned by `get_upgrade_proposal_nonce` to inspect the
+    /// current round.  Returns an empty vec if no approvals exist for that
+    /// nonce (i.e. the round has not started or was already committed/cancelled).
+    pub fn get_upgrade_approvals(env: Env, nonce: u32) -> Vec<Address> {
+        // Returns approvals only if the stored state matches the requested nonce.
+        env.storage()
+            .persistent()
+            .get::<DataKey, UpgradeApprovalState>(&DataKey::UpgradeApprovalState(0))
+            .filter(|s| s.nonce == nonce)
+            .map(|s| s.approvals)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -4391,6 +4474,28 @@ impl CraftNexusContract {
         env.storage()
             .persistent()
             .remove(&DataKey::WasmUpgradeProposal);
+
+        // Increment the round nonce inside the approval state so that any
+        // residual approvals cannot be replayed in the next round.
+        // We write a "poisoned" state (empty approvals, bumped nonce) rather
+        // than removing the key so the nonce survives across cancel cycles.
+        let state_key = DataKey::UpgradeApprovalState(0);
+        let next_nonce: u32 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, UpgradeApprovalState>(&state_key)
+            .map(|s| s.nonce.saturating_add(1))
+            .unwrap_or(1u32);
+        // Store a sentinel state with the bumped nonce so propose_upgrade_wasm
+        // knows it must open a fresh round on the next call.
+        let reset_state = UpgradeApprovalState {
+            nonce: next_nonce,
+            signers: Vec::new(&env),
+            threshold: 1u32,
+            approvals: Vec::new(&env),
+        };
+        env.storage().persistent().set(&state_key, &reset_state);
+        Self::extend_persistent(&env, &state_key);
 
         // Issue #618: Record the cancellation timestamp so propose_upgrade_wasm
         // can enforce CANCEL_REPROPOSE_COOLDOWN against the cancel-and-repropose

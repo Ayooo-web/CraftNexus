@@ -1800,7 +1800,7 @@ fn test_execute_upgrade_rejects_legacy_storage_layout_without_migration() {
     let hash = BytesN::from_array(&env, &[9u8; 32]);
     let result = client.try_execute_upgrade(&hash);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), Error::StorageLayoutMismatch);
+    assert_eq!(result.unwrap_err(), Ok(Error::StorageLayoutMismatch));
 }
 
 #[test]
@@ -1890,7 +1890,8 @@ fn test_multisig_threshold_two_of_two() {
         client.get_upgrade_proposal().is_none(),
         "proposal committed too early"
     );
-    assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
+    // Nonce is 0 on the first round (no cancellations yet).
+    assert_eq!(client.get_upgrade_approvals(&0).len(), 1);
 
     // Second approval — threshold reached, proposal committed.
     client.propose_upgrade_wasm(&signer2, &hash);
@@ -1919,7 +1920,8 @@ fn test_duplicate_approval_returns_already_approved() {
     assert!(result.is_err());
     assert!(result.is_err());
 
-    assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
+    // Nonce is 0; admin approved once; signer2 has not approved yet.
+    assert_eq!(client.get_upgrade_approvals(&0).len(), 1);
     assert!(client.get_upgrade_proposal().is_none());
 }
 
@@ -1980,6 +1982,235 @@ fn test_set_upgrade_signers_empty_resets_to_admin() {
     let hash = BytesN::from_array(&env, &[6u8; 32]);
     client.propose_upgrade_wasm(&admin, &hash);
     assert!(client.get_upgrade_proposal().is_some());
+}
+
+
+// ============== Upgrade Governance Security Tests ==============
+
+/// AC2: Signer rotation after first approval cannot inflate the approval count.
+/// After the first signer approves (locking the snapshot), the admin adds a
+/// new signer and changes the threshold.  The new signer should be treated as
+/// part of the NEW round's signer set, but the snapshot for the CURRENT round
+/// is already fixed.  The current round must NOT count the new signer.
+#[test]
+fn test_signer_rotation_cannot_inflate_approval_count() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let evil_signer = Address::generate(&env);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer2.clone());
+    client.set_upgrade_signers(&signers);
+    client.set_upgrade_threshold(&2);
+
+    let hash = BytesN::from_array(&env, &[10u8; 32]);
+
+    // Round opens: admin approves (snapshot captured: {admin, signer2}, threshold=2).
+    client.propose_upgrade_wasm(&admin, &hash);
+    assert!(client.get_upgrade_proposal().is_none(), "proposal should not be committed yet");
+
+    // Admin rotates signers to include evil_signer AFTER the round has opened.
+    let mut new_signers = Vec::new(&env);
+    new_signers.push_back(admin.clone());
+    new_signers.push_back(evil_signer.clone());
+    client.set_upgrade_signers(&new_signers);
+    // Admin also tries to lower threshold to 1 after the round is open.
+    client.set_upgrade_threshold(&1);
+
+    // evil_signer was NOT in the snapshot — must be rejected.
+    let result = client.try_propose_upgrade_wasm(&evil_signer, &hash);
+    assert!(
+        result.is_err(),
+        "evil_signer added after round open must not be able to approve"
+    );
+
+    // Proposal still not committed — the threshold snapshot (2) was not met.
+    assert!(client.get_upgrade_proposal().is_none(),
+        "proposal must not be committed despite threshold change");
+
+    // Only the original signer2 (from the snapshot) can complete this round.
+    client.propose_upgrade_wasm(&signer2, &hash);
+    assert!(client.get_upgrade_proposal().is_some(), "proposal must commit after 2 of 2 original signers");
+}
+
+/// AC3: A pending proposal remains immutable after threshold approval is reached.
+/// After the proposal is committed via propose_upgrade_wasm, any call to
+/// propose_upgrade_wasm for the same hash must fail with UpgradeProposalExists.
+#[test]
+fn test_committed_proposal_is_immutable() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let hash = BytesN::from_array(&env, &[11u8; 32]);
+
+    // threshold=1 (default), admin is sole signer — one call commits.
+    client.propose_upgrade_wasm(&admin, &hash);
+    assert!(client.get_upgrade_proposal().is_some());
+
+    // Any subsequent propose call must fail with UpgradeProposalExists.
+    let result = client.try_propose_upgrade_wasm(&admin, &hash);
+    assert!(result.is_err());
+}
+
+/// AC4: Cancellation clears stale approvals — after cancel, the nonce is
+/// incremented and any old partial approvals are unreachable.  Re-proposing
+/// after the cooldown starts a fresh round that requires new approvals.
+///
+/// Flow:
+/// 1. Round 0: admin sole-approves (threshold=1) → proposal committed.
+/// 2. Cancel → nonce bumped to 1, old state cleared.
+/// 3. Advance past cooldown.
+/// 4. Round 1: admin approves again → fresh state, nonce=1.
+/// 5. Old approvals for nonce 0 are empty; new round has exactly 1 approval.
+#[test]
+fn test_cancel_clears_stale_approvals_and_increments_nonce() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    // Threshold=1 so a single admin approval commits the proposal immediately.
+    let hash_a = BytesN::from_array(&env, &[12u8; 32]);
+    let hash_b = BytesN::from_array(&env, &[13u8; 32]);
+
+    // Round 0, nonce=0: admin approves hash_a → commits.
+    assert_eq!(client.get_upgrade_proposal_nonce(), 0, "nonce starts at 0");
+    client.propose_upgrade_wasm(&admin, &hash_a);
+    assert!(client.get_upgrade_proposal().is_some(), "proposal must commit at threshold=1");
+    // Approval state is removed on commit, so get_upgrade_approvals returns empty.
+    assert_eq!(client.get_upgrade_approvals(&0).len(), 0,
+        "approvals are cleared after commit");
+
+    // Cancel the committed proposal → nonce bumps to 1.
+    client.cancel_upgrade_wasm();
+    assert_eq!(client.get_upgrade_proposal_nonce(), 1, "nonce must be 1 after cancel");
+    assert!(client.get_upgrade_proposal().is_none(), "proposal must be removed after cancel");
+    // Old nonce 0 approvals remain empty (never re-populated after commit+cancel).
+    assert_eq!(client.get_upgrade_approvals(&0).len(), 0,
+        "old nonce 0 approvals must be empty after cancel");
+
+    // Advance past CANCEL_REPROPOSE_COOLDOWN (7 days + 1 s).
+    env.ledger().with_mut(|li| { li.timestamp += 7 * 24 * 60 * 60 + 1; });
+
+    // Round 1, nonce=1: admin proposes a different hash → fresh state.
+    client.propose_upgrade_wasm(&admin, &hash_b);
+    assert!(client.get_upgrade_proposal().is_some(),
+        "proposal must commit in fresh round");
+    // Nonce 0 still returns empty — old state was not replayed.
+    assert_eq!(client.get_upgrade_approvals(&0).len(), 0,
+        "nonce 0 must still be empty in round 1");
+}
+
+/// AC4 (simplified): cancel_upgrade_wasm increments the proposal nonce.
+#[test]
+fn test_cancel_increments_proposal_nonce() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let hash = BytesN::from_array(&env, &[13u8; 32]);
+
+    // Commit a proposal (threshold=1, admin is sole signer).
+    client.propose_upgrade_wasm(&admin, &hash);
+    let nonce_before = client.get_upgrade_proposal_nonce();
+    assert_eq!(nonce_before, 0, "nonce starts at 0");
+
+    // Cancel increments the nonce.
+    client.cancel_upgrade_wasm();
+    let nonce_after = client.get_upgrade_proposal_nonce();
+    assert_eq!(nonce_after, 1, "nonce must be 1 after first cancel");
+}
+
+/// Replay protection: after cancel + cooldown, re-proposing the same hash
+/// with the same signers starts a completely new round (nonce=1, empty approvals).
+#[test]
+fn test_repropose_same_hash_starts_fresh_round_after_cancel() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer2.clone());
+    client.set_upgrade_signers(&signers);
+    client.set_upgrade_threshold(&2);
+
+    let hash = BytesN::from_array(&env, &[14u8; 32]);
+
+    // Round 0: admin approves. Threshold not yet met.
+    // To get a partial approval we need threshold=2; but cancel requires a committed
+    // proposal. Lower threshold to 1 to commit, then cancel.
+    client.set_upgrade_threshold(&1);
+    client.propose_upgrade_wasm(&admin, &hash);
+    // Committed. Cancel it.
+    client.cancel_upgrade_wasm();
+    // Nonce is now 1.
+    assert_eq!(client.get_upgrade_proposal_nonce(), 1);
+
+    // Advance past cooldown.
+    env.ledger().with_mut(|li| { li.timestamp += 7 * 24 * 60 * 60 + 1; });
+
+    // Round 1: admin approves again for the SAME hash.
+    client.set_upgrade_threshold(&2);
+    client.propose_upgrade_wasm(&admin, &hash);
+
+    // Nonce is still 1 (cancel hasn't been called again).
+    assert_eq!(client.get_upgrade_proposal_nonce(), 1);
+
+    // Only 1 approval in round 1 — admin's prior approval from round 0 is NOT counted.
+    assert_eq!(client.get_upgrade_approvals(&1).len(), 1,
+        "round 1 must have exactly 1 fresh approval, not carry over from round 0");
+
+    // Proposal must NOT be committed (threshold=2, only 1 approval so far).
+    assert!(client.get_upgrade_proposal().is_none(),
+        "proposal must not commit with only 1 of 2 required approvals in fresh round");
+
+    // signer2 approves to complete round 1.
+    client.propose_upgrade_wasm(&signer2, &hash);
+    assert!(client.get_upgrade_proposal().is_some(), "proposal must commit after 2nd approval");
+}
+
+/// Threshold snapshot: changing threshold mid-round does not affect the current round.
+#[test]
+fn test_threshold_change_mid_round_does_not_affect_current_round() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let signer3 = Address::generate(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer2.clone());
+    signers.push_back(signer3.clone());
+    client.set_upgrade_signers(&signers);
+    client.set_upgrade_threshold(&3); // requires all 3
+
+    let hash = BytesN::from_array(&env, &[15u8; 32]);
+
+    // admin approves first — snapshot captures threshold=3.
+    client.propose_upgrade_wasm(&admin, &hash);
+    assert!(client.get_upgrade_proposal().is_none());
+
+    // Admin lowers threshold to 1 after the round has opened.
+    client.set_upgrade_threshold(&1);
+
+    // signer2 approves — with the NEW threshold=1 this would be sufficient,
+    // but the snapshot still requires 3.
+    client.propose_upgrade_wasm(&signer2, &hash);
+    assert!(
+        client.get_upgrade_proposal().is_none(),
+        "proposal must not commit: snapshot threshold is 3, only 2 approvals so far"
+    );
+
+    // Third approval completes the snapshotted requirement.
+    client.propose_upgrade_wasm(&signer3, &hash);
+    assert!(client.get_upgrade_proposal().is_some(), "proposal must commit after 3 of 3 approvals");
 }
 
 // ============== Batch Operations Tests ==============
@@ -4696,7 +4927,7 @@ fn test_stake_below_minimum_threshold_rejected() {
     let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
     // Admin sets minimum stake required to 10_000_000
-    client.set_min_stake_required(&10_000_000).unwrap();
+    client.set_min_stake_required(&10_000_000);
 
     token_admin.mint(&seller, &20_000_000);
     // Staking 5_000_000 when min required is 10_000_000 should panic
@@ -4710,7 +4941,7 @@ fn test_unstake_with_active_obligations_below_min_stake_rejected() {
     env.mock_all_auths();
     let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
-    client.set_min_stake_required(&10_000_000).unwrap();
+    client.set_min_stake_required(&10_000_000);
 
     token_admin.mint(&seller, &20_000_000);
     token_admin.mint(&buyer, &20_000_000);
@@ -4736,7 +4967,7 @@ fn test_partial_unstake_consistent_collateral_rules() {
     env.mock_all_auths();
     let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
-    client.set_min_stake_required(&10_000_000).unwrap();
+    client.set_min_stake_required(&10_000_000);
 
     token_admin.mint(&seller, &50_000_000);
     token_admin.mint(&buyer, &50_000_000);
@@ -4782,7 +5013,7 @@ fn test_is_account_under_collateralized_detection() {
     assert_eq!(client.is_account_under_collateralized(&seller), false);
 
     // Admin raises min stake required to 10_000_000
-    client.set_min_stake_required(&10_000_000).unwrap();
+    client.set_min_stake_required(&10_000_000);
 
     // Now seller has active obligation but stake (5M) < min_stake_required (10M)
     assert_eq!(client.is_account_under_collateralized(&seller), true);
