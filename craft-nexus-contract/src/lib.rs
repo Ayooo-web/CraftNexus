@@ -260,6 +260,11 @@ const CANCEL_REPROPOSE_COOLDOWN: u64 = 7 * 24 * 60 * 60; // 7 days
 /// Default maximum duration a dispute can remain open before it can be force-resolved (30 days in seconds)
 const DEFAULT_MAX_DISPUTE_DURATION: u32 = 30 * 24 * 60 * 60;
 
+/// Minimum time (seconds) a dispute must remain open before admin can force-refund
+/// bypassing an unresponsive arbitrator (90 days). This is intentionally 3× the normal
+/// max dispute duration to ensure only genuinely stalled disputes qualify.
+const ADMIN_FORCE_REFUND_THRESHOLD: u64 = 90 * 24 * 60 * 60;
+
 /// Default cooldown period after staking before tokens can be unstaked (7 days in seconds)
 const DEFAULT_STAKE_COOLDOWN: u32 = 7 * 24 * 60 * 60;
 
