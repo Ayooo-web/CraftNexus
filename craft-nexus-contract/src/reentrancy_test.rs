@@ -337,7 +337,7 @@ fn test_cancel_recurring_escrow_cei_pattern() {
     let escrow: RecurringEscrow = env.as_contract(&contract_id, || {
         env.storage()
             .persistent()
-            .get(&DataKey::RecurringEscrow(id))
+            .get(&DataKey::RecurEscrow(id))
             .unwrap()
     });
     assert_eq!(escrow.is_active, false);

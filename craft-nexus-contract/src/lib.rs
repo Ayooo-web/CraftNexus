@@ -290,117 +290,141 @@ const MIN_ADMIN_RECOVERY_COOLDOWN: u64 = 7 * 24 * 60 * 60;
 pub enum DataKey {
     Escrow(u32),
     /// DEPRECATED: Legacy vector-based storage. Kept for backward compatibility.
-    /// New implementations should use BuyerEscrowIndexed instead.
+    /// New implementations should use `BuyerEscrow` instead.
     BuyerEscrows(Address),
     /// DEPRECATED: Legacy vector-based storage. Kept for backward compatibility.
-    /// New implementations should use SellerEscrowIndexed instead.
+    /// New implementations should use `SellerEscrow` instead.
     SellerEscrows(Address),
-    MinEscrowAmount(Address),
+    /// Formerly `MinEscrowAmount`.
+    MinAmount(Address),
     TotalFees(Address),
-    FeeTokenIndex,
-    FeeTokenConfig(Address),
-    ContractVersion,
-    /// Platform configuration storage key
-    PlatformConfig,
-    /// Custom fee tier for an artisan (basis points)
-    ArtisanFeeTier(Address),
-    /// Staked token amount and asset for an artisan
-    ArtisanStake(Address),
-    StakeCooldownEnd(Address),
+    /// Formerly `FeeTokenIndex`.
+    FeeIndex,
+    /// Formerly `FeeTokenConfig`.
+    FeeConfig(Address),
+    /// Formerly `ContractVersion`.
+    Version,
+    /// Platform configuration storage key. Formerly `PlatformConfig`.
+    Config,
+    /// Custom fee tier for an artisan (basis points). Formerly `ArtisanFeeTier`.
+    FeeTier(Address),
+    /// Staked token amount and asset for an artisan. Formerly `ArtisanStake`.
+    StakeAmt(Address),
+    /// Formerly `StakeCooldownEnd`.
+    CooldownEnd(Address),
     /// DEPRECATED single-cooldown timestamp for an artisan.
     ///
-    /// Active stake/unstake logic uses [`DataKey::ArtisanStakeQueue`]; this
-    /// key is **never read** by any code path in the live contract and
-    /// cannot influence cooldown decisions. It is updated alongside the
-    /// queue (set to the latest `cooldown_end`) purely so older read-only
-    /// clients still see a meaningful value. Once a queue is fully
-    /// drained the key is removed in `unstake_tokens`.
-    ///
+    /// Active stake/unstake logic uses [`DataKey::StakeQueue`]; this key is
+    /// **never read** by any code path in the live contract and cannot
+    /// influence cooldown decisions. It is updated alongside the queue
+    /// (set to the latest `cooldown_end`) purely so older read-only clients
+    /// still see a meaningful value. Once a queue is fully drained the key
+    /// is removed in `unstake_tokens`.
     ///
     /// Per-deposit stake queue for an artisan. Each entry represents an
     /// individual deposit and its cooldown end timestamp. This allows
     /// accurate tracking of staking timeframes when multiple deposits
-    /// are made at different times.
-    ArtisanStakeQueue(Address),
-    /// Count of entries in the artisan stake queue (for bounds checking)
-    ArtisanStakeQueueCount(Address),
-    /// Indexed storage of stake deposits (Address, index) -> StakeDeposit
-    ArtisanStakeQueueIndexed(Address, u32),
-    /// Partial refund proposal for a disputed order
-    PartialRefundProposal(u32),
+    /// are made at different times. Formerly `ArtisanStakeQueue`.
+    StakeQueue(Address),
+    /// Count of entries in the artisan stake queue (for bounds checking).
+    /// Formerly `ArtisanStakeQueueCount`.
+    StakeDepositCount(Address),
+    /// Indexed storage of stake deposits (Address, index) -> StakeDeposit.
+    /// Formerly `ArtisanStakeQueueIndexed`.
+    StakeDeposit(Address, u32),
+    /// Partial refund proposal for a disputed order. Formerly `PartialRefundProposal`.
+    RefundProposal(u32),
     /// Re-entrancy guard key
     ReentryGuard,
     /// Pending admin address for two-step transfer
     PendingAdmin,
-    /// Proposal for contract WASM upgrade
-    WasmUpgradeProposal,
-    /// Configurable maximum release window (in seconds)
-    MaxReleaseWindow,
-    /// Address of the deployed onboarding contract for cross-contract reputation calls
-    OnboardingContractAddress,
+    /// Proposal for contract WASM upgrade. Formerly `WasmUpgradeProposal`.
+    UpgradeProposal,
+    /// Configurable maximum release window (in seconds). Formerly `MaxReleaseWindow`.
+    MaxRelWindow,
+    /// Address of the deployed onboarding contract for cross-contract reputation calls.
+    /// Formerly `OnboardingContractAddress`.
+    OnboardContract,
     /// DEPRECATED legacy storage: Map of whitelisted token addresses (Address -> bool).
     /// New code stores each token as an individual key-value pair.
     WhitelistedTokens,
-    /// Individual whitelisted token entry (Address -> bool)
-    WhitelistedTokenIndexed(Address),
+    /// Individual whitelisted token entry (Address -> bool).
+    /// Formerly `WhitelistedTokenIndexed`.
+    TokenAllowed(Address),
     /// Count of whitelisted tokens for efficient enumeration.
-    WhitelistedTokenCount,
+    /// Formerly `WhitelistedTokenCount`.
+    TokenCount,
     /// DEPRECATED: Legacy monolithic Vec of all escrow order IDs.
-    /// New writes use [`DataKey::GlobalEscrowIdIndexed`] (#515). Kept for
-    /// lazy migration on the next index update or paginated read.
+    /// New writes use [`DataKey::EscrowIndex`] (#515). Kept for lazy
+    /// migration on the next index update or paginated read.
     AllEscrowIds,
     /// Total count of escrows ever created; O(1) length for indexed enumeration
     EscrowCount,
     /// Indexed global escrow order ID by creation sequence (#515).
     /// Each entry stores one `u32` order ID, avoiding Vec rewrites on batch create.
-    GlobalEscrowIdIndexed(u32),
+    /// Formerly `GlobalEscrowIdIndexed`.
+    EscrowIndex(u32),
     /// Fallback admin address for recovery if primary admin storage is corrupted (#240)
     FallbackAdmin,
     /// Timestamp when admin recovery mechanism becomes available (time-lock safety).
     /// Stored as a compact `u64` ledger timestamp (#431 / key index #30).
-    AdminRecoveryTime,
+    /// Formerly `AdminRecoveryTime`.
+    AdminRecovTime,
     /// The configured delay (seconds) that was recorded when the recovery time
     /// was initiated. Used to validate that a minimum cooldown was respected.
-    AdminRecoveryDelay,
+    /// Formerly `AdminRecoveryDelay`.
+    AdminRecovDelay,
     /// Historical record of stake changes per artisan (bounded queue for audit trail) (#237)
     StakeHistory(Address),
-    /// Count of entries in the stake history queue (bounds checking)
-    StakeHistoryCount(Address),
-    /// Timestamp when an artisan's stake was last modified (for maintenance checks)
-    StakeLastModified(Address),
+    /// Count of entries in the stake history queue (bounds checking).
+    /// Formerly `StakeHistoryCount`.
+    StakeHistCount(Address),
+    /// Timestamp when an artisan's stake was last modified (for maintenance checks).
+    /// Formerly `StakeLastModified`.
+    StakeMod(Address),
     /// Number of fund-movement audit entries for a given actor/account.
-    FundAuditCount(Address),
+    /// Formerly `FundAuditCount`.
+    AuditCount(Address),
     /// Indexed fund-movement audit entry for an actor/account.
-    FundAuditIndexed(Address, u32),
-    /// Indexed storage of a buyer's escrow ID by position
-    BuyerEscrowIndexed(Address, u32),
-    /// Indexed storage of a seller's escrow ID by position
-    SellerEscrowIndexed(Address, u32),
-    /// Count of a buyer's escrows
-    BuyerEscrowCount(Address),
-    /// Count of a seller's escrows
-    SellerEscrowCount(Address),
+    /// Formerly `FundAuditIndexed`.
+    AuditEntry(Address, u32),
+    /// Indexed storage of a buyer's escrow ID by position.
+    /// Formerly `BuyerEscrowIndexed`.
+    BuyerEscrow(Address, u32),
+    /// Indexed storage of a seller's escrow ID by position.
+    /// Formerly `SellerEscrowIndexed`.
+    SellerEscrow(Address, u32),
+    /// Count of a buyer's escrows. Formerly `BuyerEscrowCount`.
+    BuyerCount(Address),
+    /// Count of a seller's escrows. Formerly `SellerEscrowCount`.
+    SellerCount(Address),
     /// Total locked funds across all active escrows for a given token address.
     TotalLocked(Address),
     /// Total amount of funds currently staked by artisans for a token address.
     TotalStaked(Address),
-    /// Bounded log of completed WASM upgrades. Capped at MAX_UPGRADE_HISTORY
-    UpgradeHistory,
-    /// Key for a recurring escrow by its ID
-    RecurringEscrow(u64),
-    /// ID counter for recurring escrows
-    NextRecurringEscrowId,
-    /// Count of currently active (non-released, non-refunded) escrows or recurring escrows for a user address.
-    ActiveObligations(Address),
-    /// Required number of distinct signer approvals before a WASM upgrade proposal is committed.
-    UpgradeThreshold,
+    /// Bounded log of completed WASM upgrades. Capped at MAX_UPGRADE_HISTORY.
+    /// Formerly `UpgradeHistory`.
+    UpgrHist,
+    /// Key for a recurring escrow by its ID. Formerly `RecurringEscrow`.
+    RecurEscrow(u64),
+    /// ID counter for recurring escrows. Formerly `NextRecurringEscrowId`.
+    NextRecurId,
+    /// Count of currently active (non-released, non-refunded) escrows or recurring
+    /// escrows for a user address. Formerly `ActiveObligations`.
+    ActiveObl(Address),
+    /// Required number of distinct signer approvals before a WASM upgrade proposal
+    /// is committed. Formerly `UpgradeThreshold`.
+    UpgrThreshold,
     /// Per-hash list of addresses that have approved a pending WASM upgrade hash.
-    UpgradeApprovals(BytesN<32>),
+    /// Formerly `UpgradeApprovals`.
+    UpgrApprove(BytesN<32>),
     /// Ordered list of addresses authorized to co-sign WASM upgrade proposals.
-    UpgradeSigners,
+    /// Formerly `UpgradeSigners`.
+    UpgrSigners,
     /// Ledger timestamp (u64) recorded when the last upgrade proposal was
     /// cancelled. Used to enforce CANCEL_REPROPOSE_COOLDOWN (Issue #618).
-    LastUpgradeCancelledAt,
+    /// Formerly `LastUpgradeCancelledAt`.
+    UpgradeCancelAt,
 }
 
 #[contracttype]
@@ -917,7 +941,7 @@ pub struct UpgradeRecord {
 /// The legacy `FeeTokenIndex` storage held only a flat `Vec<Address>` of
 /// fee-receiving tokens, which forced any future multi-token fee model into a
 /// contract upgrade. This struct gives us a per-token slot keyed by
-/// `DataKey::FeeTokenConfig(token)` that can carry forward additional fields
+/// `DataKey::FeeConfig(token)` that can carry forward additional fields
 /// (e.g. custom_bps overrides, token-specific receivers) without touching the
 /// global storage shape â€” new fields can be appended as `Option<T>` and read
 /// with safe fallbacks.
@@ -941,7 +965,7 @@ pub struct UpgradeRecord {
 ///
 /// # Storage Side-effects
 ///
-/// - Stored persistently under `DataKey::FeeTokenConfig(token_address)` with
+/// - Stored persistently under `DataKey::FeeConfig(token_address)` with
 ///   TTL extension on reads to prevent premature archival.
 /// - Updates to this struct trigger config refresh in affected escrow operations
 ///   to ensure correct fee calculations based on token status.
@@ -1336,7 +1360,7 @@ impl CraftNexusContract {
         let config: PlatformConfig = env
             .storage()
             .instance()
-            .get(&DataKey::PlatformConfig)
+            .get(&DataKey::Config)
             .ok_or(Error::PlatformNotInitialized)?;
         Ok(config.admin)
     }
@@ -1530,7 +1554,7 @@ impl CraftNexusContract {
         let count_key = DataKey::EscrowCount;
         let count = Self::get_persistent_u32(env, &count_key);
 
-        let index_key = DataKey::GlobalEscrowIdIndexed(count);
+        let index_key = DataKey::EscrowIndex(count);
         env.storage().persistent().set(&index_key, &order_id);
         Self::extend_persistent(env, &index_key);
 
@@ -1553,7 +1577,7 @@ impl CraftNexusContract {
 
         for i in 0..order_ids.len() {
             if let Some(id) = order_ids.get(i) {
-                let index_key = DataKey::GlobalEscrowIdIndexed(count);
+                let index_key = DataKey::EscrowIndex(count);
                 env.storage().persistent().set(&index_key, &id);
                 Self::extend_persistent(env, &index_key);
                 count += 1;
@@ -1575,7 +1599,7 @@ impl CraftNexusContract {
         let min_amount: i128 = env
             .storage()
             .persistent()
-            .get(&DataKey::MinEscrowAmount(token))
+            .get(&DataKey::MinAmount(token))
             .unwrap_or(0); // If not set, allow any positive amount
 
         if amount < min_amount {
@@ -1593,7 +1617,7 @@ impl CraftNexusContract {
         new_stake: i128,
         operation: &str,
     ) -> Result<(), Error> {
-        let count_key = DataKey::StakeHistoryCount(artisan.clone());
+        let count_key = DataKey::StakeHistCount(artisan.clone());
         let _history_key = DataKey::StakeHistory(artisan.clone());
 
         let current_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
@@ -1614,7 +1638,7 @@ impl CraftNexusContract {
         }
 
         // Record timestamp of this operation for maintenance checks
-        let modified_key = DataKey::StakeLastModified(artisan.clone());
+        let modified_key = DataKey::StakeMod(artisan.clone());
         env.storage()
             .persistent()
             .set(&modified_key, &env.ledger().timestamp());
@@ -1633,7 +1657,7 @@ impl CraftNexusContract {
     /// Implements safe cleanup strategy that preserves recent entries for audit trail
     #[allow(dead_code)]
     fn prune_stake_history(env: &Env, artisan: &Address) {
-        let count_key = DataKey::StakeHistoryCount(artisan.clone());
+        let count_key = DataKey::StakeHistCount(artisan.clone());
         let current_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
         if current_count > 0 {
@@ -1645,7 +1669,7 @@ impl CraftNexusContract {
     }
 
     fn update_active_obligations(env: &Env, user: &Address, delta: i32) {
-        let key = DataKey::ActiveObligations(user.clone());
+        let key = DataKey::ActiveObl(user.clone());
         let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
         let new_val = if delta > 0 {
             count.saturating_add(delta as u32)
@@ -1708,7 +1732,7 @@ impl CraftNexusContract {
     }
 
     fn get_whitelist_count(env: &Env) -> u32 {
-        let count_key = DataKey::WhitelistedTokenCount;
+        let count_key = DataKey::TokenCount;
         match env.storage().persistent().get(&count_key) {
             Some(count) => {
                 Self::extend_persistent(env, &count_key);
@@ -1719,7 +1743,7 @@ impl CraftNexusContract {
     }
 
     fn set_whitelist_count(env: &Env, count: u32) {
-        let count_key = DataKey::WhitelistedTokenCount;
+        let count_key = DataKey::TokenCount;
         env.storage().persistent().set(&count_key, &count);
         Self::extend_persistent(env, &count_key);
     }
@@ -1739,7 +1763,7 @@ impl CraftNexusContract {
         let mut count = Self::get_whitelist_count(env);
         for (token, enabled) in legacy_whitelist.iter() {
             if enabled {
-                let token_key = DataKey::WhitelistedTokenIndexed(token.clone());
+                let token_key = DataKey::TokenAllowed(token.clone());
                 if !env.storage().persistent().has(&token_key) {
                     env.storage().persistent().set(&token_key, &true);
                     Self::extend_persistent(env, &token_key);
@@ -1753,7 +1777,7 @@ impl CraftNexusContract {
         } else {
             env.storage()
                 .persistent()
-                .remove(&DataKey::WhitelistedTokenCount);
+                .remove(&DataKey::TokenCount);
         }
 
         env.storage().persistent().remove(&legacy_key);
@@ -1774,7 +1798,7 @@ impl CraftNexusContract {
 
         for i in 0..all_ids.len() {
             if let Some(id) = all_ids.get(i) {
-                let index_key = DataKey::GlobalEscrowIdIndexed(i);
+                let index_key = DataKey::EscrowIndex(i);
                 if !env.storage().persistent().has(&index_key) {
                     env.storage().persistent().set(&index_key, &id);
                     Self::extend_persistent(env, &index_key);
@@ -1797,7 +1821,7 @@ impl CraftNexusContract {
     /// Returns the configured maximum release window (in seconds).
     /// Falls back to MAX_TOTAL_RELEASE_WINDOW (30 days) if not set by admin.
     fn get_max_release_window(env: &Env) -> u32 {
-        let key = DataKey::MaxReleaseWindow;
+        let key = DataKey::MaxRelWindow;
         let value = env
             .storage()
             .persistent()
@@ -1814,7 +1838,7 @@ impl CraftNexusContract {
     fn get_onboarding_address(env: &Env) -> Option<Address> {
         env.storage()
             .persistent()
-            .get::<DataKey, Address>(&DataKey::OnboardingContractAddress)
+            .get::<DataKey, Address>(&DataKey::OnboardContract)
     }
 
     /// Build a client for the configured onboarding contract, if one is set.
@@ -1846,7 +1870,7 @@ impl CraftNexusContract {
 
     /// Check if a user has any active escrows or recurring escrows.
     pub fn has_active_escrows(env: Env, user: Address) -> bool {
-        let key = DataKey::ActiveObligations(user);
+        let key = DataKey::ActiveObl(user);
         Self::get_persistent_u32(&env, &key) > 0
     }
 
@@ -1978,7 +2002,7 @@ impl CraftNexusContract {
         }
         env.storage()
             .persistent()
-            .set(&DataKey::MaxReleaseWindow, &max_window);
+            .set(&DataKey::MaxRelWindow, &max_window);
     }
 
     /// Set the minimum release window to prevent "flash" auto-releases (admin only).
@@ -2007,7 +2031,7 @@ impl CraftNexusContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
 
         Self::emit_config_updated(
             &env,
@@ -2055,8 +2079,8 @@ impl CraftNexusContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::OnboardingContractAddress, &contract_address);
-        Self::extend_persistent(&env, &DataKey::OnboardingContractAddress);
+            .set(&DataKey::OnboardContract, &contract_address);
+        Self::extend_persistent(&env, &DataKey::OnboardContract);
 
         let old_value = match previous {
             Some(addr) => ConfigValue::Address(addr),
@@ -2083,7 +2107,7 @@ impl CraftNexusContract {
 
         env.storage()
             .persistent()
-            .remove(&DataKey::OnboardingContractAddress);
+            .remove(&DataKey::OnboardContract);
 
         Self::emit_config_updated(
             &env,
@@ -2097,7 +2121,7 @@ impl CraftNexusContract {
     /// Add a token to the platform whitelist (admin only).
     ///
     /// Uses individual key-value pairs for scalability instead of a single Map.
-    /// Each token is stored as DataKey::WhitelistedTokenIndexed(token) -> true.
+    /// Each token is stored as DataKey::TokenAllowed(token) -> true.
     /// Once at least one token is whitelisted, only whitelisted tokens may be
     /// used in escrow creation. The check is skipped when the whitelist is empty,
     /// preserving backward compatibility.
@@ -2121,7 +2145,7 @@ impl CraftNexusContract {
         }
 
         Self::migrate_legacy_whitelisted_tokens(&env);
-        let token_key = DataKey::WhitelistedTokenIndexed(token.clone());
+        let token_key = DataKey::TokenAllowed(token.clone());
         let mut count = Self::get_whitelist_count(&env);
 
         if !env.storage().persistent().has(&token_key) {
@@ -2143,7 +2167,7 @@ impl CraftNexusContract {
         config.admin.require_auth();
 
         Self::migrate_legacy_whitelisted_tokens(&env);
-        let token_key = DataKey::WhitelistedTokenIndexed(token.clone());
+        let token_key = DataKey::TokenAllowed(token.clone());
 
         if env.storage().persistent().has(&token_key) {
             env.storage().persistent().remove(&token_key);
@@ -2166,7 +2190,7 @@ impl CraftNexusContract {
             return true;
         }
 
-        let token_key = DataKey::WhitelistedTokenIndexed(token);
+        let token_key = DataKey::TokenAllowed(token);
         let is_whitelisted = env.storage().persistent().has(&token_key);
         if is_whitelisted {
             Self::extend_persistent(&env, &token_key);
@@ -2189,7 +2213,7 @@ impl CraftNexusContract {
             return;
         }
 
-        let token_key = DataKey::WhitelistedTokenIndexed(token.clone());
+        let token_key = DataKey::TokenAllowed(token.clone());
         if !env.storage().persistent().has(&token_key) {
             env.panic_with_error(crate::Error::TokenNotWhitelisted);
         }
@@ -2234,7 +2258,7 @@ impl CraftNexusContract {
             if let Some(token) = keys.get(i) {
                 if let Some(is_whitelisted) = legacy_whitelist.get(token.clone()) {
                     if is_whitelisted {
-                        let token_key = DataKey::WhitelistedTokenIndexed(token);
+                        let token_key = DataKey::TokenAllowed(token);
                         env.storage().persistent().set(&token_key, &true);
                         Self::extend_persistent(&env, &token_key);
                         migrated_count += 1;
@@ -2245,7 +2269,7 @@ impl CraftNexusContract {
 
         // Update count
         if migrated_count > 0 {
-            let count_key = DataKey::WhitelistedTokenCount;
+            let count_key = DataKey::TokenCount;
             env.storage().persistent().set(&count_key, &migrated_count);
             Self::extend_persistent(&env, &count_key);
         }
@@ -2265,7 +2289,7 @@ impl CraftNexusContract {
         let config = Self::get_platform_config_internal(&env);
         config.admin.require_auth();
 
-        let legacy_key = DataKey::ArtisanStakeQueue(artisan.clone());
+        let legacy_key = DataKey::StakeQueue(artisan.clone());
 
         // Check if legacy storage exists
         if !env.storage().persistent().has(&legacy_key) {
@@ -2288,14 +2312,14 @@ impl CraftNexusContract {
         // Migrate each deposit to individual indexed storage
         for i in 0..queue_len {
             if let Some(deposit) = legacy_queue.get(i) {
-                let deposit_key = DataKey::ArtisanStakeQueueIndexed(artisan.clone(), i);
+                let deposit_key = DataKey::StakeDeposit(artisan.clone(), i);
                 env.storage().persistent().set(&deposit_key, &deposit);
                 Self::extend_persistent(&env, &deposit_key);
             }
         }
 
         // Set count
-        let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
+        let count_key = DataKey::StakeDepositCount(artisan.clone());
         env.storage().persistent().set(&count_key, &queue_len);
         Self::extend_persistent(&env, &count_key);
 
@@ -2310,7 +2334,7 @@ impl CraftNexusContract {
     /// Returns 0 if no deposits exist. This is more efficient than loading
     /// all deposits when only the count is needed.
     pub fn get_artisan_stake_queue_count(env: Env, artisan: Address) -> u32 {
-        let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
+        let count_key = DataKey::StakeDepositCount(artisan.clone());
         env.storage().persistent().get(&count_key).unwrap_or(0)
     }
 
@@ -2324,14 +2348,14 @@ impl CraftNexusContract {
         offset: u32,
         limit: u32,
     ) -> soroban_sdk::Vec<StakeDeposit> {
-        let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
+        let count_key = DataKey::StakeDepositCount(artisan.clone());
         let total_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
         let mut deposits = soroban_sdk::Vec::new(&env);
         let end = core::cmp::min(offset + limit, total_count);
 
         for i in offset..end {
-            let deposit_key = DataKey::ArtisanStakeQueueIndexed(artisan.clone(), i);
+            let deposit_key = DataKey::StakeDeposit(artisan.clone(), i);
             if let Some(deposit) = env
                 .storage()
                 .persistent()
@@ -2377,7 +2401,7 @@ impl CraftNexusContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
 
         env.storage()
             .persistent()
@@ -2392,15 +2416,15 @@ impl CraftNexusContract {
         // Initialize contract version to 1
         env.storage()
             .persistent()
-            .set(&DataKey::ContractVersion, &1u32);
-        Self::extend_persistent(&env, &DataKey::ContractVersion);
+            .set(&DataKey::Version, &1u32);
+        Self::extend_persistent(&env, &DataKey::Version);
 
         // Set the onboarding contract address to enable reputation tracking (optional)
         if let Some(ref addr) = onboarding_contract {
             env.storage()
                 .persistent()
-                .set(&DataKey::OnboardingContractAddress, addr);
-            Self::extend_persistent(&env, &DataKey::OnboardingContractAddress);
+                .set(&DataKey::OnboardContract, addr);
+            Self::extend_persistent(&env, &DataKey::OnboardContract);
         }
 
         Self::emit_config_updated(
@@ -2447,7 +2471,7 @@ impl CraftNexusContract {
         config.pending_admin = Some(new_admin.clone());
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
 
         // Emit audit event for admin change proposal
         Self::emit_admin_changed(&env, previous_admin, new_admin, "admin_proposed");
@@ -2473,7 +2497,7 @@ impl CraftNexusContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
 
         // Emit audit event for the completed two-step admin transfer (#631)
         Self::emit_admin_changed(&env, previous_admin, new_admin, "admin_claimed");
@@ -2491,7 +2515,7 @@ impl CraftNexusContract {
         config.pending_admin = None;
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
         Ok(())
     }
 
@@ -2532,9 +2556,9 @@ impl CraftNexusContract {
         for i in 0..count {
             if let Some(escrow_id) = legacy_escrows.get(i) {
                 let index_key = if is_buyer {
-                    DataKey::BuyerEscrowIndexed(user.clone(), i)
+                    DataKey::BuyerEscrow(user.clone(), i)
                 } else {
-                    DataKey::SellerEscrowIndexed(user.clone(), i)
+                    DataKey::SellerEscrow(user.clone(), i)
                 };
                 env.storage().persistent().set(&index_key, &escrow_id);
                 Self::extend_persistent(&env, &index_key);
@@ -2543,9 +2567,9 @@ impl CraftNexusContract {
 
         // Set the count
         let count_key = if is_buyer {
-            DataKey::BuyerEscrowCount(user.clone())
+            DataKey::BuyerCount(user.clone())
         } else {
-            DataKey::SellerEscrowCount(user.clone())
+            DataKey::SellerCount(user.clone())
         };
         env.storage().persistent().set(&count_key, &count);
         Self::extend_persistent(&env, &count_key);
@@ -2586,7 +2610,7 @@ impl CraftNexusContract {
         }
 
         // Check if recovery time lock has passed (#431 â€” TTL-friendly read)
-        let recovery_time = Self::get_persistent_u64(&env, &DataKey::AdminRecoveryTime);
+        let recovery_time = Self::get_persistent_u64(&env, &DataKey::AdminRecovTime);
 
         let current_time = env.ledger().timestamp();
 
@@ -2595,7 +2619,7 @@ impl CraftNexusContract {
         // cannot bypass the minimum cooldown requirement.
         if recovery_time == 0 {
             let new_recovery_time = current_time + ADMIN_RECOVERY_DELAY;
-            let recovery_time_key = DataKey::AdminRecoveryTime;
+            let recovery_time_key = DataKey::AdminRecovTime;
             env.storage()
                 .persistent()
                 .set(&recovery_time_key, &new_recovery_time);
@@ -2603,7 +2627,7 @@ impl CraftNexusContract {
 
             // Record the delay used for this initiation so it can be validated
             // later when recovery is attempted.
-            let delay_key = DataKey::AdminRecoveryDelay;
+            let delay_key = DataKey::AdminRecovDelay;
             env.storage()
                 .persistent()
                 .set(&delay_key, &ADMIN_RECOVERY_DELAY);
@@ -2624,7 +2648,7 @@ impl CraftNexusContract {
         // Ensure the recorded cooldown meets the minimum floor. If the delay
         // is missing or below the minimum, treat this as a failed recovery
         // attempt to prevent direct-storage bypasses.
-        let recorded_delay = Self::get_persistent_u64(&env, &DataKey::AdminRecoveryDelay);
+        let recorded_delay = Self::get_persistent_u64(&env, &DataKey::AdminRecovDelay);
         if recorded_delay == 0 || recorded_delay < MIN_ADMIN_RECOVERY_COOLDOWN {
             return Err(Error::AdminRecoveryFailed);
         }
@@ -2639,7 +2663,7 @@ impl CraftNexusContract {
         // by get_platform_config_internal. No redundant extend_persistent needed.
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
 
         // Sync to persistent backup key for recovery consistency (no TTL extension needed
         // since this is a one-time sync, not a read-heavy path).
@@ -2648,11 +2672,11 @@ impl CraftNexusContract {
         // Clear the recovery time lock for next cycle
         env.storage()
             .persistent()
-            .remove(&DataKey::AdminRecoveryTime);
+            .remove(&DataKey::AdminRecovTime);
         // Clear the recorded delay as well
         env.storage()
             .persistent()
-            .remove(&DataKey::AdminRecoveryDelay);
+            .remove(&DataKey::AdminRecovDelay);
 
         // Emit audit event
         Self::emit_admin_changed(&env, previous_admin, recovered_admin, "admin_recovered");
@@ -2726,7 +2750,7 @@ impl CraftNexusContract {
             let artisan_stake: i128 = env
                 .storage()
                 .persistent()
-                .get(&DataKey::ArtisanStake(seller.clone()))
+                .get(&DataKey::StakeAmt(seller.clone()))
                 .map(|stake: ArtisanStakeData| stake.amount)
                 .unwrap_or(0);
             if artisan_stake < config.min_stake_required {
@@ -2788,13 +2812,13 @@ impl CraftNexusContract {
         Self::update_escrow_indices_atomic(&env, order_id);
 
         // Update buyer's escrow list using indexed storage (scalable approach)
-        let buyer_count_key = DataKey::BuyerEscrowCount(buyer.clone());
+        let buyer_count_key = DataKey::BuyerCount(buyer.clone());
         let buyer_count: u32 = env
             .storage()
             .persistent()
             .get(&buyer_count_key)
             .unwrap_or(0u32);
-        let buyer_index_key = DataKey::BuyerEscrowIndexed(buyer.clone(), buyer_count);
+        let buyer_index_key = DataKey::BuyerEscrow(buyer.clone(), buyer_count);
         env.storage()
             .persistent()
             .set(&buyer_index_key, &(order_id as u64));
@@ -2805,13 +2829,13 @@ impl CraftNexusContract {
         Self::extend_persistent(&env, &buyer_count_key);
 
         // Update seller's escrow list using indexed storage (scalable approach)
-        let seller_count_key = DataKey::SellerEscrowCount(seller.clone());
+        let seller_count_key = DataKey::SellerCount(seller.clone());
         let seller_count: u32 = env
             .storage()
             .persistent()
             .get(&seller_count_key)
             .unwrap_or(0u32);
-        let seller_index_key = DataKey::SellerEscrowIndexed(seller.clone(), seller_count);
+        let seller_index_key = DataKey::SellerEscrow(seller.clone(), seller_count);
         env.storage()
             .persistent()
             .set(&seller_index_key, &(order_id as u64));
@@ -2909,13 +2933,13 @@ impl CraftNexusContract {
         Self::extend_persistent(&env, &(ESCROW, order_id));
 
         // Update buyer's escrow list
-        let buyer_count_key = DataKey::BuyerEscrowCount(buyer.clone());
+        let buyer_count_key = DataKey::BuyerCount(buyer.clone());
         let buyer_count: u32 = env
             .storage()
             .persistent()
             .get(&buyer_count_key)
             .unwrap_or(0u32);
-        let buyer_index_key = DataKey::BuyerEscrowIndexed(buyer.clone(), buyer_count);
+        let buyer_index_key = DataKey::BuyerEscrow(buyer.clone(), buyer_count);
         env.storage()
             .persistent()
             .set(&buyer_index_key, &(order_id as u64));
@@ -2926,13 +2950,13 @@ impl CraftNexusContract {
         Self::extend_persistent(&env, &buyer_count_key);
 
         // Update seller's escrow list
-        let seller_count_key = DataKey::SellerEscrowCount(seller.clone());
+        let seller_count_key = DataKey::SellerCount(seller.clone());
         let seller_count: u32 = env
             .storage()
             .persistent()
             .get(&seller_count_key)
             .unwrap_or(0u32);
-        let seller_index_key = DataKey::SellerEscrowIndexed(seller.clone(), seller_count);
+        let seller_index_key = DataKey::SellerEscrow(seller.clone(), seller_count);
         env.storage()
             .persistent()
             .set(&seller_index_key, &(order_id as u64));
@@ -3134,7 +3158,7 @@ impl CraftNexusContract {
         }
 
         // Try new indexed storage first
-        let count_key = DataKey::BuyerEscrowCount(buyer.clone());
+        let count_key = DataKey::BuyerCount(buyer.clone());
         if env.storage().persistent().has(&count_key) {
             let total_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
             let start = page * page_size;
@@ -3151,7 +3175,7 @@ impl CraftNexusContract {
                 } else {
                     position
                 };
-                let index_key = DataKey::BuyerEscrowIndexed(buyer.clone(), storage_index);
+                let index_key = DataKey::BuyerEscrow(buyer.clone(), storage_index);
                 if let Some(escrow_id) = env.storage().persistent().get::<_, u64>(&index_key) {
                     result.push_back(escrow_id);
                     Self::extend_persistent_read(&env, &index_key);
@@ -3212,7 +3236,7 @@ impl CraftNexusContract {
         }
 
         // Try new indexed storage first
-        let count_key = DataKey::SellerEscrowCount(seller.clone());
+        let count_key = DataKey::SellerCount(seller.clone());
         if env.storage().persistent().has(&count_key) {
             let total_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32);
             let start = page * page_size;
@@ -3229,7 +3253,7 @@ impl CraftNexusContract {
                 } else {
                     position
                 };
-                let index_key = DataKey::SellerEscrowIndexed(seller.clone(), storage_index);
+                let index_key = DataKey::SellerEscrow(seller.clone(), storage_index);
                 if let Some(escrow_id) = env.storage().persistent().get::<_, u64>(&index_key) {
                     result.push_back(escrow_id);
                     Self::extend_persistent_read(&env, &index_key);
@@ -3283,7 +3307,7 @@ impl CraftNexusContract {
             .extend_ttl(TTL_THRESHOLD, TTL_EXTENSION);
         env.storage()
             .instance()
-            .get(&DataKey::PlatformConfig)
+            .get(&DataKey::Config)
             .unwrap_or_else(|| env.panic_with_error(crate::Error::PlatformNotInitialized))
     }
 
@@ -3494,7 +3518,7 @@ impl CraftNexusContract {
     /// `migrate_fee_token_configs` admin call backfills `FeeTokenConfig` for
     /// pre-existing tokens.
     fn add_fee_token_to_index(env: &Env, token: &Address) {
-        let key = DataKey::FeeTokenIndex;
+        let key = DataKey::FeeIndex;
         let mut tracked_tokens: Vec<Address> = env
             .storage()
             .persistent()
@@ -3522,7 +3546,7 @@ impl CraftNexusContract {
     /// Idempotent â€” once a slot exists, subsequent calls leave it untouched
     /// so admin overrides survive future fee deposits (#239).
     fn ensure_fee_token_config(env: &Env, token: &Address) {
-        let cfg_key = DataKey::FeeTokenConfig(token.clone());
+        let cfg_key = DataKey::FeeConfig(token.clone());
         if !env.storage().persistent().has(&cfg_key) {
             let info = FeeTokenInfo {
                 active: true,
@@ -3541,7 +3565,7 @@ impl CraftNexusContract {
             return;
         }
         Self::ensure_fee_token_config(env, token);
-        let cfg_key = DataKey::FeeTokenConfig(token.clone());
+        let cfg_key = DataKey::FeeConfig(token.clone());
         let mut info: FeeTokenInfo =
             env.storage()
                 .persistent()
@@ -3561,7 +3585,7 @@ impl CraftNexusContract {
     pub fn get_fee_token_config(env: Env, token: Address) -> Option<FeeTokenInfo> {
         env.storage()
             .persistent()
-            .get(&DataKey::FeeTokenConfig(token))
+            .get(&DataKey::FeeConfig(token))
     }
 
     /// Returns every token that has ever received platform fees (#239).
@@ -3570,7 +3594,7 @@ impl CraftNexusContract {
     pub fn get_fee_tokens(env: Env) -> Vec<Address> {
         env.storage()
             .persistent()
-            .get(&DataKey::FeeTokenIndex)
+            .get(&DataKey::FeeIndex)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -3599,7 +3623,7 @@ impl CraftNexusContract {
             }
         }
 
-        let cfg_key = DataKey::FeeTokenConfig(token.clone());
+        let cfg_key = DataKey::FeeConfig(token.clone());
         let existing: FeeTokenInfo =
             env.storage()
                 .persistent()
@@ -3634,7 +3658,7 @@ impl CraftNexusContract {
         let tokens: Vec<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::FeeTokenIndex)
+            .get(&DataKey::FeeIndex)
             .unwrap_or_else(|| Vec::new(&env));
 
         let scanned_tokens = tokens.len();
@@ -3642,7 +3666,7 @@ impl CraftNexusContract {
         let mut skipped_existing: u32 = 0;
         for index in 0..tokens.len() {
             if let Some(token) = tokens.get(index) {
-                let cfg_key = DataKey::FeeTokenConfig(token.clone());
+                let cfg_key = DataKey::FeeConfig(token.clone());
                 if !env.storage().persistent().has(&cfg_key) {
                     let info = FeeTokenInfo {
                         active: true,
@@ -3703,9 +3727,9 @@ impl CraftNexusContract {
             return;
         }
 
-        let count_key = DataKey::FundAuditCount(actor.clone());
+        let count_key = DataKey::AuditCount(actor.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        let entry_key = DataKey::FundAuditIndexed(actor.clone(), count);
+        let entry_key = DataKey::AuditEntry(actor.clone(), count);
         let entry = FundMovementAuditEntry {
             actor: actor.clone(),
             amount,
@@ -3767,7 +3791,7 @@ impl CraftNexusContract {
     }
 
     fn get_all_tracked_total_fees(env: &Env) -> i128 {
-        let key = DataKey::FeeTokenIndex;
+        let key = DataKey::FeeIndex;
         let tracked_tokens: Vec<Address> = env
             .storage()
             .persistent()
@@ -4076,7 +4100,7 @@ impl CraftNexusContract {
         if let Some(cancelled_at) = env
             .storage()
             .persistent()
-            .get::<DataKey, u64>(&DataKey::LastUpgradeCancelledAt)
+            .get::<DataKey, u64>(&DataKey::UpgradeCancelAt)
         {
             let now = env.ledger().timestamp();
             if now < cancelled_at.saturating_add(CANCEL_REPROPOSE_COOLDOWN) {
@@ -4087,7 +4111,7 @@ impl CraftNexusContract {
         if env
             .storage()
             .persistent()
-            .has(&DataKey::WasmUpgradeProposal)
+            .has(&DataKey::UpgradeProposal)
         {
             return Err(Error::UpgradeProposalExists);
         }
@@ -4096,7 +4120,7 @@ impl CraftNexusContract {
         let signers: Vec<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::UpgradeSigners)
+            .get(&DataKey::UpgrSigners)
             .unwrap_or_else(|| {
                 let mut v = Vec::new(&env);
                 if let Ok(admin) = Self::get_admin(&env) {
@@ -4112,10 +4136,10 @@ impl CraftNexusContract {
         let threshold: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::UpgradeThreshold)
+            .get(&DataKey::UpgrThreshold)
             .unwrap_or(1u32);
 
-        let approvals_key = DataKey::UpgradeApprovals(new_wasm_hash.clone());
+        let approvals_key = DataKey::UpgrApprove(new_wasm_hash.clone());
         let mut approvals: Vec<Address> = env
             .storage()
             .persistent()
@@ -4160,8 +4184,8 @@ impl CraftNexusContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::WasmUpgradeProposal, &proposal);
-        Self::extend_persistent(&env, &DataKey::WasmUpgradeProposal);
+            .set(&DataKey::UpgradeProposal, &proposal);
+        Self::extend_persistent(&env, &DataKey::UpgradeProposal);
 
         Self::emit_upgrade_event(&env, UPGRADE_PROPOSED, new_wasm_hash, signer, upgrade_at);
 
@@ -4178,7 +4202,7 @@ impl CraftNexusContract {
         admin.require_auth();
         env.storage()
             .instance()
-            .set(&DataKey::UpgradeThreshold, &threshold);
+            .set(&DataKey::UpgrThreshold, &threshold);
         Ok(())
     }
 
@@ -4188,12 +4212,12 @@ impl CraftNexusContract {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
         if signers.is_empty() {
-            env.storage().persistent().remove(&DataKey::UpgradeSigners);
+            env.storage().persistent().remove(&DataKey::UpgrSigners);
         } else {
             env.storage()
                 .persistent()
-                .set(&DataKey::UpgradeSigners, &signers);
-            Self::extend_persistent(&env, &DataKey::UpgradeSigners);
+                .set(&DataKey::UpgrSigners, &signers);
+            Self::extend_persistent(&env, &DataKey::UpgrSigners);
         }
         Ok(())
     }
@@ -4202,7 +4226,7 @@ impl CraftNexusContract {
     pub fn get_upgrade_threshold(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::UpgradeThreshold)
+            .get(&DataKey::UpgrThreshold)
             .unwrap_or(1u32)
     }
 
@@ -4210,7 +4234,7 @@ impl CraftNexusContract {
     pub fn get_upgrade_approvals(env: Env, wasm_hash: BytesN<32>) -> Vec<Address> {
         env.storage()
             .persistent()
-            .get(&DataKey::UpgradeApprovals(wasm_hash))
+            .get(&DataKey::UpgrApprove(wasm_hash))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -4232,7 +4256,7 @@ impl CraftNexusContract {
         let proposal: WasmUpgradeProposal = env
             .storage()
             .persistent()
-            .get(&DataKey::WasmUpgradeProposal)
+            .get(&DataKey::UpgradeProposal)
             .ok_or(Error::NoUpgradeProposed)?;
 
         if proposal.wasm_hash != expected_wasm_hash {
@@ -4250,14 +4274,14 @@ impl CraftNexusContract {
         let current_version: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::ContractVersion)
+            .get(&DataKey::Version)
             .unwrap_or(0);
         let new_version = current_version + 1;
 
         env.storage()
             .persistent()
-            .set(&DataKey::ContractVersion, &new_version);
-        Self::extend_persistent(&env, &DataKey::ContractVersion);
+            .set(&DataKey::Version, &new_version);
+        Self::extend_persistent(&env, &DataKey::Version);
 
         Self::append_upgrade_history(
             &env,
@@ -4273,7 +4297,7 @@ impl CraftNexusContract {
         // Clear proposal
         env.storage()
             .persistent()
-            .remove(&DataKey::WasmUpgradeProposal);
+            .remove(&DataKey::UpgradeProposal);
 
         Self::emit_upgrade_event(
             &env,
@@ -4298,12 +4322,12 @@ impl CraftNexusContract {
         let proposal: WasmUpgradeProposal = env
             .storage()
             .persistent()
-            .get(&DataKey::WasmUpgradeProposal)
+            .get(&DataKey::UpgradeProposal)
             .ok_or(Error::NoUpgradeProposed)?;
 
         env.storage()
             .persistent()
-            .remove(&DataKey::WasmUpgradeProposal);
+            .remove(&DataKey::UpgradeProposal);
 
         // Issue #618: Record the cancellation timestamp so propose_upgrade_wasm
         // can enforce CANCEL_REPROPOSE_COOLDOWN against the cancel-and-repropose
@@ -4311,8 +4335,8 @@ impl CraftNexusContract {
         let cancelled_at = env.ledger().timestamp();
         env.storage()
             .persistent()
-            .set(&DataKey::LastUpgradeCancelledAt, &cancelled_at);
-        Self::extend_persistent(&env, &DataKey::LastUpgradeCancelledAt);
+            .set(&DataKey::UpgradeCancelAt, &cancelled_at);
+        Self::extend_persistent(&env, &DataKey::UpgradeCancelAt);
 
         Self::emit_upgrade_event(
             &env,
@@ -4331,7 +4355,7 @@ impl CraftNexusContract {
     pub fn get_upgrade_proposal(env: Env) -> Option<WasmUpgradeProposal> {
         env.storage()
             .persistent()
-            .get(&DataKey::WasmUpgradeProposal)
+            .get(&DataKey::UpgradeProposal)
     }
 
     /// Returns the current contract version.
@@ -4346,7 +4370,7 @@ impl CraftNexusContract {
     pub fn get_version(env: Env) -> u32 {
         env.storage()
             .persistent()
-            .get(&DataKey::ContractVersion)
+            .get(&DataKey::Version)
             .unwrap_or(0)
     }
 
@@ -4356,7 +4380,7 @@ impl CraftNexusContract {
         let mut history: Vec<UpgradeRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::UpgradeHistory)
+            .get(&DataKey::UpgrHist)
             .unwrap_or_else(|| Vec::new(env));
 
         history.push_back(record);
@@ -4366,8 +4390,8 @@ impl CraftNexusContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::UpgradeHistory, &history);
-        Self::extend_persistent(env, &DataKey::UpgradeHistory);
+            .set(&DataKey::UpgrHist, &history);
+        Self::extend_persistent(env, &DataKey::UpgrHist);
     }
 
     /// Returns the bounded log of past contract upgrades (#241).
@@ -4379,7 +4403,7 @@ impl CraftNexusContract {
     pub fn get_upgrade_history(env: Env) -> Vec<UpgradeRecord> {
         env.storage()
             .persistent()
-            .get(&DataKey::UpgradeHistory)
+            .get(&DataKey::UpgrHist)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -4505,12 +4529,12 @@ impl CraftNexusContract {
 
     /// Read the immutable fund-movement audit history for an account.
     pub fn get_fund_audit_history(env: Env, actor: Address) -> Vec<FundMovementAuditEntry> {
-        let count_key = DataKey::FundAuditCount(actor.clone());
+        let count_key = DataKey::AuditCount(actor.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
         let mut history = Vec::new(&env);
 
         for index in 0..count {
-            let entry_key = DataKey::FundAuditIndexed(actor.clone(), index);
+            let entry_key = DataKey::AuditEntry(actor.clone(), index);
             if let Some(entry) = env.storage().persistent().get::<DataKey, FundMovementAuditEntry>(&entry_key) {
                 history.push_back(entry);
             }
@@ -4521,7 +4545,7 @@ impl CraftNexusContract {
 
     /// Read the total number of fund-movement audit entries for an account.
     pub fn get_fund_audit_count(env: Env, actor: Address) -> u32 {
-        let count_key = DataKey::FundAuditCount(actor);
+        let count_key = DataKey::AuditCount(actor);
         env.storage().persistent().get(&count_key).unwrap_or(0)
     }
 
@@ -4537,7 +4561,7 @@ impl CraftNexusContract {
         start_index: u32,
         limit: u32,
     ) -> Vec<FundMovementAuditEntry> {
-        let count_key = DataKey::FundAuditCount(actor.clone());
+        let count_key = DataKey::AuditCount(actor.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
         let mut history = Vec::new(&env);
 
@@ -4547,7 +4571,7 @@ impl CraftNexusContract {
 
         let end_index = start_index.saturating_add(limit).min(count);
         for index in start_index..end_index {
-            let entry_key = DataKey::FundAuditIndexed(actor.clone(), index);
+            let entry_key = DataKey::AuditEntry(actor.clone(), index);
             if let Some(entry) = env.storage().persistent().get::<DataKey, FundMovementAuditEntry>(&entry_key) {
                 history.push_back(entry);
             }
@@ -4750,7 +4774,7 @@ impl CraftNexusContract {
         Self::update_active_obligations(&env, &escrow.seller, -1);
 
         // Clean up any orphaned partial refund proposal
-        let proposal_key = DataKey::PartialRefundProposal(order_id);
+        let proposal_key = DataKey::RefundProposal(order_id);
         env.storage().persistent().remove(&proposal_key);
 
         Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
@@ -4879,7 +4903,7 @@ impl CraftNexusContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &new_config);
+            .set(&DataKey::Config, &new_config);
         Self::emit_config_updated(
             &env,
             "platform_fee_bps",
@@ -4914,7 +4938,7 @@ impl CraftNexusContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &new_config);
+            .set(&DataKey::Config, &new_config);
         Self::emit_config_updated(
             &env,
             "platform_wallet",
@@ -4947,7 +4971,7 @@ impl CraftNexusContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
 
         Self::emit_config_updated(
             &env,
@@ -4976,7 +5000,7 @@ impl CraftNexusContract {
         config.moderator = Some(moderator.clone());
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
         Self::emit_config_updated(&env, "moderator", previous, ConfigValue::Address(moderator));
     }
 
@@ -4989,7 +5013,7 @@ impl CraftNexusContract {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 
-        let key = DataKey::MinEscrowAmount(token.clone());
+        let key = DataKey::MinAmount(token.clone());
         let old_amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
 
         env.storage().persistent().set(&key, &min_amount);
@@ -5281,14 +5305,14 @@ impl CraftNexusContract {
                 let seller_key = params.seller.clone();
 
                 if !buyer_count_state.contains_key(buyer_key.clone()) {
-                    let count_key = DataKey::BuyerEscrowCount(buyer_key.clone());
+                    let count_key = DataKey::BuyerCount(buyer_key.clone());
                     let existing_count: u32 =
                         env.storage().persistent().get(&count_key).unwrap_or(0u32);
                     buyer_count_state.set(buyer_key.clone(), existing_count);
                 }
 
                 if !seller_count_state.contains_key(seller_key.clone()) {
-                    let count_key = DataKey::SellerEscrowCount(seller_key.clone());
+                    let count_key = DataKey::SellerCount(seller_key.clone());
                     let existing_count: u32 =
                         env.storage().persistent().get(&count_key).unwrap_or(0u32);
                     seller_count_state.set(seller_key.clone(), existing_count);
@@ -5317,7 +5341,7 @@ impl CraftNexusContract {
 
                         // Store escrow ID at indexed position
                         let buyer_index_key =
-                            DataKey::BuyerEscrowIndexed(buyer_key.clone(), buyer_count);
+                            DataKey::BuyerEscrow(buyer_key.clone(), buyer_count);
                         env.storage().persistent().set(&buyer_index_key, &id);
                         Self::extend_persistent(&env, &buyer_index_key);
 
@@ -5333,7 +5357,7 @@ impl CraftNexusContract {
 
                         // Store escrow ID at indexed position
                         let seller_index_key =
-                            DataKey::SellerEscrowIndexed(seller_key.clone(), seller_count);
+                            DataKey::SellerEscrow(seller_key.clone(), seller_count);
                         env.storage().persistent().set(&seller_index_key, &id);
                         Self::extend_persistent(&env, &seller_index_key);
 
@@ -5373,7 +5397,7 @@ impl CraftNexusContract {
             }
             if let Some(buyer_addr) = buyer_next_counts.keys().get(i) {
                 if let Some(final_count) = buyer_next_counts.get(buyer_addr.clone()) {
-                    let count_key = DataKey::BuyerEscrowCount(buyer_addr.clone());
+                    let count_key = DataKey::BuyerCount(buyer_addr.clone());
                     env.storage().persistent().set(&count_key, &final_count);
                     Self::extend_persistent(&env, &count_key);
                 }
@@ -5388,7 +5412,7 @@ impl CraftNexusContract {
             }
             if let Some(seller_addr) = seller_next_counts.keys().get(i) {
                 if let Some(final_count) = seller_next_counts.get(seller_addr.clone()) {
-                    let count_key = DataKey::SellerEscrowCount(seller_addr.clone());
+                    let count_key = DataKey::SellerCount(seller_addr.clone());
                     env.storage().persistent().set(&count_key, &final_count);
                     Self::extend_persistent(&env, &count_key);
                 }
@@ -5526,7 +5550,7 @@ impl CraftNexusContract {
         if let Some(config) = env
             .storage()
             .instance()
-            .get::<DataKey, PlatformConfig>(&DataKey::PlatformConfig)
+            .get::<DataKey, PlatformConfig>(&DataKey::Config)
         {
             if config.is_paused {
                 env.panic_with_error(crate::Error::ContractPaused);
@@ -5544,7 +5568,7 @@ impl CraftNexusContract {
         config.is_paused = paused;
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
 
         if paused {
             Self::emit_platform_paused(&env, admin);
@@ -5573,15 +5597,15 @@ impl CraftNexusContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::ArtisanFeeTier(artisan.clone()), &fee_bps);
-        Self::extend_persistent(&env, &DataKey::ArtisanFeeTier(artisan.clone()));
+            .set(&DataKey::FeeTier(artisan.clone()), &fee_bps);
+        Self::extend_persistent(&env, &DataKey::FeeTier(artisan.clone()));
         Self::emit_artisan_fee_tier_updated(&env, artisan, fee_bps);
     }
 
     /// Get the effective fee basis points for a seller.
     /// Returns artisan-specific tier if set, otherwise platform default.
     pub fn get_effective_fee_bps(env: Env, seller: Address) -> u32 {
-        let key = DataKey::ArtisanFeeTier(seller);
+        let key = DataKey::FeeTier(seller);
         if let Some(fee) = env.storage().persistent().get::<DataKey, u32>(&key) {
             Self::extend_persistent(&env, &key);
             fee
@@ -5711,7 +5735,7 @@ impl CraftNexusContract {
         Self::update_total_staked(&env, &token, amount);
 
         // Accumulate stake in a single record with token metadata.
-        let stake_key = DataKey::ArtisanStake(artisan.clone());
+        let stake_key = DataKey::StakeAmt(artisan.clone());
         let current_stake: Option<ArtisanStakeData> = env.storage().persistent().get(&stake_key);
         let new_stake = if let Some(existing_stake) = current_stake {
             if existing_stake.token != token {
@@ -5735,14 +5759,14 @@ impl CraftNexusContract {
         }
 
         // Check queue capacity and current cooldown state (#237)
-        let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
+        let count_key = DataKey::StakeDepositCount(artisan.clone());
         let current_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
         // Initialize cooldown only if artisan doesn't already have one.
         // This prevents cooldown reset gaming where artisans extend their cooldown by continuously staking.
         let existing_cooldown = if current_count > 0 {
             let last_deposit_key =
-                DataKey::ArtisanStakeQueueIndexed(artisan.clone(), current_count - 1);
+                DataKey::StakeDeposit(artisan.clone(), current_count - 1);
             let deposit: StakeDeposit = env.storage().persistent().get(&last_deposit_key).unwrap();
             deposit.cooldown_end
         } else {
@@ -5758,7 +5782,7 @@ impl CraftNexusContract {
         };
 
         // Check queue capacity and prune if necessary
-        let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
+        let count_key = DataKey::StakeDepositCount(artisan.clone());
         let current_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
         if current_count >= STAKE_QUEUE_PRUNE_THRESHOLD {
@@ -5772,9 +5796,9 @@ impl CraftNexusContract {
     /// Add a stake deposit to the bounded indexed queue.
     ///
     /// Implements individual key-value storage for scalability. Each deposit is stored
-    /// as DataKey::ArtisanStakeQueueIndexed(artisan, index) -> StakeDeposit.
+    /// as DataKey::StakeDeposit(artisan, index) -> StakeDeposit.
     fn add_stake_deposit(env: &Env, artisan: &Address, amount: i128, cooldown_end: u64) {
-        let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
+        let count_key = DataKey::StakeDepositCount(artisan.clone());
         let current_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
         if current_count >= MAX_STAKE_QUEUE_SIZE {
@@ -5782,7 +5806,7 @@ impl CraftNexusContract {
         }
 
         // Add new deposit at the end of the queue
-        let deposit_key = DataKey::ArtisanStakeQueueIndexed(artisan.clone(), current_count);
+        let deposit_key = DataKey::StakeDeposit(artisan.clone(), current_count);
         let deposit = StakeDeposit {
             amount,
             cooldown_end,
@@ -5803,7 +5827,7 @@ impl CraftNexusContract {
     /// by shifting remaining deposits to fill gaps. This maintains queue ordering
     /// while keeping storage bounded.
     fn prune_matured_stake_deposits(env: &Env, artisan: &Address) {
-        let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
+        let count_key = DataKey::StakeDepositCount(artisan.clone());
         let current_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
         if current_count == 0 {
@@ -5815,7 +5839,7 @@ impl CraftNexusContract {
 
         // Compact queue by moving non-matured deposits to fill gaps
         for read_index in 0..current_count {
-            let deposit_key = DataKey::ArtisanStakeQueueIndexed(artisan.clone(), read_index);
+            let deposit_key = DataKey::StakeDeposit(artisan.clone(), read_index);
 
             if let Some(deposit) = env
                 .storage()
@@ -5827,7 +5851,7 @@ impl CraftNexusContract {
                     if write_index != read_index {
                         // Move deposit to new position
                         let new_key =
-                            DataKey::ArtisanStakeQueueIndexed(artisan.clone(), write_index);
+                            DataKey::StakeDeposit(artisan.clone(), write_index);
                         env.storage().persistent().set(&new_key, &deposit);
                         Self::extend_persistent(env, &new_key);
                     }
@@ -5861,7 +5885,7 @@ impl CraftNexusContract {
 
         // Validate the requested token matches the token recorded at stake time.
         // Rejects attempts to withdraw in a cheaper/different asset (#421).
-        let stake_key = DataKey::ArtisanStake(artisan.clone());
+        let stake_key = DataKey::StakeAmt(artisan.clone());
         let current_stake: ArtisanStakeData = env
             .storage()
             .persistent()
@@ -5872,7 +5896,7 @@ impl CraftNexusContract {
         }
 
         // Use bounded indexed queue: only matured deposits can be unstaked.
-        let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
+        let count_key = DataKey::StakeDepositCount(artisan.clone());
         let current_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
         let now = env.ledger().timestamp();
@@ -5881,7 +5905,7 @@ impl CraftNexusContract {
 
         // Process all deposits, collecting matured amounts and compacting the queue
         for read_index in 0..current_count {
-            let deposit_key = DataKey::ArtisanStakeQueueIndexed(artisan.clone(), read_index);
+            let deposit_key = DataKey::StakeDeposit(artisan.clone(), read_index);
 
             if let Some(deposit) = env
                 .storage()
@@ -5898,7 +5922,7 @@ impl CraftNexusContract {
                     if write_index != read_index {
                         // Move deposit to new position to compact the queue
                         let new_key =
-                            DataKey::ArtisanStakeQueueIndexed(artisan.clone(), write_index);
+                            DataKey::StakeDeposit(artisan.clone(), write_index);
                         env.storage().persistent().set(&new_key, &deposit);
                         Self::extend_persistent(&env, &new_key);
                         // Remove old position
@@ -5967,7 +5991,7 @@ impl CraftNexusContract {
     pub fn get_stake(env: Env, artisan: Address) -> i128 {
         env.storage()
             .persistent()
-            .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
+            .get::<DataKey, ArtisanStakeData>(&DataKey::StakeAmt(artisan))
             .map(|stake: ArtisanStakeData| stake.amount)
             .unwrap_or(0)
     }
@@ -5981,7 +6005,7 @@ impl CraftNexusContract {
         config.min_stake_required = min_stake;
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
         Ok(())
     }
 
@@ -5995,7 +6019,7 @@ impl CraftNexusContract {
         config.wasm_upgrade_cooldown = cooldown_seconds;
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
 
         Self::emit_config_updated(
             &env,
@@ -6016,7 +6040,7 @@ impl CraftNexusContract {
         config.max_dispute_duration = duration_seconds;
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
 
         Self::emit_config_updated(
             &env,
@@ -6037,7 +6061,7 @@ impl CraftNexusContract {
         config.stake_cooldown = cooldown_seconds;
         env.storage()
             .instance()
-            .set(&DataKey::PlatformConfig, &config);
+            .set(&DataKey::Config, &config);
 
         Self::emit_config_updated(
             &env,
@@ -6090,7 +6114,7 @@ impl CraftNexusContract {
             return Err(Error::InvalidRefundAmount);
         }
 
-        let proposal_key = DataKey::PartialRefundProposal(order_id);
+        let proposal_key = DataKey::RefundProposal(order_id);
         if env.storage().persistent().has(&proposal_key) {
             return Err(Error::ProposalAlreadyExists);
         }
@@ -6141,16 +6165,16 @@ impl CraftNexusContract {
     /// To enumerate storage keys directly via the RPC without calling this function,
     /// use the `getLedgerEntries` method or the experimental `getContractData` cursor
     /// endpoint.  Relevant key patterns:
-    /// - `DataKey::GlobalEscrowIdIndexed(index)` â€“ indexed global escrow ID (#515)
+    /// - `DataKey::EscrowIndex(index)` â€“ indexed global escrow ID (#515)
     /// - `DataKey::EscrowCount`            â€“ u32 total count
     /// - `DataKey::AllEscrowIds`           â€“ DEPRECATED legacy Vec index
     /// - `(ESCROW, order_id: u32)`         â€“ individual escrow struct
     /// - `DataKey::BuyerEscrows(address)`  â€“ DEPRECATED: Legacy Vec<u64> of IDs for a buyer
     /// - `DataKey::SellerEscrows(address)` â€“ DEPRECATED: Legacy Vec<u64> of IDs for a seller
-    /// - `DataKey::BuyerEscrowIndexed(address, index)` â€“ Indexed storage: u64 escrow ID at position
-    /// - `DataKey::BuyerEscrowCount(address)` â€“ u32 total count of buyer's escrows
-    /// - `DataKey::SellerEscrowIndexed(address, index)` â€“ Indexed storage: u64 escrow ID at position
-    /// - `DataKey::SellerEscrowCount(address)` â€“ u32 total count of seller's escrows
+    /// - `DataKey::BuyerEscrow(address, index)` â€“ Indexed storage: u64 escrow ID at position
+    /// - `DataKey::BuyerCount(address)` â€“ u32 total count of buyer's escrows
+    /// - `DataKey::SellerEscrow(address, index)` â€“ Indexed storage: u64 escrow ID at position
+    /// - `DataKey::SellerCount(address)` â€“ u32 total count of seller's escrows
     ///
     /// # Arguments
     /// * `page`  â€“ Zero-indexed page number
@@ -6177,7 +6201,7 @@ impl CraftNexusContract {
         let mut result = soroban_sdk::Vec::new(&env);
 
         for index in start..end {
-            let index_key = DataKey::GlobalEscrowIdIndexed(index);
+            let index_key = DataKey::EscrowIndex(index);
             if let Some(id) = env.storage().persistent().get(&index_key) {
                 result.push_back(id);
                 Self::extend_persistent(&env, &index_key);
@@ -6204,7 +6228,7 @@ impl CraftNexusContract {
             return Err(Error::InvalidEscrowState);
         }
 
-        let proposal_key = DataKey::PartialRefundProposal(order_id);
+        let proposal_key = DataKey::RefundProposal(order_id);
         let proposal_opt: Option<PartialRefundProposal> =
             env.storage().persistent().get(&proposal_key);
         if proposal_opt.is_none() {
@@ -6305,7 +6329,7 @@ impl CraftNexusContract {
             return Err(Error::InvalidEscrowState);
         }
 
-        let proposal_key = DataKey::PartialRefundProposal(order_id);
+        let proposal_key = DataKey::RefundProposal(order_id);
         let proposal_opt: Option<PartialRefundProposal> =
             env.storage().persistent().get(&proposal_key);
         if proposal_opt.is_none() {
@@ -6380,7 +6404,7 @@ impl CraftNexusContract {
         let id: u64 = env
             .storage()
             .persistent()
-            .get(&DataKey::NextRecurringEscrowId)
+            .get(&DataKey::NextRecurId)
             .unwrap_or(1);
         if id > MAX_RECURRING_ESCROW_ID {
             return Err(crate::Error::RecurringEscrowIdExhausted);
@@ -6390,8 +6414,8 @@ impl CraftNexusContract {
             .ok_or(crate::Error::RecurringEscrowIdExhausted)?;
         env.storage()
             .persistent()
-            .set(&DataKey::NextRecurringEscrowId, &next_id);
-        Self::extend_persistent(&env, &DataKey::NextRecurringEscrowId);
+            .set(&DataKey::NextRecurId, &next_id);
+        Self::extend_persistent(&env, &DataKey::NextRecurId);
 
         let now = env.ledger().timestamp();
 
@@ -6411,8 +6435,8 @@ impl CraftNexusContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::RecurringEscrow(id), &escrow);
-        Self::extend_persistent(&env, &DataKey::RecurringEscrow(id));
+            .set(&DataKey::RecurEscrow(id), &escrow);
+        Self::extend_persistent(&env, &DataKey::RecurEscrow(id));
 
         // Track active recurring escrows
         Self::update_active_obligations(&env, &buyer, 1);
@@ -6446,7 +6470,7 @@ impl CraftNexusContract {
     /// Release funds for the next cycle in a recurring escrow.
     pub fn release_next_cycle(env: Env, id: u64) {
         let _guard = ReentryGuardScope::new(&env);
-        let key = DataKey::RecurringEscrow(id);
+        let key = DataKey::RecurEscrow(id);
         let mut escrow: RecurringEscrow = env
             .storage()
             .persistent()
@@ -6554,7 +6578,7 @@ impl CraftNexusContract {
     /// Cancel a recurring escrow and refund remaining funds to the buyer.
     pub fn cancel_recurring_escrow(env: Env, id: u64) {
         let _guard = ReentryGuardScope::new(&env);
-        let key = DataKey::RecurringEscrow(id);
+        let key = DataKey::RecurEscrow(id);
         let mut escrow: RecurringEscrow = env
             .storage()
             .persistent()
@@ -6606,7 +6630,7 @@ impl CraftNexusContract {
     pub fn get_recurring_escrow(env: Env, id: u64) -> RecurringEscrow {
         env.storage()
             .persistent()
-            .get(&DataKey::RecurringEscrow(id))
+            .get(&DataKey::RecurEscrow(id))
             .expect("")
     }
 
