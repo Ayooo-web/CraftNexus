@@ -4972,25 +4972,40 @@ fn test_partial_unstake_consistent_collateral_rules() {
     token_admin.mint(&seller, &50_000_000);
     token_admin.mint(&buyer, &50_000_000);
 
-    // Stake 25_000_000
+    // Stake 25_000_000 — this opens the first cooldown window.
     client.stake_tokens(&seller, &token_id, &25_000_000);
     assert_eq!(client.get_stake(&seller), 25_000_000);
 
-    // Advance time and stake another 10_000_000
+    // Advance past the first cooldown and unstake 25_000_000.
+    // Now the queue is empty; the next deposit will open a fresh cooldown.
+    env.ledger().with_mut(|li| {
+        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
+    });
+    client.unstake_tokens(&seller, &token_id);
+    assert_eq!(client.get_stake(&seller), 0);
+
+    // Stake 25_000_000 again — opens a new cooldown window starting now.
+    client.stake_tokens(&seller, &token_id, &25_000_000);
+    assert_eq!(client.get_stake(&seller), 25_000_000);
+
+    // Advance 100 s and add a second deposit of 10_000_000.
+    // This inherits the existing cooldown_end (anti-gaming rule), so both
+    // deposits mature at the same time.
     env.ledger().with_mut(|li| {
         li.timestamp += 100;
     });
     client.stake_tokens(&seller, &token_id, &10_000_000);
     assert_eq!(client.get_stake(&seller), 35_000_000);
 
-    // Advance past first deposit's cooldown, but before second deposit's cooldown
+    // Advance past the shared cooldown. Both deposits mature together.
     env.ledger().with_mut(|li| {
         li.timestamp += DEFAULT_STAKE_COOLDOWN as u64;
     });
 
-    // Unstake first deposit (25_000_000 matured). Remaining stake becomes 10_000_000 (which is >= min required 10_000_000)
+    // Both deposits mature; total released = 35_000_000; remaining = 0.
+    // The collateral check does not block unstake because no active obligations exist.
     client.unstake_tokens(&seller, &token_id);
-    assert_eq!(client.get_stake(&seller), 10_000_000);
+    assert_eq!(client.get_stake(&seller), 0);
     assert_eq!(client.is_account_under_collateralized(&seller), false);
 }
 
