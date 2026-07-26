@@ -1140,9 +1140,10 @@ fn test_recover_admin_timelock_returns_standard_error() {
     });
 
     let recovered_admin = Address::generate(&env);
-    let initial_result = client.try_recover_admin_access(&recovered_admin);
-    assert_admin_recovery_failed(initial_result);
+    // Initiation must succeed (Ok) so the timelock persists under Soroban semantics.
+    client.recover_admin_access(&recovered_admin);
 
+    // Second call before the delay elapses remains blocked.
     let locked_result = client.try_recover_admin_access(&recovered_admin);
     assert_admin_recovery_failed(locked_result);
 }
@@ -3311,34 +3312,40 @@ fn test_set_paused_emits_platform_status_events() {
     client.set_paused(&true);
 
     let events = env.events().all();
-    let last_event = events.last().unwrap();
-    assert_eq!(
-        last_event.1,
-        vec![
-            &env,
-            Symbol::new(&env, "admin_platform_paused").into_val(&env),
-            admin.clone().into_val(&env),
-        ]
-    );
-
-    let paused_event: PlatformPausedEvent = last_event.2.try_into_val(&env).unwrap();
+    let paused_topics = vec![
+        &env,
+        Symbol::new(&env, "admin_platform_paused").into_val(&env),
+        admin.clone().into_val(&env),
+    ];
+    let paused_event_entry = events
+        .iter()
+        .rev()
+        .find(|e| e.1 == paused_topics)
+        .expect("platform_paused event missing");
+    let paused_event: PlatformPausedEvent = paused_event_entry.2.try_into_val(&env).unwrap();
     assert_eq!(paused_event.initiator, admin.clone());
     assert_eq!(paused_event.timestamp, 1711368000);
+
+    // Emergency framework also records a deterministic pause audit entry.
+    let op = client.get_emergency_operation().unwrap();
+    assert_eq!(op.kind, EmergencyOpKind::Pause);
+    assert_eq!(op.phase, EmergencyOpPhase::Completed);
+    assert!(op.success);
 
     client.set_paused(&false);
 
     let events = env.events().all();
-    let last_event = events.last().unwrap();
-    assert_eq!(
-        last_event.1,
-        vec![
-            &env,
-            Symbol::new(&env, "admin_platform_unpaused").into_val(&env),
-            admin.clone().into_val(&env),
-        ]
-    );
-
-    let unpaused_event: PlatformUnpausedEvent = last_event.2.try_into_val(&env).unwrap();
+    let unpaused_topics = vec![
+        &env,
+        Symbol::new(&env, "admin_platform_unpaused").into_val(&env),
+        admin.clone().into_val(&env),
+    ];
+    let unpaused_event_entry = events
+        .iter()
+        .rev()
+        .find(|e| e.1 == unpaused_topics)
+        .expect("platform_unpaused event missing");
+    let unpaused_event: PlatformUnpausedEvent = unpaused_event_entry.2.try_into_val(&env).unwrap();
     assert_eq!(unpaused_event.initiator, admin);
     assert_eq!(unpaused_event.timestamp, 1711368000);
 }
@@ -4521,7 +4528,10 @@ fn test_fund_audit_escrow_release_and_refund() {
     let buyer_count = client.get_fund_audit_count(&buyer);
     assert_eq!(buyer_count, 1);
     let buyer_history = client.get_fund_audit_history(&buyer);
-    assert_eq!(buyer_history.get(0).unwrap().reason, Symbol::new(&env, "escrow_funded"));
+    assert_eq!(
+        buyer_history.get(0).unwrap().reason,
+        Symbol::new(&env, "escrow_funded")
+    );
 
     // Check seller history: release entry
     let seller_count = client.get_fund_audit_count(&seller);
@@ -4591,7 +4601,10 @@ fn test_fund_audit_recurring_escrow_flow() {
     let rec = client.create_recurring_escrow(&buyer, &seller, &token_id, &10_000_000, &100, &2);
     assert_eq!(client.get_fund_audit_count(&buyer), 1);
     let buyer_hist = client.get_fund_audit_history(&buyer);
-    assert_eq!(buyer_hist.get(0).unwrap().reason, Symbol::new(&env, "recurring_escrow_locked"));
+    assert_eq!(
+        buyer_hist.get(0).unwrap().reason,
+        Symbol::new(&env, "recurring_escrow_locked")
+    );
 
     // Fast forward timestamp past cycle frequency
     env.ledger().with_mut(|li| {
@@ -4602,15 +4615,20 @@ fn test_fund_audit_recurring_escrow_flow() {
     client.release_next_cycle(&rec.id);
     assert_eq!(client.get_fund_audit_count(&seller), 1);
     let seller_hist = client.get_fund_audit_history(&seller);
-    assert_eq!(seller_hist.get(0).unwrap().reason, Symbol::new(&env, "recurring_release"));
+    assert_eq!(
+        seller_hist.get(0).unwrap().reason,
+        Symbol::new(&env, "recurring_release")
+    );
 
     // Cancel remaining
     client.cancel_recurring_escrow(&rec.id);
     assert_eq!(client.get_fund_audit_count(&buyer), 2);
     let buyer_cancel_hist = client.get_fund_audit_history(&buyer);
-    assert_eq!(buyer_cancel_hist.get(1).unwrap().reason, Symbol::new(&env, "recurring_cancel_refund"));
+    assert_eq!(
+        buyer_cancel_hist.get(1).unwrap().reason,
+        Symbol::new(&env, "recurring_cancel_refund")
+    );
 }
-
 
 #[test]
 fn test_fund_audit_pagination_and_immutability() {
@@ -4648,4 +4666,3 @@ fn test_fund_audit_pagination_and_immutability() {
     let page_oob = client.get_fund_audit_history_paginated(&buyer, &10, &2);
     assert_eq!(page_oob.len(), 0);
 }
-

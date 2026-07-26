@@ -11,6 +11,8 @@ use soroban_sdk::{
 extern crate alloc;
 
 #[cfg(test)]
+mod emergency_ops_test;
+#[cfg(test)]
 mod enhanced_features_test;
 #[cfg(test)]
 mod event_snapshot_test;
@@ -39,7 +41,7 @@ pub mod onboarding;
 /// | 10â€“19   | State       | Invalid state transitions or preconditions      | Retry after state change  |
 /// | 20â€“29   | Config      | Operator-configurable limits or misconfig       | Operator must act         |
 /// | 30â€“39   | Operational | System or cooldown gates                        | Retry after cooldown      |
-/// | 40â€“42   | Validation  | Input validation failures                       | Fix caller input          |
+/// | 40â€“49   | Validation / Emergency | Input validation or emergency-op gates    | Fix input or clear conflicts |
 ///
 /// Use [`is_retryable`] to determine whether an error may succeed on retry.
 #[contracterror]
@@ -140,6 +142,16 @@ pub enum Error {
     AlreadyApproved = 43,
     /// Token decimal places are outside the supported range (0–18)
     InvalidTokenDecimals = 44,
+    /// Another emergency operation is already in progress
+    EmergencyOpInProgress = 45,
+    /// Active disputes, pending upgrade, or active recurring escrows block this emergency action
+    EmergencyConflictActive = 46,
+    /// Contract token balance is below TotalLocked + TotalStaked (accounting drift)
+    EmergencyAccountingInvariant = 47,
+    /// Current emergency operation cannot be resumed from its present phase
+    EmergencyOpNotResumable = 48,
+    /// Emergency operation is in an unexpected phase for the requested action
+    EmergencyOpInvalidPhase = 49,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -162,6 +174,11 @@ pub fn is_retryable(error: Error) -> bool {
             | Error::UpgradeCooldownActive
             | Error::CycleNotReady
             | Error::BatchLimitExceeded
+            | Error::EmergencyOpInProgress
+            | Error::EmergencyConflictActive
+            | Error::EmergencyOpNotResumable
+            | Error::EmergencyOpInvalidPhase
+            | Error::AdminRecoveryFailed
     )
 }
 
@@ -213,6 +230,18 @@ const BASE58_BTC_CHARSET: [bool; 256] = {
 };
 const TOTAL_FEES: Symbol = symbol_short!("TOT_FEES");
 const ADMIN: Symbol = symbol_short!("ADMIN");
+/// Current emergency operation state (Symbol key — avoids DataKey variant bloat).
+const EMERGENCY_OP: Symbol = symbol_short!("EMER_OP");
+/// Emergency audit history entry count.
+const EMERGENCY_HIST_CNT: Symbol = symbol_short!("EM_HCNT");
+/// Prefix for indexed emergency history entries: `(EMERGENCY_HIST, index)`.
+const EMERGENCY_HIST: Symbol = symbol_short!("EM_HIST");
+/// Next emergency operation ID.
+const EMERGENCY_NEXT_ID: Symbol = symbol_short!("EM_NXT");
+/// Global active dispute count.
+const ACTIVE_DISPUTES: Symbol = symbol_short!("ACT_DSP");
+/// Global active recurring-escrow count.
+const ACTIVE_RECURRING: Symbol = symbol_short!("ACT_REC");
 
 /// Standard TTL threshold for persistent storage (approx 14 hours at 5s ledger)
 const TTL_THRESHOLD: u32 = 10_000;
@@ -283,6 +312,8 @@ const ADMIN_RECOVERY_DELAY: u64 = 7 * 24 * 60 * 60;
 /// Minimum allowed admin recovery cooldown. Deploys attempting to set a
 /// shorter window (including zero) will be rejected during recovery.
 const MIN_ADMIN_RECOVERY_COOLDOWN: u64 = 7 * 24 * 60 * 60;
+/// Maximum emergency-operation audit records retained (FIFO once full).
+const MAX_EMERGENCY_HISTORY: u32 = 32;
 
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
@@ -833,6 +864,62 @@ pub struct PlatformPausedEvent {
 pub struct PlatformUnpausedEvent {
     pub initiator: Address,
     pub timestamp: u64,
+}
+
+/// Kind of serialized emergency / fund-safety operation.
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+#[repr(u32)]
+pub enum EmergencyOpKind {
+    Idle = 0,
+    Pause = 1,
+    Unpause = 2,
+    AdminRecovery = 3,
+    Sweep = 4,
+    UpgradeCancel = 5,
+    UpgradeExecute = 6,
+    UpgradePropose = 7,
+}
+
+/// Phase of the current emergency operation state machine.
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+#[repr(u32)]
+pub enum EmergencyOpPhase {
+    Idle = 0,
+    Locked = 1,
+    Executing = 2,
+    Completed = 3,
+    Failed = 4,
+}
+
+/// On-chain record of an emergency operation for serialization and audit.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct EmergencyOpState {
+    pub op_id: u64,
+    pub kind: EmergencyOpKind,
+    pub phase: EmergencyOpPhase,
+    pub initiator: Address,
+    pub started_at: u64,
+    pub updated_at: u64,
+    pub success: bool,
+    pub status: Symbol,
+    pub amount: i128,
+}
+
+/// Token fund allocation view used by sweep safety checks.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct FundAllocation {
+    pub balance: i128,
+    pub total_locked: i128,
+    pub total_staked: i128,
+    pub unallocated: i128,
 }
 
 #[contracttype]
@@ -2579,8 +2666,15 @@ impl CraftNexusContract {
     }
 
     /// Recover admin access using fallback admin after time lock period (#240)
-    /// This provides a recovery mechanism if the primary admin is corrupted or inaccessible
-    /// Requires a 7-day time lock after recovery is initiated to prevent abuse
+    ///
+    /// Serialized through the emergency-operations framework: blocked while
+    /// disputes, pending upgrades, or active recurring escrows are present.
+    /// Auto-pauses the platform for fund safety.
+    ///
+    /// **Soroban note:** the initiation call returns `Ok(())` after recording the
+    /// timelock (returning `Err` would roll back the timelock). A subsequent call
+    /// before the delay elapses returns [`Error::AdminRecoveryFailed`]. Partial
+    /// progress can be aborted via [`Self::abort_emergency_operation`].
     pub fn recover_admin_access(env: Env, recovered_admin: Address) -> Result<(), Error> {
         // Check if fallback admin exists and is authorized
         let fallback = match env
@@ -2599,7 +2693,15 @@ impl CraftNexusContract {
             return Err(Error::AdminRecoveryFailed);
         }
 
-        // Check if recovery time lock has passed (#431 â€” TTL-friendly read)
+        // Dependency checks MUST run before any writes — an Err return reverts state.
+        Self::assert_emergency_dependencies_clear(&env)?;
+
+        let state =
+            Self::begin_or_resume_emergency_op(&env, EmergencyOpKind::AdminRecovery, &fallback)?;
+
+        Self::ensure_paused_for_emergency(&env, &fallback);
+
+        // Check if recovery time lock has passed (#431 — TTL-friendly read)
         let recovery_time = Self::get_persistent_u64(&env, &DataKey::AdminRecoveryTime);
 
         let current_time = env.ledger().timestamp();
@@ -2627,10 +2729,14 @@ impl CraftNexusContract {
                 (Symbol::new(&env, "admin_recovery_initiated"), true),
                 String::from_str(&env, "7-day time lock initiated for admin recovery"),
             );
-            return Err(Error::AdminRecoveryFailed); // Recovery not ready yet
+
+            Self::park_emergency_op(&env, state, "timelock", 0);
+            // Must return Ok so the timelock + emergency lock persist.
+            return Ok(());
         }
 
-        // Check if time lock period has elapsed
+        // Check if time lock period has elapsed. Err is safe here: no new
+        // durable writes are required beyond the already-committed park.
         if current_time < recovery_time {
             return Err(Error::AdminRecoveryFailed);
         }
@@ -2649,27 +2755,24 @@ impl CraftNexusContract {
 
         config.admin = recovered_admin.clone();
         config.pending_admin = None;
-        // Write config to instance storage (primary location) â€” TTL already extended
-        // by get_platform_config_internal. No redundant extend_persistent needed.
+        // Keep paused after recovery; operator must explicitly unpause.
+        config.is_paused = true;
         env.storage()
             .instance()
             .set(&DataKey::PlatformConfig, &config);
 
-        // Sync to persistent backup key for recovery consistency (no TTL extension needed
-        // since this is a one-time sync, not a read-heavy path).
         env.storage().persistent().set(&PLATFORM_FEE, &config);
 
-        // Clear the recovery time lock for next cycle
         env.storage()
             .persistent()
             .remove(&DataKey::AdminRecoveryTime);
-        // Clear the recorded delay as well
         env.storage()
             .persistent()
             .remove(&DataKey::AdminRecoveryDelay);
 
-        // Emit audit event
         Self::emit_admin_changed(&env, previous_admin, recovered_admin, "admin_recovered");
+
+        Self::finalize_emergency_op(&env, state, true, "recovered", 0);
 
         Ok(())
     }
@@ -2840,7 +2943,16 @@ impl CraftNexusContract {
 
         // Transfer funds from buyer to contract and record audit
         let client = token::Client::new(&env, &token);
-        Self::transfer_tokens_and_record_audit(&env, &token, &buyer, &env.current_contract_address(), amount, &buyer, Symbol::new(&env, "escrow_funded"), -amount);
+        Self::transfer_tokens_and_record_audit(
+            &env,
+            &token,
+            &buyer,
+            &env.current_contract_address(),
+            amount,
+            &buyer,
+            Symbol::new(&env, "escrow_funded"),
+            -amount,
+        );
 
         // Track locked funds (#212)
         Self::update_total_locked(&env, &token, amount);
@@ -2875,6 +2987,7 @@ impl CraftNexusContract {
         metadata_hash: Option<Bytes>,
     ) -> Escrow {
         let _guard = ReentryGuardScope::new(&env);
+        Self::check_not_paused(&env);
 
         // Validate release window bounds
         let config = Self::get_platform_config_internal(&env);
@@ -2988,7 +3101,16 @@ impl CraftNexusContract {
         escrow.buyer.require_auth();
 
         let client = token::Client::new(&env, &escrow.token);
-        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &escrow.buyer, &env.current_contract_address(), escrow.amount, &escrow.buyer, Symbol::new(&env, "escrow_funded"), -escrow.amount);
+        Self::transfer_tokens_and_record_audit(
+            &env,
+            &escrow.token,
+            &escrow.buyer,
+            &env.current_contract_address(),
+            escrow.amount,
+            &escrow.buyer,
+            Symbol::new(&env, "escrow_funded"),
+            -escrow.amount,
+        );
 
         escrow.funded = true;
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
@@ -3813,6 +3935,7 @@ impl CraftNexusContract {
     /// * `order_id` - Order identifier
     pub fn release_funds(env: Env, order_id: u32) {
         let _guard = ReentryGuardScope::new(&env);
+        Self::check_not_paused(&env);
         let escrow_for_auth = Self::get_stored_escrow(&env, order_id);
 
         // Only buyer can release funds
@@ -3848,7 +3971,16 @@ impl CraftNexusContract {
 
         // Transfer remaining funds to seller and record audit
         let token_client = token::Client::new(&env, &escrow.token);
-        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), seller_amount);
+        Self::transfer_tokens_and_record_audit(
+            &env,
+            &escrow.token,
+            &env.current_contract_address(),
+            &escrow.seller,
+            seller_amount,
+            &escrow.seller,
+            Symbol::new(&env, "escrow_released"),
+            seller_amount,
+        );
 
         // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
@@ -3900,6 +4032,7 @@ impl CraftNexusContract {
     /// * `order_id` - Order identifier
     pub fn auto_release(env: Env, order_id: u32) {
         let _guard = ReentryGuardScope::new(&env);
+        Self::check_not_paused(&env);
         let escrow_for_window = Self::get_stored_escrow(&env, order_id);
 
         if !(escrow_for_window.status == EscrowStatus::Active) {
@@ -3943,7 +4076,16 @@ impl CraftNexusContract {
 
         // Transfer remaining funds to seller and record audit
         let token_client = token::Client::new(&env, &escrow.token);
-        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), seller_amount);
+        Self::transfer_tokens_and_record_audit(
+            &env,
+            &escrow.token,
+            &env.current_contract_address(),
+            &escrow.seller,
+            seller_amount,
+            &escrow.seller,
+            Symbol::new(&env, "escrow_released"),
+            seller_amount,
+        );
 
         Self::emit_escrow_created(
             &env,
@@ -4085,6 +4227,7 @@ impl CraftNexusContract {
     ) -> Result<(), Error> {
         signer.require_auth();
 
+        Self::assert_no_fund_emergency_lock(&env)?;
         Self::validate_upgrade_hash(&env, &new_wasm_hash)?;
 
         // Issue #618: Prevent cancel-and-repropose from resetting the review
@@ -4246,6 +4389,8 @@ impl CraftNexusContract {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 
+        Self::assert_no_fund_emergency_lock(&env)?;
+
         let proposal: WasmUpgradeProposal = env
             .storage()
             .persistent()
@@ -4296,9 +4441,24 @@ impl CraftNexusContract {
             &env,
             UPGRADE_EXECUTED,
             proposal.wasm_hash,
-            admin,
+            admin.clone(),
             proposal.upgrade_at,
         );
+
+        // Audit trail entry (does not hold the fund-emergency lock).
+        let audit = EmergencyOpState {
+            op_id: Self::next_emergency_op_id(&env),
+            kind: EmergencyOpKind::UpgradeExecute,
+            phase: EmergencyOpPhase::Completed,
+            initiator: admin,
+            started_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
+            success: true,
+            status: Symbol::new(&env, "upgraded"),
+            amount: 0,
+        };
+        Self::append_emergency_history(&env, &audit);
+        Self::emit_emergency_op_event(&env, &audit);
 
         Ok(())
     }
@@ -4312,6 +4472,8 @@ impl CraftNexusContract {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 
+        // Cancel remains available during recovery so operators can clear the
+        // pending-upgrade conflict that blocks sweep/recovery completion.
         let proposal: WasmUpgradeProposal = env
             .storage()
             .persistent()
@@ -4335,9 +4497,23 @@ impl CraftNexusContract {
             &env,
             UPGRADE_CANCELLED,
             proposal.wasm_hash,
-            admin,
+            admin.clone(),
             proposal.upgrade_at,
         );
+
+        let audit = EmergencyOpState {
+            op_id: Self::next_emergency_op_id(&env),
+            kind: EmergencyOpKind::UpgradeCancel,
+            phase: EmergencyOpPhase::Completed,
+            initiator: admin,
+            started_at: cancelled_at,
+            updated_at: cancelled_at,
+            success: true,
+            status: Symbol::new(&env, "cancelled"),
+            amount: 0,
+        };
+        Self::append_emergency_history(&env, &audit);
+        Self::emit_emergency_op_event(&env, &audit);
 
         Ok(())
     }
@@ -4440,7 +4616,16 @@ impl CraftNexusContract {
 
         // Refund to buyer and record audit
         let client = token::Client::new(&env, &escrow.token);
-        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(&env, "refund"), escrow.amount);
+        Self::transfer_tokens_and_record_audit(
+            &env,
+            &escrow.token,
+            &env.current_contract_address(),
+            &escrow.buyer,
+            escrow.amount,
+            &escrow.buyer,
+            Symbol::new(&env, "refund"),
+            escrow.amount,
+        );
 
         // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
@@ -4498,7 +4683,16 @@ impl CraftNexusContract {
             Self::transfer_platform_fee(env, &escrow.token, &config.platform_wallet, fee_amount);
         }
 
-        Self::transfer_tokens_and_record_audit(env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_amount, &escrow.seller, Symbol::new(env, "escrow_released"), seller_amount);
+        Self::transfer_tokens_and_record_audit(
+            env,
+            &escrow.token,
+            &env.current_contract_address(),
+            &escrow.seller,
+            seller_amount,
+            &escrow.seller,
+            Symbol::new(env, "escrow_released"),
+            seller_amount,
+        );
 
         // Track locked funds (#212)
         Self::update_total_locked(env, &escrow.token, -escrow.amount);
@@ -4506,7 +4700,16 @@ impl CraftNexusContract {
 
     fn refund_funds_to_buyer(env: &Env, escrow: &Escrow) {
         let token_client = token::Client::new(env, &escrow.token);
-        Self::transfer_tokens_and_record_audit(env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(env, "refund"), escrow.amount);
+        Self::transfer_tokens_and_record_audit(
+            env,
+            &escrow.token,
+            &env.current_contract_address(),
+            &escrow.buyer,
+            escrow.amount,
+            &escrow.buyer,
+            Symbol::new(env, "refund"),
+            escrow.amount,
+        );
 
         // Track locked funds (#212)
         Self::update_total_locked(env, &escrow.token, -escrow.amount);
@@ -4528,7 +4731,11 @@ impl CraftNexusContract {
 
         for index in 0..count {
             let entry_key = DataKey::FundAuditIndexed(actor.clone(), index);
-            if let Some(entry) = env.storage().persistent().get::<DataKey, FundMovementAuditEntry>(&entry_key) {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, FundMovementAuditEntry>(&entry_key)
+            {
                 history.push_back(entry);
             }
         }
@@ -4565,7 +4772,11 @@ impl CraftNexusContract {
         let end_index = start_index.saturating_add(limit).min(count);
         for index in start_index..end_index {
             let entry_key = DataKey::FundAuditIndexed(actor.clone(), index);
-            if let Some(entry) = env.storage().persistent().get::<DataKey, FundMovementAuditEntry>(&entry_key) {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, FundMovementAuditEntry>(&entry_key)
+            {
                 history.push_back(entry);
             }
         }
@@ -4690,6 +4901,7 @@ impl CraftNexusContract {
         dispute_reason: Symbol, // UPDATE ARGUMENT TYPE
         authorized_address: Address,
     ) {
+        Self::check_not_paused(&env);
         authorized_address.require_auth();
 
         let escrow_for_auth = Self::get_stored_escrow(&env, order_id);
@@ -4709,6 +4921,7 @@ impl CraftNexusContract {
         escrow.dispute_reason = Some(dispute_reason); // Assign Symbol
         escrow.dispute_initiated_at = Some(env.ledger().timestamp());
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+        Self::update_active_dispute_count(&env, 1);
 
         Self::emit_escrow_created(
             &env,
@@ -4761,6 +4974,7 @@ impl CraftNexusContract {
         // CRITICAL: Update status BEFORE external calls (CEI pattern)
         escrow.status = EscrowStatus::Resolved;
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+        Self::update_active_dispute_count(&env, -1);
 
         // Decrement active counts
         Self::update_active_obligations(&env, &escrow.buyer, -1);
@@ -5163,7 +5377,16 @@ impl CraftNexusContract {
 
         // Transfer funds from buyer to contract and record audit
         let client = token::Client::new(env, &params.token);
-        Self::transfer_tokens_and_record_audit(env, &params.token, &params.buyer, &env.current_contract_address(), params.amount, &params.buyer, Symbol::new(env, "escrow_funded"), -params.amount);
+        Self::transfer_tokens_and_record_audit(
+            env,
+            &params.token,
+            &params.buyer,
+            &env.current_contract_address(),
+            params.amount,
+            &params.buyer,
+            Symbol::new(env, "escrow_funded"),
+            -params.amount,
+        );
 
         // Track locked funds (#212)
         Self::update_total_locked(env, &params.token, params.amount);
@@ -5325,9 +5548,8 @@ impl CraftNexusContract {
                         let seller_key = params.seller.clone();
 
                         if !buyer_next_counts.contains_key(buyer_key.clone()) {
-                            let existing_count = buyer_count_state
-                                .get(buyer_key.clone())
-                                .unwrap_or(0u32);
+                            let existing_count =
+                                buyer_count_state.get(buyer_key.clone()).unwrap_or(0u32);
                             buyer_next_counts.set(buyer_key.clone(), existing_count);
                         }
                         let buyer_count = buyer_next_counts.get(buyer_key.clone()).unwrap();
@@ -5341,9 +5563,8 @@ impl CraftNexusContract {
                         buyer_next_counts.set(buyer_key, buyer_count + 1);
 
                         if !seller_next_counts.contains_key(seller_key.clone()) {
-                            let existing_count = seller_count_state
-                                .get(seller_key.clone())
-                                .unwrap_or(0u32);
+                            let existing_count =
+                                seller_count_state.get(seller_key.clone()).unwrap_or(0u32);
                             seller_next_counts.set(seller_key.clone(), existing_count);
                         }
                         let seller_count = seller_next_counts.get(seller_key.clone()).unwrap();
@@ -5444,6 +5665,7 @@ impl CraftNexusContract {
         authorized_address: Address,
     ) -> Result<soroban_sdk::Vec<u64>, Error> {
         let _guard = ReentryGuardScope::new(&env);
+        Self::check_not_paused(&env);
         authorized_address.require_auth();
 
         let mut results = soroban_sdk::Vec::new(&env);
@@ -5512,7 +5734,16 @@ impl CraftNexusContract {
 
                     // Transfer remaining funds to seller
                     let token_client = token::Client::new(&env, &escrow.token);
-                    Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), seller_amount);
+                    Self::transfer_tokens_and_record_audit(
+                        &env,
+                        &escrow.token,
+                        &env.current_contract_address(),
+                        &escrow.seller,
+                        seller_amount,
+                        &escrow.seller,
+                        Symbol::new(&env, "escrow_released"),
+                        seller_amount,
+                    );
 
                     // Emit release event
                     Self::emit_escrow_created(
@@ -5538,6 +5769,290 @@ impl CraftNexusContract {
     // NOTE: referral payout support has been removed from the contract. The configuration key is
     // retained only for storage compatibility during upgrades.
 
+    /// Returns `true` when an emergency phase still holds the serialization lock.
+    fn emergency_phase_is_active(phase: EmergencyOpPhase) -> bool {
+        matches!(
+            phase,
+            EmergencyOpPhase::Locked | EmergencyOpPhase::Executing
+        )
+    }
+
+    fn load_emergency_op_state(env: &Env) -> Option<EmergencyOpState> {
+        env.storage().persistent().get(&EMERGENCY_OP)
+    }
+
+    fn store_emergency_op_state(env: &Env, state: &EmergencyOpState) {
+        env.storage().persistent().set(&EMERGENCY_OP, state);
+        Self::extend_persistent(env, &EMERGENCY_OP);
+    }
+
+    fn emit_emergency_op_event(env: &Env, state: &EmergencyOpState) {
+        env.events().publish(
+            (
+                Symbol::new(env, "emergency_op"),
+                state.op_id,
+                state.status.clone(),
+            ),
+            (
+                state.kind,
+                state.phase,
+                state.success,
+                state.amount,
+                state.initiator.clone(),
+                state.updated_at,
+            ),
+        );
+    }
+
+    fn append_emergency_history(env: &Env, state: &EmergencyOpState) {
+        let mut count: u32 = env
+            .storage()
+            .persistent()
+            .get(&EMERGENCY_HIST_CNT)
+            .unwrap_or(0);
+
+        if count >= MAX_EMERGENCY_HISTORY {
+            // Drop oldest entry (index 0) and shift left.
+            for i in 0..(MAX_EMERGENCY_HISTORY - 1) {
+                let next_key = (EMERGENCY_HIST, i + 1);
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, EmergencyOpState>(&next_key)
+                {
+                    let cur_key = (EMERGENCY_HIST, i);
+                    env.storage().persistent().set(&cur_key, &entry);
+                    Self::extend_persistent(env, &cur_key);
+                }
+            }
+            count = MAX_EMERGENCY_HISTORY - 1;
+        }
+
+        let index_key = (EMERGENCY_HIST, count);
+        env.storage().persistent().set(&index_key, state);
+        Self::extend_persistent(env, &index_key);
+
+        count = count.saturating_add(1);
+        env.storage().persistent().set(&EMERGENCY_HIST_CNT, &count);
+        Self::extend_persistent(env, &EMERGENCY_HIST_CNT);
+    }
+
+    fn next_emergency_op_id(env: &Env) -> u64 {
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&EMERGENCY_NEXT_ID)
+            .unwrap_or(1);
+        let next = id.saturating_add(1);
+        env.storage().persistent().set(&EMERGENCY_NEXT_ID, &next);
+        Self::extend_persistent(env, &EMERGENCY_NEXT_ID);
+        id
+    }
+
+    /// Acquire or resume the emergency serialization lock for `kind`.
+    ///
+    /// Active ops of a *different* kind are rejected. Terminal states
+    /// (`Completed` / `Failed` / absent) allow a fresh operation. Matching
+    /// `Executing`/`Locked` ops of the same kind are resumed in place so
+    /// multi-transaction flows (e.g. admin recovery timelock) can continue.
+    fn begin_or_resume_emergency_op(
+        env: &Env,
+        kind: EmergencyOpKind,
+        initiator: &Address,
+    ) -> Result<EmergencyOpState, Error> {
+        let now = env.ledger().timestamp();
+
+        if let Some(existing) = Self::load_emergency_op_state(env) {
+            if Self::emergency_phase_is_active(existing.phase) {
+                if existing.kind != kind {
+                    return Err(Error::EmergencyOpInProgress);
+                }
+                let mut resumed = existing;
+                resumed.updated_at = now;
+                resumed.phase = EmergencyOpPhase::Executing;
+                resumed.status = Symbol::new(env, "resumed");
+                Self::store_emergency_op_state(env, &resumed);
+                Self::emit_emergency_op_event(env, &resumed);
+                return Ok(resumed);
+            }
+        }
+
+        let state = EmergencyOpState {
+            op_id: Self::next_emergency_op_id(env),
+            kind,
+            phase: EmergencyOpPhase::Locked,
+            initiator: initiator.clone(),
+            started_at: now,
+            updated_at: now,
+            success: false,
+            status: Symbol::new(env, "locked"),
+            amount: 0,
+        };
+        Self::store_emergency_op_state(env, &state);
+        Self::emit_emergency_op_event(env, &state);
+        Ok(state)
+    }
+
+    fn finalize_emergency_op(
+        env: &Env,
+        mut state: EmergencyOpState,
+        success: bool,
+        status: &str,
+        amount: i128,
+    ) -> EmergencyOpState {
+        let now = env.ledger().timestamp();
+        state.updated_at = now;
+        state.success = success;
+        state.status = Symbol::new(env, status);
+        state.amount = amount;
+        state.phase = if success {
+            EmergencyOpPhase::Completed
+        } else {
+            EmergencyOpPhase::Failed
+        };
+        Self::store_emergency_op_state(env, &state);
+        Self::append_emergency_history(env, &state);
+        Self::emit_emergency_op_event(env, &state);
+        state
+    }
+
+    /// Park a multi-tx emergency op in `Executing` without releasing the lock.
+    fn park_emergency_op(
+        env: &Env,
+        mut state: EmergencyOpState,
+        status: &str,
+        amount: i128,
+    ) -> EmergencyOpState {
+        state.updated_at = env.ledger().timestamp();
+        state.phase = EmergencyOpPhase::Executing;
+        state.success = false;
+        state.status = Symbol::new(env, status);
+        state.amount = amount;
+        Self::store_emergency_op_state(env, &state);
+        Self::emit_emergency_op_event(env, &state);
+        state
+    }
+
+    /// Dependency gate for recovery and sweep: no pending WASM upgrade,
+    /// no open disputes, and no active recurring escrows.
+    fn assert_emergency_dependencies_clear(env: &Env) -> Result<(), Error> {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::WasmUpgradeProposal)
+        {
+            return Err(Error::EmergencyConflictActive);
+        }
+
+        let disputes: u32 = env
+            .storage()
+            .persistent()
+            .get(&ACTIVE_DISPUTES)
+            .unwrap_or(0);
+        if disputes > 0 {
+            return Err(Error::EmergencyConflictActive);
+        }
+
+        let recurring: u32 = env
+            .storage()
+            .persistent()
+            .get(&ACTIVE_RECURRING)
+            .unwrap_or(0);
+        if recurring > 0 {
+            return Err(Error::EmergencyConflictActive);
+        }
+
+        Ok(())
+    }
+
+    fn update_active_dispute_count(env: &Env, delta: i32) {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&ACTIVE_DISPUTES)
+            .unwrap_or(0);
+        let new_val = if delta > 0 {
+            count.saturating_add(delta as u32)
+        } else {
+            count.saturating_sub((-delta) as u32)
+        };
+        env.storage().persistent().set(&ACTIVE_DISPUTES, &new_val);
+        Self::extend_persistent(env, &ACTIVE_DISPUTES);
+    }
+
+    fn update_active_recurring_count(env: &Env, delta: i32) {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&ACTIVE_RECURRING)
+            .unwrap_or(0);
+        let new_val = if delta > 0 {
+            count.saturating_add(delta as u32)
+        } else {
+            count.saturating_sub((-delta) as u32)
+        };
+        env.storage().persistent().set(&ACTIVE_RECURRING, &new_val);
+        Self::extend_persistent(env, &ACTIVE_RECURRING);
+    }
+
+    fn compute_fund_allocation(env: &Env, token: &Address) -> Result<FundAllocation, Error> {
+        let token_client = token::Client::new(env, token);
+        let balance = token_client.balance(&env.current_contract_address());
+        let total_locked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLocked(token.clone()))
+            .unwrap_or(0);
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked(token.clone()))
+            .unwrap_or(0);
+
+        let reserved = total_locked.saturating_add(total_staked);
+        if balance < reserved {
+            return Err(Error::EmergencyAccountingInvariant);
+        }
+
+        Ok(FundAllocation {
+            balance,
+            total_locked,
+            total_staked,
+            unallocated: balance - reserved,
+        })
+    }
+
+    /// Ensure no fund-safety emergency op (pause/recovery/sweep) holds the lock.
+    /// Upgrade cancel remains allowed so operators can clear conflicts.
+    fn assert_no_fund_emergency_lock(env: &Env) -> Result<(), Error> {
+        if let Some(existing) = Self::load_emergency_op_state(env) {
+            if Self::emergency_phase_is_active(existing.phase) {
+                match existing.kind {
+                    EmergencyOpKind::Pause
+                    | EmergencyOpKind::Unpause
+                    | EmergencyOpKind::AdminRecovery
+                    | EmergencyOpKind::Sweep => {
+                        return Err(Error::EmergencyOpInProgress);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensure the platform is paused; auto-pause when starting recovery/sweep.
+    fn ensure_paused_for_emergency(env: &Env, initiator: &Address) {
+        let mut config = Self::get_platform_config_internal(env);
+        if !config.is_paused {
+            config.is_paused = true;
+            env.storage()
+                .instance()
+                .set(&DataKey::PlatformConfig, &config);
+            Self::emit_platform_paused(env, initiator.clone());
+        }
+    }
+
     /// Check that the contract is not paused. Panics with ContractPaused if it is.
     fn check_not_paused(env: &Env) {
         if let Some(config) = env
@@ -5557,6 +6072,27 @@ impl CraftNexusContract {
             .unwrap_or_else(|_| env.panic_with_error(crate::Error::Unauthorized));
         admin.require_auth();
 
+        let kind = if paused {
+            EmergencyOpKind::Pause
+        } else {
+            EmergencyOpKind::Unpause
+        };
+
+        // Unpause is blocked while a multi-tx emergency op (e.g. recovery
+        // timelock) still holds the serialization lock.
+        if !paused {
+            if let Some(existing) = Self::load_emergency_op_state(&env) {
+                if Self::emergency_phase_is_active(existing.phase)
+                    && existing.kind != EmergencyOpKind::Unpause
+                {
+                    env.panic_with_error(crate::Error::EmergencyOpInProgress);
+                }
+            }
+        }
+
+        let state = Self::begin_or_resume_emergency_op(&env, kind, &admin)
+            .unwrap_or_else(|e| env.panic_with_error(e));
+
         let mut config = Self::get_platform_config_internal(&env);
         config.is_paused = paused;
         env.storage()
@@ -5568,12 +6104,110 @@ impl CraftNexusContract {
         } else {
             Self::emit_platform_unpaused(&env, admin);
         }
+
+        Self::finalize_emergency_op(
+            &env,
+            state,
+            true,
+            if paused { "paused" } else { "unpaused" },
+            0,
+        );
     }
 
     /// View: check if contract is paused.
     pub fn is_paused(env: Env) -> bool {
         let config = Self::get_platform_config_internal(&env);
         config.is_paused
+    }
+
+    /// Current emergency operation state, if any has been recorded.
+    pub fn get_emergency_operation(env: Env) -> Option<EmergencyOpState> {
+        Self::load_emergency_op_state(&env)
+    }
+
+    /// Paginated emergency-operation audit history (oldest → newest within page).
+    pub fn get_emergency_operation_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<EmergencyOpState> {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&EMERGENCY_HIST_CNT)
+            .unwrap_or(0);
+        let page_limit = if limit == 0 || limit > MAX_PAGE_SIZE {
+            MAX_PAGE_SIZE
+        } else {
+            limit
+        };
+        let mut result = Vec::new(&env);
+        let mut i = offset;
+        let end = offset.saturating_add(page_limit).min(count);
+        while i < end {
+            let key = (EMERGENCY_HIST, i);
+            if let Some(entry) = env.storage().persistent().get::<_, EmergencyOpState>(&key) {
+                Self::extend_persistent_read(&env, &key);
+                result.push_back(entry);
+            }
+            i = i.saturating_add(1);
+        }
+        result
+    }
+
+    /// Abort a stuck/partial emergency operation so a new one can begin.
+    /// Clears a pending admin-recovery timelock when aborting recovery.
+    /// `caller` must be the current admin or the fallback admin.
+    pub fn abort_emergency_operation(env: Env, caller: Address) -> Result<EmergencyOpState, Error> {
+        caller.require_auth();
+
+        let admin = Self::get_admin(&env).ok();
+        let fallback: Option<Address> = env.storage().persistent().get(&DataKey::FallbackAdmin);
+
+        let allowed = admin.as_ref() == Some(&caller) || fallback.as_ref() == Some(&caller);
+        if !allowed {
+            return Err(Error::Unauthorized);
+        }
+
+        let existing = Self::load_emergency_op_state(&env).ok_or(Error::EmergencyOpNotResumable)?;
+        if existing.phase == EmergencyOpPhase::Completed || existing.phase == EmergencyOpPhase::Idle
+        {
+            return Err(Error::EmergencyOpInvalidPhase);
+        }
+
+        if existing.kind == EmergencyOpKind::AdminRecovery {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::AdminRecoveryTime);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::AdminRecoveryDelay);
+        }
+
+        Ok(Self::finalize_emergency_op(
+            &env, existing, false, "aborted", 0,
+        ))
+    }
+
+    /// View token allocation used by sweep safety checks.
+    pub fn get_fund_allocation(env: Env, token: Address) -> Result<FundAllocation, Error> {
+        Self::compute_fund_allocation(&env, &token)
+    }
+
+    /// Global count of escrows currently in `Disputed` status.
+    pub fn get_active_dispute_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&ACTIVE_DISPUTES)
+            .unwrap_or(0)
+    }
+
+    /// Global count of active recurring escrows.
+    pub fn get_active_recurring_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&ACTIVE_RECURRING)
+            .unwrap_or(0)
     }
 
     // â”€â”€ Tiered Artisan Fees (#98) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -5640,6 +6274,7 @@ impl CraftNexusContract {
         // CRITICAL: Update status BEFORE external calls (CEI pattern)
         escrow.status = EscrowStatus::Resolved;
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+        Self::update_active_dispute_count(&env, -1);
 
         // Decrement active counts
         Self::update_active_obligations(&env, &escrow.buyer, -1);
@@ -5656,18 +6291,50 @@ impl CraftNexusContract {
         match config.expired_dispute_fee_policy {
             ExpiredDisputeFeePolicy::RefundFullNoPlatformFee => {
                 // Refund buyer in full, platform collects no fee
-                Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(&env, "expired_dispute_refund"), escrow.amount);
+                Self::transfer_tokens_and_record_audit(
+                    &env,
+                    &escrow.token,
+                    &env.current_contract_address(),
+                    &escrow.buyer,
+                    escrow.amount,
+                    &escrow.buyer,
+                    Symbol::new(&env, "expired_dispute_refund"),
+                    escrow.amount,
+                );
             }
             ExpiredDisputeFeePolicy::RefundMinusPlatformFee => {
                 // Refund buyer minus platform fee, platform collects fee
                 let buyer_refund = escrow.amount - fee_amount;
-                Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, buyer_refund, &escrow.buyer, Symbol::new(&env, "expired_dispute_refund"), buyer_refund);
-                Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, fee_amount);
+                Self::transfer_tokens_and_record_audit(
+                    &env,
+                    &escrow.token,
+                    &env.current_contract_address(),
+                    &escrow.buyer,
+                    buyer_refund,
+                    &escrow.buyer,
+                    Symbol::new(&env, "expired_dispute_refund"),
+                    buyer_refund,
+                );
+                Self::transfer_platform_fee(
+                    &env,
+                    &escrow.token,
+                    &config.platform_wallet,
+                    fee_amount,
+                );
             }
             ExpiredDisputeFeePolicy::DeductFeeFromSeller => {
                 // Refund buyer in full, but conceptually the fee comes from seller's side
                 // (seller loses the fee even though they didn't receive payment)
-                Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(&env, "expired_dispute_refund"), escrow.amount);
+                Self::transfer_tokens_and_record_audit(
+                    &env,
+                    &escrow.token,
+                    &env.current_contract_address(),
+                    &escrow.buyer,
+                    escrow.amount,
+                    &escrow.buyer,
+                    Symbol::new(&env, "expired_dispute_refund"),
+                    escrow.amount,
+                );
                 // Note: In this policy, the platform doesn't collect the fee
                 // This represents a loss for the seller (they lose the opportunity cost)
                 // but protects the buyer from arbitrator failure
@@ -5677,7 +6344,16 @@ impl CraftNexusContract {
                 let half_fee = fee_amount / 2;
                 let buyer_refund = escrow.amount - half_fee;
 
-                Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, buyer_refund, &escrow.buyer, Symbol::new(&env, "expired_dispute_refund"), buyer_refund);
+                Self::transfer_tokens_and_record_audit(
+                    &env,
+                    &escrow.token,
+                    &env.current_contract_address(),
+                    &escrow.buyer,
+                    buyer_refund,
+                    &escrow.buyer,
+                    Symbol::new(&env, "expired_dispute_refund"),
+                    buyer_refund,
+                );
                 Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, half_fee);
             }
         }
@@ -5714,6 +6390,7 @@ impl CraftNexusContract {
     /// Staked balances remain owned by the artisan. The contract does not accrue,
     /// distribute, or sweep interest/yield from these reserved funds into platform fees.
     pub fn stake_tokens(env: Env, artisan: Address, token: Address, amount: i128) {
+        Self::check_not_paused(&env);
         artisan.require_auth();
 
         if amount <= 0 {
@@ -5722,7 +6399,16 @@ impl CraftNexusContract {
 
         // Transfer from artisan to contract and record audit
         let token_client = token::Client::new(&env, &token);
-        Self::transfer_tokens_and_record_audit(&env, &token, &artisan, &env.current_contract_address(), amount, &artisan, Symbol::new(&env, "stake_deposit"), -amount);
+        Self::transfer_tokens_and_record_audit(
+            &env,
+            &token,
+            &artisan,
+            &env.current_contract_address(),
+            amount,
+            &artisan,
+            Symbol::new(&env, "stake_deposit"),
+            -amount,
+        );
 
         // Track staked funds (#212)
         Self::update_total_staked(&env, &token, amount);
@@ -5874,6 +6560,7 @@ impl CraftNexusContract {
     /// prevents reserved artisan collateral from being treated as platform-managed fees.
     /// Enhanced with bounded indexed queue and automatic pruning for scalability.
     pub fn unstake_tokens(env: Env, artisan: Address, token: Address) {
+        Self::check_not_paused(&env);
         artisan.require_auth();
 
         // Validate the requested token matches the token recorded at stake time.
@@ -5963,7 +6650,16 @@ impl CraftNexusContract {
 
         // Return matured tokens to artisan and record audit
         let token_client = token::Client::new(&env, &token);
-        Self::transfer_tokens_and_record_audit(&env, &token, &env.current_contract_address(), &artisan, matured_amount, &artisan, Symbol::new(&env, "stake_unstaked"), matured_amount);
+        Self::transfer_tokens_and_record_audit(
+            &env,
+            &token,
+            &env.current_contract_address(),
+            &artisan,
+            matured_amount,
+            &artisan,
+            Symbol::new(&env, "stake_unstaked"),
+            matured_amount,
+        );
 
         // Track staked funds (#212): the matured amount is the delta
         // leaving the contract; the per-artisan stake record (if any) is
@@ -6251,6 +6947,7 @@ impl CraftNexusContract {
         // CEI Pattern: EFFECTS - Update state BEFORE external calls
         escrow.status = EscrowStatus::Resolved;
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+        Self::update_active_dispute_count(&env, -1);
 
         // Clean up proposal
         env.storage().persistent().remove(&proposal_key);
@@ -6267,7 +6964,16 @@ impl CraftNexusContract {
 
         // Refund buyer and record audit
         if refund_amount_net > 0 {
-            Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, refund_amount_net, &escrow.buyer, Symbol::new(&env, "partial_refund_buyer"), refund_amount_net);
+            Self::transfer_tokens_and_record_audit(
+                &env,
+                &escrow.token,
+                &env.current_contract_address(),
+                &escrow.buyer,
+                refund_amount_net,
+                &escrow.buyer,
+                Symbol::new(&env, "partial_refund_buyer"),
+                refund_amount_net,
+            );
         }
 
         // Pay platform fee
@@ -6282,7 +6988,16 @@ impl CraftNexusContract {
 
         // Pay seller
         if seller_net > 0 {
-            Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_net, &escrow.seller, Symbol::new(&env, "partial_refund_seller"), seller_net);
+            Self::transfer_tokens_and_record_audit(
+                &env,
+                &escrow.token,
+                &env.current_contract_address(),
+                &escrow.seller,
+                seller_net,
+                &escrow.seller,
+                Symbol::new(&env, "partial_refund_seller"),
+                seller_net,
+            );
 
             // Track locked funds (#212)
             Self::update_total_locked(&env, &escrow.token, -escrow.amount);
@@ -6435,13 +7150,23 @@ impl CraftNexusContract {
         // Track active recurring escrows
         Self::update_active_obligations(&env, &buyer, 1);
         Self::update_active_obligations(&env, &artisan, 1);
+        Self::update_active_recurring_count(&env, 1);
 
         Self::safe_update_active_contracts(&env, buyer.clone(), 1);
         Self::safe_update_active_contracts(&env, artisan.clone(), 1);
 
         // Lock funds upfront and record audit
         let token_client = token::Client::new(&env, &token);
-        Self::transfer_tokens_and_record_audit(&env, &token, &buyer, &env.current_contract_address(), total_amount, &buyer, Symbol::new(&env, "recurring_escrow_locked"), -total_amount);
+        Self::transfer_tokens_and_record_audit(
+            &env,
+            &token,
+            &buyer,
+            &env.current_contract_address(),
+            total_amount,
+            &buyer,
+            Symbol::new(&env, "recurring_escrow_locked"),
+            -total_amount,
+        );
 
         // Track locked funds (#212)
         Self::update_total_locked(&env, &token, total_amount);
@@ -6464,6 +7189,7 @@ impl CraftNexusContract {
     /// Release funds for the next cycle in a recurring escrow.
     pub fn release_next_cycle(env: Env, id: u64) {
         let _guard = ReentryGuardScope::new(&env);
+        Self::check_not_paused(&env);
         let key = DataKey::RecurringEscrow(id);
         let mut escrow: RecurringEscrow = env
             .storage()
@@ -6501,7 +7227,16 @@ impl CraftNexusContract {
         }
 
         let token_client = token::Client::new(&env, &escrow.token);
-        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.artisan, artisan_amount, &escrow.artisan, Symbol::new(&env, "recurring_release"), artisan_amount);
+        Self::transfer_tokens_and_record_audit(
+            &env,
+            &escrow.token,
+            &env.current_contract_address(),
+            &escrow.artisan,
+            artisan_amount,
+            &escrow.artisan,
+            Symbol::new(&env, "recurring_release"),
+            artisan_amount,
+        );
 
         // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, -cycle_amount);
@@ -6517,6 +7252,7 @@ impl CraftNexusContract {
             // Decrement active recurring counts
             Self::update_active_obligations(&env, &escrow.buyer, -1);
             Self::update_active_obligations(&env, &escrow.artisan, -1);
+            Self::update_active_recurring_count(&env, -1);
         }
 
         env.storage().persistent().set(&key, &escrow);
@@ -6594,6 +7330,7 @@ impl CraftNexusContract {
         // Decrement active recurring counts
         Self::update_active_obligations(&env, &escrow.buyer, -1);
         Self::update_active_obligations(&env, &escrow.artisan, -1);
+        Self::update_active_recurring_count(&env, -1);
 
         Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
         Self::safe_update_active_contracts(&env, escrow.artisan.clone(), -1);
@@ -6601,7 +7338,16 @@ impl CraftNexusContract {
         // CEI Pattern: INTERACTIONS - External calls AFTER state updates
         if remaining > 0 {
             let token_client = token::Client::new(&env, &escrow.token);
-            Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, remaining, &escrow.buyer, Symbol::new(&env, "recurring_cancel_refund"), remaining);
+            Self::transfer_tokens_and_record_audit(
+                &env,
+                &escrow.token,
+                &env.current_contract_address(),
+                &escrow.buyer,
+                remaining,
+                &escrow.buyer,
+                Symbol::new(&env, "recurring_cancel_refund"),
+                remaining,
+            );
 
             // Track locked funds (#212)
             Self::update_total_locked(&env, &escrow.token, -remaining);
@@ -6629,7 +7375,12 @@ impl CraftNexusContract {
     }
 
     /// Recovery function to sweep unallocated tokens from the contract (admin only).
+    ///
     /// Unallocated funds = current_balance - (total_locked_in_escrows + total_staked_by_artisans).
+    /// Serialized through the emergency framework and blocked while disputes,
+    /// pending upgrades, or active recurring escrows would make the sweep unsafe.
+    /// Requires (or auto-applies) pause. Rejects accounting drift where
+    /// `balance < locked + staked`.
     pub fn sweep_unallocated_funds(
         env: Env,
         token: Address,
@@ -6638,26 +7389,29 @@ impl CraftNexusContract {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 
-        let token_client = token::Client::new(&env, &token);
-        let balance = token_client.balance(&env.current_contract_address());
+        // Checks before writes so Err does not leave a partial emergency lock.
+        Self::assert_emergency_dependencies_clear(&env)?;
+        let allocation = Self::compute_fund_allocation(&env, &token)?;
 
-        let locked: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TotalLocked(token.clone()))
-            .unwrap_or(0);
-        let staked: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TotalStaked(token.clone()))
-            .unwrap_or(0);
+        let state = Self::begin_or_resume_emergency_op(&env, EmergencyOpKind::Sweep, &admin)?;
 
-        let unallocated = balance - (locked + staked);
+        Self::ensure_paused_for_emergency(&env, &admin);
 
+        let unallocated = allocation.unallocated;
         if unallocated > 0 {
-            Self::transfer_tokens_and_record_audit(&env, &token, &env.current_contract_address(), &destination, unallocated, &destination, Symbol::new(&env, "sweep_unallocated"), unallocated);
+            Self::transfer_tokens_and_record_audit(
+                &env,
+                &token,
+                &env.current_contract_address(),
+                &destination,
+                unallocated,
+                &destination,
+                Symbol::new(&env, "sweep_unallocated"),
+                unallocated,
+            );
         }
 
+        Self::finalize_emergency_op(&env, state, true, "swept", unallocated);
         Ok(unallocated)
     }
 

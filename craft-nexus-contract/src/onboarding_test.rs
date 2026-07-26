@@ -843,7 +843,7 @@ fn test_process_verification_request_unauthorized() {
             .set(&DataKey::UserProfile(user.clone()), &profile);
     });
 
-       // No platform-admin signature is present, so require_auth() must panic and
+    // No platform-admin signature is present, so require_auth() must panic and
     // the verification state transition must never execute.
     client.process_verification_request(&user, &true);
 }
@@ -1016,7 +1016,11 @@ fn test_reputation_zero_trades_no_op() {
 
     let (client, _) = setup_test(&env);
     let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "repzero"), &UserRole::Artisan);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "repzero"),
+        &UserRole::Artisan,
+    );
 
     client.update_reputation(&user, &0u32, &0u32);
     let (successful, disputed) = client.get_user_reputation(&user);
@@ -1045,7 +1049,6 @@ fn test_reputation_max_trades_no_overflow() {
     assert_eq!(successful2, u32::MAX);
     assert_eq!(disputed2, u32::MAX);
 }
-
 
 #[test]
 fn test_get_user_migrates_legacy_profile() {
@@ -1320,14 +1323,11 @@ fn test_change_username_with_special_characters() {
     client.onboard_user(&user, &String::from_str(&env, "original"), &UserRole::Buyer);
 
     // Change to username with special characters (should be normalized)
-       let new_username = String::from_str(&env, "New-User_Name.123");
+    let new_username = String::from_str(&env, "New-User_Name.123");
     let updated = client.change_username(&user, &new_username);
 
     // Should be normalized with underscores
-    assert_eq!(
-        updated.username,
-        Symbol::new(&env, "new_user_name_123")
-    );
+    assert_eq!(updated.username, Symbol::new(&env, "new_user_name_123"));
 }
 
 #[test]
@@ -2445,12 +2445,15 @@ fn test_has_active_contracts_authorized_returns_boolean_and_extends_ttl() {
     let (client, _) = setup_test(&env);
     let user = Address::generate(&env);
 
-    client.onboard_user(&user, &String::from_str(&env, "activeusr"), &UserRole::Buyer);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "activeusr"),
+        &UserRole::Buyer,
+    );
 
     // Initial query returns false (no escrows registered)
     assert!(!client.has_active_contracts(&user));
 }
-
 
 // ===== set_verification_thresholds auth tests (#422) =====
 
@@ -2503,11 +2506,8 @@ fn test_onboard_rejected_when_escrow_paused() {
     escrow_client.set_paused(&true);
 
     // Onboarding should be rejected
-    let result = client.try_onboard_user(
-        &user,
-        &String::from_str(&env, "newuser"),
-        &UserRole::Buyer,
-    );
+    let result =
+        client.try_onboard_user(&user, &String::from_str(&env, "newuser"), &UserRole::Buyer);
     assert!(result.is_err());
 }
 
