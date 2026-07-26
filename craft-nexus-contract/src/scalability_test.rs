@@ -726,7 +726,10 @@ fn test_artisan_stake_queue_pruning_does_not_run_before_threshold() {
             .persistent()
             .get(&DataKey::StakeDeposit(artisan.clone(), 48))
     });
-    assert!(stored_deposit.is_some(), "queue should still contain the last deposit");
+    assert!(
+        stored_deposit.is_some(),
+        "queue should still contain the last deposit"
+    );
 }
 
 #[test]
@@ -747,13 +750,19 @@ fn test_artisan_stake_queue_pruning_removes_all_matured_deposits() {
     client.stake_tokens(&artisan, &token, &1000);
 
     let count_after_pruning = client.get_artisan_stake_queue_count(&artisan);
-    assert_eq!(count_after_pruning, 1, "only the newest deposit should remain");
+    assert_eq!(
+        count_after_pruning, 1,
+        "only the newest deposit should remain"
+    );
 
     let count_key = DataKey::StakeDepositCount(artisan.clone());
     let count_present = env.as_contract(&client.address, || {
         env.storage().persistent().has(&count_key)
     });
-    assert!(count_present, "queue count should remain stored for the remaining deposit");
+    assert!(
+        count_present,
+        "queue count should remain stored for the remaining deposit"
+    );
 }
 
 #[test]
@@ -792,9 +801,10 @@ fn test_artisan_stake_queue_pruning_can_empty_queue() {
 
     // The pruned slots must not linger in persistent storage.
     for index in 1..STAKE_QUEUE_PRUNE_THRESHOLD {
-        let stale_key = DataKey::StakeDeposit(artisan.clone(), index);
-        let still_present =
-            env.as_contract(&client.address, || env.storage().persistent().has(&stale_key));
+        let stale_key = DataKey::ArtisanStakeQueueIndexed(artisan.clone(), index);
+        let still_present = env.as_contract(&client.address, || {
+            env.storage().persistent().has(&stale_key)
+        });
         assert!(!still_present, "pruned deposit {index} should be removed");
     }
 }

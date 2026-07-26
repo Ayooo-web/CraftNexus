@@ -408,7 +408,6 @@ fn test_dispute_expired_recurring_escrow_arbitrator_fees() {
     assert_eq!(escrow.status, EscrowStatus::Resolved);
 }
 
-
 #[test]
 fn test_auto_release_cei_pattern() {
     let env = Env::default();

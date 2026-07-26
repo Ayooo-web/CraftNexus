@@ -1145,7 +1145,11 @@ fn test_reputation_zero_trades_no_op() {
 
     let (client, _) = setup_test(&env);
     let user = Address::generate(&env);
-    client.onboard_user(&user, &String::from_str(&env, "repzero"), &UserRole::Artisan, &None);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "repzero"),
+        &UserRole::Artisan,
+    );
 
     client.update_reputation(&user, &0u32, &0u32);
     let (successful, disputed) = client.get_user_reputation(&user);
@@ -1174,7 +1178,6 @@ fn test_reputation_max_trades_no_overflow() {
     assert_eq!(successful2, u32::MAX);
     assert_eq!(disputed2, u32::MAX);
 }
-
 
 #[test]
 fn test_get_user_migrates_legacy_profile() {
@@ -2823,12 +2826,15 @@ fn test_has_active_contracts_authorized_returns_boolean_and_extends_ttl() {
     let (client, _) = setup_test(&env);
     let user = Address::generate(&env);
 
-    client.onboard_user(&user, &String::from_str(&env, "activeusr"), &UserRole::Buyer, &None);
+    client.onboard_user(
+        &user,
+        &String::from_str(&env, "activeusr"),
+        &UserRole::Buyer,
+    );
 
     // Initial query returns false (no escrows registered)
     assert!(!client.has_active_contracts(&user));
 }
-
 
 // ===== set_verification_thresholds auth tests (#422) =====
 
