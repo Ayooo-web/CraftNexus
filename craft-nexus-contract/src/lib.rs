@@ -5721,7 +5721,7 @@ impl CraftNexusContract {
         }
 
         // Transfer from artisan to contract and record audit
-        let token_client = token::Client::new(&env, &token);
+        let _token_client = token::Client::new(&env, &token);
         Self::transfer_tokens_and_record_audit(&env, &token, &artisan, &env.current_contract_address(), amount, &artisan, Symbol::new(&env, "stake_deposit"), -amount);
 
         // Track staked funds (#212)
@@ -5741,6 +5741,11 @@ impl CraftNexusContract {
         } else {
             ArtisanStakeData { amount, token }
         };
+
+        let config = Self::get_platform_config_internal(&env);
+        if config.min_stake_required > 0 && new_stake.amount < config.min_stake_required {
+            env.panic_with_error(crate::Error::InsufficientStake);
+        }
 
         env.storage().persistent().set(&stake_key, &new_stake);
         Self::extend_persistent(&env, &stake_key);
@@ -5939,8 +5944,20 @@ impl CraftNexusContract {
             env.storage().persistent().remove(&count_key);
         }
 
-        // Update stake metadata
+        // Validate remaining collateral safety and active obligation rules
         let remaining_amount = current_stake.amount - matured_amount;
+        let config = Self::get_platform_config_internal(&env);
+        let active_obligations = Self::has_active_escrows(env.clone(), artisan.clone());
+        if config.min_stake_required > 0 {
+            if active_obligations && remaining_amount < config.min_stake_required {
+                env.panic_with_error(crate::Error::InsufficientStake);
+            }
+            if !active_obligations && remaining_amount > 0 && remaining_amount < config.min_stake_required {
+                env.panic_with_error(crate::Error::InsufficientStake);
+            }
+        }
+
+        // Update stake metadata
         if remaining_amount > 0 {
             let updated_stake = ArtisanStakeData {
                 amount: remaining_amount,
@@ -5962,7 +5979,7 @@ impl CraftNexusContract {
         }
 
         // Return matured tokens to artisan and record audit
-        let token_client = token::Client::new(&env, &token);
+        let _token_client = token::Client::new(&env, &token);
         Self::transfer_tokens_and_record_audit(&env, &token, &env.current_contract_address(), &artisan, matured_amount, &artisan, Symbol::new(&env, "stake_unstaked"), matured_amount);
 
         // Track staked funds (#212): the matured amount is the delta
@@ -5987,6 +6004,17 @@ impl CraftNexusContract {
             .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
             .map(|stake: ArtisanStakeData| stake.amount)
             .unwrap_or(0)
+    }
+
+    /// Check if an artisan account is under-collateralized (active obligations exist while holding less than minimum required stake).
+    pub fn is_account_under_collateralized(env: Env, artisan: Address) -> bool {
+        let config = Self::get_platform_config_internal(&env);
+        if config.min_stake_required <= 0 {
+            return false;
+        }
+        let stake = Self::get_stake(env.clone(), artisan.clone());
+        let active = Self::has_active_escrows(env, artisan);
+        active && stake < config.min_stake_required
     }
 
     /// Admin sets the minimum stake required for artisans to create escrows.

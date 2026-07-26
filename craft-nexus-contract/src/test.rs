@@ -4649,3 +4649,103 @@ fn test_fund_audit_pagination_and_immutability() {
     assert_eq!(page_oob.len(), 0);
 }
 
+#[test]
+#[should_panic]
+fn test_stake_below_minimum_threshold_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    // Admin sets minimum stake required to 10_000_000
+    client.set_min_stake_required(&10_000_000).unwrap();
+
+    token_admin.mint(&seller, &20_000_000);
+    // Staking 5_000_000 when min required is 10_000_000 should panic
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+}
+
+#[test]
+#[should_panic]
+fn test_unstake_with_active_obligations_below_min_stake_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    client.set_min_stake_required(&10_000_000).unwrap();
+
+    token_admin.mint(&seller, &20_000_000);
+    token_admin.mint(&buyer, &20_000_000);
+
+    // Stake 15_000_000 in two deposits so partial unstaking is possible
+    client.stake_tokens(&seller, &token_id, &15_000_000);
+
+    // Create an active escrow (seller has active obligations)
+    client.create_escrow(&buyer, &seller, &token_id, &5_000_000, &1, &None);
+    assert!(client.has_active_escrows(&seller));
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
+    });
+
+    // Unstaking matured 15_000_000 while active escrow exists leaves 0 stake (< 10_000_000 min requirement)
+    client.unstake_tokens(&seller, &token_id);
+}
+
+#[test]
+fn test_partial_unstake_consistent_collateral_rules() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    client.set_min_stake_required(&10_000_000).unwrap();
+
+    token_admin.mint(&seller, &50_000_000);
+    token_admin.mint(&buyer, &50_000_000);
+
+    // Stake 25_000_000
+    client.stake_tokens(&seller, &token_id, &25_000_000);
+    assert_eq!(client.get_stake(&seller), 25_000_000);
+
+    // Advance time and stake another 10_000_000
+    env.ledger().with_mut(|li| {
+        li.timestamp += 100;
+    });
+    client.stake_tokens(&seller, &token_id, &10_000_000);
+    assert_eq!(client.get_stake(&seller), 35_000_000);
+
+    // Advance past first deposit's cooldown, but before second deposit's cooldown
+    env.ledger().with_mut(|li| {
+        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64;
+    });
+
+    // Unstake first deposit (25_000_000 matured). Remaining stake becomes 10_000_000 (which is >= min required 10_000_000)
+    client.unstake_tokens(&seller, &token_id);
+    assert_eq!(client.get_stake(&seller), 10_000_000);
+    assert_eq!(client.is_account_under_collateralized(&seller), false);
+}
+
+#[test]
+fn test_is_account_under_collateralized_detection() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&seller, &20_000_000);
+    token_admin.mint(&buyer, &20_000_000);
+
+    // Stake 5_000_000 (when min stake is 0)
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+
+    // Create an escrow
+    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
+
+    // Initially min stake is 0, so not under-collateralized
+    assert_eq!(client.is_account_under_collateralized(&seller), false);
+
+    // Admin raises min stake required to 10_000_000
+    client.set_min_stake_required(&10_000_000).unwrap();
+
+    // Now seller has active obligation but stake (5M) < min_stake_required (10M)
+    assert_eq!(client.is_account_under_collateralized(&seller), true);
+}
+
