@@ -162,6 +162,8 @@ pub enum Error {
     /// Dispute lifecycle action invalid in the current context: dispute already
     /// escalated, or a `parent_evidence_id` does not reference existing evidence
     InvalidDisputeAction = 50,
+    /// Persisted storage is on a legacy layout that must be migrated first.
+    StorageLayoutMismatch = 45,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -284,6 +286,12 @@ const DEFAULT_RATE_LIMIT_MAX_CALLS: u32 = 5;
 const MAX_PLATFORM_FEE_BPS: u32 = 1000; // 10% max
 const MAX_TOTAL_RELEASE_WINDOW: u32 = 2592000; // 30 days
 const CURRENT_ESCROW_VERSION: u32 = 4;
+/// Explicit storage layout version for persisted contract state.
+///
+/// New deployments initialize this to `CURRENT_STORAGE_LAYOUT_VERSION`; legacy
+/// deployments without the key must run `migrate_storage_layout` before any
+/// WASM upgrade can be executed.
+const CURRENT_STORAGE_LAYOUT_VERSION: u32 = 1;
 /// Maximum number of escrows per batch operation (Issue #111)
 // Conservative batch size to avoid exceeding instruction/read-write limits
 // observed on Soroban testnets. Reduced from 100 to 20 (Issue #198).
@@ -347,6 +355,8 @@ pub enum DataKey {
     ContractVersion,
     /// Platform configuration storage key
     PlatformConfig,
+    /// Explicit storage layout version for persisted state.
+    StorageLayoutVersion,
     /// Custom fee tier for an artisan (basis points)
     ArtisanFeeTier(Address),
     /// Staked token amount and asset for an artisan
@@ -2644,6 +2654,13 @@ impl CraftNexusContract {
             .set(&DataKey::ContractVersion, &1u32);
         Self::extend_persistent(&env, &DataKey::ContractVersion);
 
+        // Initialize storage layout version so future upgrades can validate the
+        // on-disk schema before applying new logic.
+        env.storage()
+            .persistent()
+            .set(&DataKey::StorageLayoutVersion, &CURRENT_STORAGE_LAYOUT_VERSION);
+        Self::extend_persistent(&env, &DataKey::StorageLayoutVersion);
+
         // Set the onboarding contract address to enable reputation tracking (optional)
         if let Some(ref addr) = onboarding_contract {
             env.storage()
@@ -4468,6 +4485,57 @@ impl CraftNexusContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Return the persisted storage layout version.
+    pub fn get_storage_layout_version(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StorageLayoutVersion)
+            .unwrap_or(0)
+    }
+
+    /// Migrate persisted storage to the current layout version.
+    ///
+    /// This is an explicit, admin-gated migration path for legacy deployments.
+    /// Existing state is preserved by running the existing lazy migration helpers
+    /// before recording the new layout version.
+    pub fn migrate_storage_layout(env: Env) -> u32 {
+        let admin = Self::get_admin(&env).unwrap_or_else(|_| {
+            env.panic_with_error(crate::Error::PlatformNotInitialized)
+        });
+        admin.require_auth();
+
+        let current_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StorageLayoutVersion)
+            .unwrap_or(0);
+        if current_version == CURRENT_STORAGE_LAYOUT_VERSION {
+            return 0;
+        }
+
+        Self::migrate_legacy_all_escrow_ids(&env);
+        Self::migrate_legacy_whitelisted_tokens(&env);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::StorageLayoutVersion, &CURRENT_STORAGE_LAYOUT_VERSION);
+        Self::extend_persistent(&env, &DataKey::StorageLayoutVersion);
+
+        1
+    }
+
+    fn ensure_storage_layout_compatible(env: &Env) -> Result<(), Error> {
+        let stored_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StorageLayoutVersion)
+            .unwrap_or(0);
+        if stored_version != CURRENT_STORAGE_LAYOUT_VERSION {
+            return Err(Error::StorageLayoutMismatch);
+        }
+        Ok(())
+    }
+
     /// Upgrade the contract's WASM code after the grace period has elapsed.
     ///
     /// The caller passes the `expected_wasm_hash` they think is pending; if it
@@ -4480,6 +4548,8 @@ impl CraftNexusContract {
     /// On success a new `UpgradeRecord` is appended to `UpgradeHistory`,
     /// `ContractVersion` is bumped, and the proposal is cleared atomically.
     pub fn execute_upgrade(env: Env, expected_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::ensure_storage_layout_compatible(&env)?;
+
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 
@@ -6373,7 +6443,7 @@ impl CraftNexusContract {
         }
 
         // Transfer from artisan to contract and record audit
-        let token_client = token::Client::new(&env, &token);
+        let _token_client = token::Client::new(&env, &token);
         Self::transfer_tokens_and_record_audit(&env, &token, &artisan, &env.current_contract_address(), amount, &artisan, Symbol::new(&env, "stake_deposit"), -amount);
 
         // Track staked funds (#212)
@@ -6393,6 +6463,11 @@ impl CraftNexusContract {
         } else {
             ArtisanStakeData { amount, token }
         };
+
+        let config = Self::get_platform_config_internal(&env);
+        if config.min_stake_required > 0 && new_stake.amount < config.min_stake_required {
+            env.panic_with_error(crate::Error::InsufficientStake);
+        }
 
         env.storage().persistent().set(&stake_key, &new_stake);
         Self::extend_persistent(&env, &stake_key);
@@ -6591,8 +6666,20 @@ impl CraftNexusContract {
             env.storage().persistent().remove(&count_key);
         }
 
-        // Update stake metadata
+        // Validate remaining collateral safety and active obligation rules
         let remaining_amount = current_stake.amount - matured_amount;
+        let config = Self::get_platform_config_internal(&env);
+        let active_obligations = Self::has_active_escrows(env.clone(), artisan.clone());
+        if config.min_stake_required > 0 {
+            if active_obligations && remaining_amount < config.min_stake_required {
+                env.panic_with_error(crate::Error::InsufficientStake);
+            }
+            if !active_obligations && remaining_amount > 0 && remaining_amount < config.min_stake_required {
+                env.panic_with_error(crate::Error::InsufficientStake);
+            }
+        }
+
+        // Update stake metadata
         if remaining_amount > 0 {
             let updated_stake = ArtisanStakeData {
                 amount: remaining_amount,
@@ -6614,7 +6701,7 @@ impl CraftNexusContract {
         }
 
         // Return matured tokens to artisan and record audit
-        let token_client = token::Client::new(&env, &token);
+        let _token_client = token::Client::new(&env, &token);
         Self::transfer_tokens_and_record_audit(&env, &token, &env.current_contract_address(), &artisan, matured_amount, &artisan, Symbol::new(&env, "stake_unstaked"), matured_amount);
 
         // Track staked funds (#212): the matured amount is the delta
@@ -6639,6 +6726,17 @@ impl CraftNexusContract {
             .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
             .map(|stake: ArtisanStakeData| stake.amount)
             .unwrap_or(0)
+    }
+
+    /// Check if an artisan account is under-collateralized (active obligations exist while holding less than minimum required stake).
+    pub fn is_account_under_collateralized(env: Env, artisan: Address) -> bool {
+        let config = Self::get_platform_config_internal(&env);
+        if config.min_stake_required <= 0 {
+            return false;
+        }
+        let stake = Self::get_stake(env.clone(), artisan.clone());
+        let active = Self::has_active_escrows(env, artisan);
+        active && stake < config.min_stake_required
     }
 
     /// Admin sets the minimum stake required for artisans to create escrows.
