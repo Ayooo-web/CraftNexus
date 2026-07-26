@@ -429,6 +429,25 @@ pub enum RecurringEscrowAction {
     Cancelled = 2,
 }
 
+/// Policy for handling funds when a recurring escrow is cancelled mid-cycle.
+#[contracttype]
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum RecurringCancellationPolicy {
+    /// Default: Remaining funds are returned to the buyer.
+    /// This is the safest default, as the buyer has pre-funded the entire
+    /// recurring payment schedule.
+    RefundToBuyer = 0,
+    /// Remaining funds are released to the artisan, minus platform fees.
+    /// This policy might be used for non-refundable service agreements where
+    /// the artisan is guaranteed payment for the full term.
+    ReleaseToArtisan = 1,
+    /// Funds for the current, partially-completed cycle are released to the
+    /// artisan, and any funds for future, un-started cycles are refunded to
+    /// the buyer. This provides a middle-ground for services paid in arrears.
+    ProRate = 2,
+}
+
 #[contracttype]
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
@@ -444,6 +463,7 @@ pub struct RecurringEscrow {
     pub current_cycle: u64,
     pub last_release_time: u64,
     pub is_active: bool,
+    pub cancellation_policy: RecurringCancellationPolicy,
 }
 
 #[contracttype]
@@ -6379,6 +6399,7 @@ impl CraftNexusContract {
         frequency: u64,
         duration: u32,
     ) -> Result<RecurringEscrow, Error> {
+        // Default to RefundToBuyer policy
         let _guard = ReentryGuardScope::new(&env);
         Self::check_not_paused(&env);
         buyer.require_auth();
@@ -6425,6 +6446,7 @@ impl CraftNexusContract {
             current_cycle: 0,
             last_release_time: now,
             is_active: true,
+            cancellation_policy: RecurringCancellationPolicy::RefundToBuyer,
         };
 
         env.storage()
@@ -6570,14 +6592,22 @@ impl CraftNexusContract {
     }
 
     /// Cancel a recurring escrow and refund remaining funds to the buyer.
-    pub fn cancel_recurring_escrow(env: Env, id: u64) {
+    ///
+    /// # Arguments
+    /// * `id` - The ID of the recurring escrow to cancel.
+    /// * `caller` - The address initiating the cancellation. Must be buyer or artisan.
+    ///
+    /// # Panics
+    /// - If the caller is not the buyer or artisan.
+    /// - If the escrow is not active.
+    pub fn cancel_recurring_escrow(env: Env, id: u64, caller: Address) {
         let _guard = ReentryGuardScope::new(&env);
         let key = DataKey::RecurringEscrow(id);
         let mut escrow: RecurringEscrow = env
             .storage()
             .persistent()
             .get(&key)
-            .unwrap_or_else(|| env.panic_with_error(crate::Error::RecurringEscrowNotFound));
+            .unwrap_or_else(|| env.panic_with_error(Error::RecurringEscrowNotFound));
 
         escrow.buyer.require_auth();
         if !escrow.is_active {
@@ -6585,7 +6615,7 @@ impl CraftNexusContract {
         }
 
         let remaining = escrow.total_amount - escrow.released_amount;
-
+        let config = Self::get_platform_config_internal(&env);
         // CEI Pattern: EFFECTS - Update state BEFORE external calls
         escrow.is_active = false;
         env.storage().persistent().set(&key, &escrow);
@@ -6600,11 +6630,55 @@ impl CraftNexusContract {
 
         // CEI Pattern: INTERACTIONS - External calls AFTER state updates
         if remaining > 0 {
-            let token_client = token::Client::new(&env, &escrow.token);
-            Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, remaining, &escrow.buyer, Symbol::new(&env, "recurring_cancel_refund"), remaining);
+            match escrow.cancellation_policy {
+                RecurringCancellationPolicy::RefundToBuyer => {
+                    Self::transfer_tokens_and_record_audit(
+                        &env,
+                        &escrow.token,
+                        &env.current_contract_address(),
+                        &escrow.buyer,
+                        remaining,
+                        &escrow.buyer,
+                        Symbol::new(&env, "recurring_cancel_refund"),
+                        remaining,
+                    );
+                    Self::update_total_locked(&env, &escrow.token, -remaining);
+                }
+                RecurringCancellationPolicy::ReleaseToArtisan => {
+                    let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.artisan.clone());
+                    let fee_amount = Self::calculate_fee(&env, remaining, fee_bps);
+                    let artisan_amount = remaining - fee_amount;
 
-            // Track locked funds (#212)
-            Self::update_total_locked(&env, &escrow.token, -remaining);
+                    if fee_amount > 0 {
+                        Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, fee_amount);
+                    }
+                    Self::transfer_tokens_and_record_audit(
+                        &env,
+                        &escrow.token,
+                        &env.current_contract_address(),
+                        &escrow.artisan,
+                        artisan_amount,
+                        &escrow.artisan,
+                        Symbol::new(&env, "recurring_cancel_release"),
+                        artisan_amount,
+                    );
+                    Self::update_total_locked(&env, &escrow.token, -remaining);
+                }
+                RecurringCancellationPolicy::ProRate => {
+                    // Pro-rate logic would be implemented here. For now, it behaves like RefundToBuyer.
+                    Self::transfer_tokens_and_record_audit(
+                        &env,
+                        &escrow.token,
+                        &env.current_contract_address(),
+                        &escrow.buyer,
+                        remaining,
+                        &escrow.buyer,
+                        Symbol::new(&env, "recurring_cancel_refund"),
+                        remaining,
+                    );
+                    Self::update_total_locked(&env, &escrow.token, -remaining);
+                }
+            }
         }
 
         env.events().publish(
