@@ -140,6 +140,10 @@ const BASE58_BTC_CHARSET: [bool; 256] = {
 const USERNAME_CHANGE_COOLDOWN: u64 = 30 * 24 * 60 * 60;
 /// Maximum verification history entries retained per user (#519).
 const MAX_VERIFICATION_HISTORY: u32 = 10;
+/// Default sliding window (seconds) for rate-limiting `onboard_user` retries (#943).
+const DEFAULT_RATE_LIMIT_WINDOW: u32 = 60 * 60;
+/// Default maximum `onboard_user` calls per account per `rate_limit_window` (#943).
+const DEFAULT_RATE_LIMIT_MAX_CALLS: u32 = 5;
 
 #[cfg(not(target_family = "wasm"))]
 #[path = "decimal_test_token.rs"]
@@ -197,6 +201,20 @@ pub enum DataKey {
     UsernameChangeFeeWallet,
     /// Timestamp of last username change per user - Issue #114
     LastUsernameChange(Address),
+    /// Sliding rate-limit window state for `onboard_user` retries, keyed by
+    /// the registering account (#943)
+    RateLimit(Address),
+}
+
+/// Fixed-window rate limit counter for a single account's `onboard_user`
+/// retries (#943). See `CraftNexusContract`'s identically-shaped
+/// `RateLimitState` for the sliding/fixed-window semantics.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct RateLimitState {
+    pub window_start: u64,
+    pub count: u32,
 }
 
 /// User roles in the CraftNexus platform.
@@ -619,6 +637,12 @@ pub struct OnboardingConfig {
     /// Address of the ESCROW_CONTRACT authorized to call `update_reputation` / `update_user_metrics`.
     /// If `None`, the `platform_admin` is used as fallback caller. (#63, #100)
     pub escrow_contract: Option<Address>,
+    /// Sliding window (seconds) used to rate-limit `onboard_user` retries per
+    /// account (default: 1 hour). `0` disables the limiter (#943).
+    pub rate_limit_window: u32,
+    /// Maximum `onboard_user` calls a single account may make within
+    /// `rate_limit_window` (default: 5) (#943).
+    pub rate_limit_max_calls: u32,
 }
 
 /// Errors returned by the onboarding contract.
@@ -661,6 +685,8 @@ pub enum Error {
     ActiveContractUnderflow = 15,
     /// The escrow contract is paused — onboarding is temporarily disabled
     ContractPaused = 16,
+    /// Caller has exceeded the configured rate limit for `onboard_user` retries (#943)
+    RateLimitExceeded = 17,
 }
 
 /// Cross-contract interface the onboarding contract uses to query the escrow
@@ -1566,6 +1592,24 @@ impl OnboardingContract {
             .unwrap_or_else(|| env.panic_with_error(Error::UserNotFound))
     }
 
+    /// Assert that `user` is onboarded and their profile is currently active.
+    ///
+    /// Panics with [`Error::UserNotFound`] when no profile exists, or with
+    /// [`Error::ProfileDeactivated`] when the profile's status is
+    /// [`ProfileStatus::Deactivated`]. Used by state-mutating endpoints that
+    /// must not operate on deactivated accounts (e.g. `update_user_role`,
+    /// `deactivate_profile`).
+    ///
+    /// # Returns
+    /// The loaded [`UserProfile`] so callers do not have to fetch it again.
+    fn assert_user_onboarded_and_active(env: &Env, user: Address) -> UserProfile {
+        let profile = Self::get_user_profile(env, user);
+        if profile.status == ProfileStatus::Deactivated {
+            env.panic_with_error(Error::ProfileDeactivated);
+        }
+        profile
+    }
+
     /// Extend the TTL of a persistent storage entry using standardized values.
     ///
     /// Soroban charges rent per ledger entry, so persistent state for an
@@ -1589,6 +1633,56 @@ impl OnboardingContract {
         env.storage()
             .persistent()
             .extend_ttl(key, READ_TTL_THRESHOLD, TTL_EXTENSION);
+    }
+
+    /// Enforce a per-account fixed-window rate limit on `onboard_user` (#943).
+    ///
+    /// Mirrors `CraftNexusContract::enforce_rate_limit`: counts calls in a
+    /// window of `config.rate_limit_window` seconds, resetting once the
+    /// window elapses. `rate_limit_window == 0` disables the limiter.
+    ///
+    /// Keyed by `config.platform_admin` (the required co-signer on every
+    /// `onboard_user` call) rather than the registering user. A single
+    /// address can only ever *successfully* onboard once (subsequent calls
+    /// hit `Error::AlreadyOnboarded`), and Soroban discards all storage
+    /// writes from a call that ultimately panics — so a per-user counter
+    /// could never observe more than one increment and would never trigger.
+    /// The admin, by contrast, co-signs a new (and generally successful)
+    /// onboarding for every distinct user, making it the account whose call
+    /// volume this limiter can meaningfully throttle.
+    fn enforce_rate_limit(
+        env: &Env,
+        account: &Address,
+        config: &OnboardingConfig,
+    ) -> Result<(), Error> {
+        if config.rate_limit_window == 0 {
+            return Ok(());
+        }
+
+        let key = DataKey::RateLimit(account.clone());
+        let now = env.ledger().timestamp();
+        let mut state: RateLimitState =
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(RateLimitState {
+                    window_start: now,
+                    count: 0,
+                });
+
+        if now >= state.window_start + config.rate_limit_window as u64 {
+            state.window_start = now;
+            state.count = 0;
+        }
+
+        if state.count >= config.rate_limit_max_calls {
+            return Err(Error::RateLimitExceeded);
+        }
+
+        state.count += 1;
+        env.storage().persistent().set(&key, &state);
+        Self::extend_persistent(env, &key);
+        Ok(())
     }
 
     /// Load a persistent entry and refresh its TTL in a single storage pass
@@ -1766,6 +1860,8 @@ impl OnboardingContract {
             min_escrow_count_for_verify: 5,
             min_volume_for_verify: 10_000_000_000, // 1000 USDC at 7 decimals
             escrow_contract: None,
+            rate_limit_window: DEFAULT_RATE_LIMIT_WINDOW,
+            rate_limit_max_calls: DEFAULT_RATE_LIMIT_MAX_CALLS,
         };
 
         // Store the configuration
@@ -1918,6 +2014,13 @@ impl OnboardingContract {
                 Self::emit_onboard_failed_and_panic(&env, &user, Error::NotInitialized)
             });
         Self::extend_persistent(&env, &DataKey::Config);
+
+        // [SECURITY] Issue #943: Throttle the volume of onboard_user calls the
+        // platform admin co-signs within a sliding window, preventing a
+        // compromised or scripted admin key from mass-onboarding accounts.
+        if let Err(e) = Self::enforce_rate_limit(&env, &config.platform_admin, &config) {
+            Self::emit_onboard_failed_and_panic(&env, &user, e);
+        }
 
         // [SECURITY] Endpoint #93: Only verified platform roles may approve new user
         // registrations. The platform admin must co-sign every onboarding transaction
@@ -2427,8 +2530,8 @@ impl OnboardingContract {
             _ => {} // Proceed for Buyer, Artisan, Moderator
         }
 
-        // Fetch and validate existing profile before mutation
-        let mut profile = Self::get_user_profile(&env, user.clone());
+        // Fetch and validate existing profile; reject deactivated accounts before mutation
+        let mut profile = Self::assert_user_onboarded_and_active(&env, user.clone());
 
         // [SECURITY] Prevent unnecessary state mutations and replay attacks
         // by recording state transition audit trail for forensic analysis
@@ -2484,11 +2587,7 @@ impl OnboardingContract {
     /// - User is the admin
     pub fn deactivate_profile(env: Env, user: Address) {
         user.require_auth();
-        let mut profile = Self::get_user_profile(&env, user.clone());
-
-        if profile.status == ProfileStatus::Deactivated {
-            env.panic_with_error(Error::ProfileDeactivated);
-        }
+        let mut profile = Self::assert_user_onboarded_and_active(&env, user.clone());
 
         let username_string = String::from_str(&env, profile.username.to_string().as_ref());
         let normalized = normalize_username(&env, &username_string);
@@ -2862,6 +2961,27 @@ impl OnboardingContract {
 
         config.platform_admin.require_auth();
         config.auto_verify_enabled = enabled;
+
+        env.storage().persistent().set(&DataKey::Config, &config);
+        Self::extend_persistent(&env, &DataKey::Config);
+    }
+
+    /// Admin sets the `onboard_user` rate limit (#943).
+    ///
+    /// `window_seconds` is the sliding window length; `max_calls` is the
+    /// maximum number of `onboard_user` attempts a single account may make
+    /// within that window. `window_seconds == 0` disables rate limiting.
+    pub fn set_rate_limit_config(env: Env, window_seconds: u32, max_calls: u32) {
+        let mut config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        config.platform_admin.require_auth();
+        config.rate_limit_window = window_seconds;
+        config.rate_limit_max_calls = max_calls;
 
         env.storage().persistent().set(&DataKey::Config, &config);
         Self::extend_persistent(&env, &DataKey::Config);
