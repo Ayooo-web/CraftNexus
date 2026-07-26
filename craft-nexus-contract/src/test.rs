@@ -102,10 +102,6 @@ fn test_create_escrow_success() {
     assert!(!events.is_empty(), "No events emitted");
     let last_event = events.last().unwrap();
     assert_eq!(last_event.0, client.address);
-    let last_event = events.last();
-    let last_event = last_event.unwrap();
-    assert_eq!(last_event.0, client.address);
-    assert_eq!(last_event.0, client.address);
     // Topics: ["escrow_created", escrow_id]
     assert_eq!(
         last_event.1,
