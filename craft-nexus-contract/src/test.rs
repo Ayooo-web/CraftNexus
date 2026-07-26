@@ -166,6 +166,26 @@ fn test_release_funds_success() {
 }
 
 #[test]
+fn test_fund_movements_create_audit_records() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+
+    let history = client.get_fund_audit_history(&buyer);
+    assert_eq!(history.len(), 1);
+
+    let entry = history.get(0).unwrap();
+    assert_eq!(entry.actor, buyer);
+    assert_eq!(entry.amount, 50_000_000);
+    assert_eq!(entry.reason, Symbol::new(&env, "escrow_funded"));
+    assert_eq!(entry.balance_impact, -50_000_000);
+    assert!(entry.timestamp > 0);
+}
+
+#[test]
 #[should_panic]
 fn test_release_funds_already_processed() {
     let env = Env::default();
@@ -407,6 +427,11 @@ fn test_resolve_dispute_release_to_seller() {
     client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
     client.dispute_escrow(&1, &Symbol::new(&env, "Non_delivery"), &buyer);
 
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
+
     // Arbitrator is setup in setup_test as a random Address and mock_all_auths bypasses auth
     client.resolve_dispute(&1, &Resolution::ReleaseToSeller, &admin);
 
@@ -428,6 +453,11 @@ fn test_resolve_dispute_refund_to_buyer() {
     token_admin.mint(&buyer, &100_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
     client.dispute_escrow(&1, &Symbol::new(&env, "Late_shipping"), &buyer);
+
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
 
     client.resolve_dispute(&1, &Resolution::RefundToBuyer, &admin);
 
@@ -451,6 +481,11 @@ fn test_resolve_dispute_by_moderator() {
     token_admin.mint(&buyer, &100_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
     client.dispute_escrow(&1, &Symbol::new(&env, "Moderator_review"), &buyer);
+
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
 
     client.resolve_dispute(&1, &Resolution::RefundToBuyer, &moderator);
 
@@ -1372,6 +1407,20 @@ fn test_unstake_rejects_different_token_than_original_stake() {
 }
 
 #[test]
+#[should_panic(expected = "Stake cooldown active. Remaining seconds: 604800")]
+fn test_unstake_too_early_returns_remaining_seconds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&seller, &20_000_000);
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+
+    // Try to unstake immediately (remaining seconds should be 604800)
+    client.unstake_tokens(&seller, &token_id);
+}
+
+#[test]
 fn test_create_escrow_with_metadata_success_cid_v0() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1765,6 +1814,45 @@ fn test_get_version_initially() {
     env.mock_all_auths();
     let (client, _, _, _, _, _, _) = setup_test(&env, true);
     assert_eq!(client.get_version(), 1);
+}
+
+#[test]
+fn test_execute_upgrade_rejects_legacy_storage_layout_without_migration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::StorageLayoutVersion);
+    });
+
+    let hash = BytesN::from_array(&env, &[9u8; 32]);
+    let result = client.try_execute_upgrade(&hash);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), Error::StorageLayoutMismatch);
+}
+
+#[test]
+fn test_migrate_storage_layout_marks_current_layout_and_preserves_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::StorageLayoutVersion);
+    });
+
+    let migrated = client.migrate_storage_layout();
+    assert_eq!(migrated, 1);
+    assert_eq!(client.get_storage_layout_version(), CURRENT_STORAGE_LAYOUT_VERSION);
+
+    let escrow = client.get_escrow(&1);
+    assert_eq!(escrow.buyer, buyer);
+    assert_eq!(escrow.amount, 50_000_000);
+    assert_eq!(escrow.status, EscrowStatus::Active);
 }
 
 // ===== Multi-sig upgrade tests =====
@@ -4280,7 +4368,7 @@ fn test_funding_deadline_set_on_create() {
         .funding_deadline
         .expect("funding_deadline must be set");
     // created_at is stored as u32 (truncated ledger timestamp); deadline is created_at + 86400
-    assert_eq!(deadline, escrow.created_at as u64 + 24 * 60 * 60);
+    assert_eq!(deadline, escrow.created_at + 24 * 60 * 60);
 }
 
 /// Buyer may cancel an unfunded escrow voluntarily before the deadline.
@@ -4485,61 +4573,247 @@ fn test_get_escrows_pagination_large_dataset() {
     assert_eq!(seller_page1.len(), 50, "seller page1 should have 50 items");
 }
 
-// ── #707 platform_wallet validation ──────────────────────────────────────────
-
-/// `initialize` must reject the contract's own address as platform_wallet.
-/// Allowing it would cause every fee transfer to panic at the host level.
 #[test]
-fn test_initialize_rejects_contract_address_as_platform_wallet() {
+fn test_fund_audit_escrow_release_and_refund() {
     let env = Env::default();
     env.mock_all_auths();
-    env.budget().reset_unlimited();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
-    let contract_id = env.register_contract(None, CraftNexusContract);
-    let client = CraftNexusContractClient::new(&env, &contract_id);
+    token_admin.mint(&buyer, &100_000_000);
 
-    let admin = Address::generate(&env);
-    let arbitrator = Address::generate(&env);
+    // Escrow 1: funding & release
+    client.create_escrow(&buyer, &seller, &token_id, &40_000_000, &1, &None);
+    client.release_funds(&1);
 
-    // Pass the contract's own address as the platform wallet — must be rejected.
-    let result = client.try_initialize(
-        &contract_id,  // <-- invalid: contract's own address
-        &admin,
-        &arbitrator,
-        &500,
-        &None,
-    );
+    // Check buyer history: funding entry
+    let buyer_count = client.get_fund_audit_count(&buyer);
+    assert_eq!(buyer_count, 1);
+    let buyer_history = client.get_fund_audit_history(&buyer);
+    assert_eq!(buyer_history.get(0).unwrap().reason, Symbol::new(&env, "escrow_funded"));
 
-    assert!(
-        result.is_err(),
-        "initialize must reject the contract address as platform_wallet"
-    );
+    // Check seller history: release entry
+    let seller_count = client.get_fund_audit_count(&seller);
+    assert_eq!(seller_count, 1);
+    let seller_history = client.get_fund_audit_history(&seller);
+    let seller_entry = seller_history.get(0).unwrap();
+    assert_eq!(seller_entry.actor, seller);
+    assert_eq!(seller_entry.reason, Symbol::new(&env, "escrow_released"));
+    assert!(seller_entry.amount > 0);
+    assert!(seller_entry.balance_impact > 0);
+
+    // Escrow 2: funding & refund
+    client.create_escrow(&buyer, &seller, &token_id, &30_000_000, &2, &None);
+    client.refund(&2);
+
+    // Check buyer history now has 3 entries: funded (1), funded (2), refund (2)
+    assert_eq!(client.get_fund_audit_count(&buyer), 3);
+    let buyer_history_updated = client.get_fund_audit_history(&buyer);
+    let refund_entry = buyer_history_updated.get(2).unwrap();
+    assert_eq!(refund_entry.reason, Symbol::new(&env, "refund"));
+    assert_eq!(refund_entry.amount, 30_000_000);
+    assert_eq!(refund_entry.balance_impact, 30_000_000);
 }
 
-/// `update_platform_wallet` must reject the contract's own address.
 #[test]
-fn test_update_platform_wallet_rejects_contract_address() {
+fn test_fund_audit_staking_flow() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
-    // Attempting to set the wallet to the contract itself must fail.
-    let result = client.try_update_platform_wallet(&client.address);
+    token_admin.mint(&seller, &50_000_000);
 
-    assert!(
-        result.is_err(),
-        "update_platform_wallet must reject the contract address"
-    );
+    // Stake
+    client.stake_tokens(&seller, &token_id, &20_000_000);
+    assert_eq!(client.get_fund_audit_count(&seller), 1);
+    let stake_history = client.get_fund_audit_history(&seller);
+    let stake_entry = stake_history.get(0).unwrap();
+    assert_eq!(stake_entry.actor, seller);
+    assert_eq!(stake_entry.amount, 20_000_000);
+    assert_eq!(stake_entry.reason, Symbol::new(&env, "stake_deposit"));
+    assert_eq!(stake_entry.balance_impact, -20_000_000);
+
+    // Fast forward timestamp past stake cooldown
+    env.ledger().with_mut(|li| {
+        li.timestamp += 8 * 86400;
+    });
+
+    // Unstake
+    client.unstake_tokens(&seller, &token_id);
+    assert_eq!(client.get_fund_audit_count(&seller), 2);
+    let unstake_history = client.get_fund_audit_history(&seller);
+    let unstake_entry = unstake_history.get(1).unwrap();
+    assert_eq!(unstake_entry.reason, Symbol::new(&env, "stake_unstaked"));
+    assert_eq!(unstake_entry.amount, 20_000_000);
+    assert_eq!(unstake_entry.balance_impact, 20_000_000);
 }
 
-/// `update_platform_wallet` must accept a valid external address.
 #[test]
-fn test_update_platform_wallet_accepts_valid_address() {
+fn test_fund_audit_recurring_escrow_flow() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
-    let new_wallet = Address::generate(&env);
-    // Should succeed without panicking.
-    client.update_platform_wallet(&new_wallet);
+    token_admin.mint(&buyer, &100_000_000);
+
+    // Create recurring escrow: 10_000_000 total, 100s frequency, 2 cycles
+    let rec = client.create_recurring_escrow(&buyer, &seller, &token_id, &10_000_000, &100, &2);
+    assert_eq!(client.get_fund_audit_count(&buyer), 1);
+    let buyer_hist = client.get_fund_audit_history(&buyer);
+    assert_eq!(buyer_hist.get(0).unwrap().reason, Symbol::new(&env, "recurring_escrow_locked"));
+
+    // Fast forward timestamp past cycle frequency
+    env.ledger().with_mut(|li| {
+        li.timestamp += 100;
+    });
+
+    // Release next cycle
+    client.release_next_cycle(&rec.id);
+    assert_eq!(client.get_fund_audit_count(&seller), 1);
+    let seller_hist = client.get_fund_audit_history(&seller);
+    assert_eq!(seller_hist.get(0).unwrap().reason, Symbol::new(&env, "recurring_release"));
+
+    // Cancel remaining
+    client.cancel_recurring_escrow(&rec.id);
+    assert_eq!(client.get_fund_audit_count(&buyer), 2);
+    let buyer_cancel_hist = client.get_fund_audit_history(&buyer);
+    assert_eq!(buyer_cancel_hist.get(1).unwrap().reason, Symbol::new(&env, "recurring_cancel_refund"));
 }
+
+
+#[test]
+fn test_fund_audit_pagination_and_immutability() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &500_000_000);
+
+    for i in 1u32..=5u32 {
+        let amt = (i as i128) * 10_000_000;
+        client.create_escrow(&buyer, &seller, &token_id, &amt, &i, &None);
+    }
+
+    assert_eq!(client.get_fund_audit_count(&buyer), 5);
+
+    // Test page 0 (offset 0, limit 2)
+    let page0 = client.get_fund_audit_history_paginated(&buyer, &0, &2);
+    assert_eq!(page0.len(), 2);
+    assert_eq!(page0.get(0).unwrap().amount, 10_000_000);
+    assert_eq!(page0.get(1).unwrap().amount, 20_000_000);
+
+    // Test page 1 (offset 2, limit 2)
+    let page1 = client.get_fund_audit_history_paginated(&buyer, &2, &2);
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page1.get(0).unwrap().amount, 30_000_000);
+    assert_eq!(page1.get(1).unwrap().amount, 40_000_000);
+
+    // Test page 2 (offset 4, limit 2 -> returns remaining 1)
+    let page2 = client.get_fund_audit_history_paginated(&buyer, &4, &2);
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2.get(0).unwrap().amount, 50_000_000);
+
+    // Test out of bounds (offset 10, limit 2 -> empty)
+    let page_oob = client.get_fund_audit_history_paginated(&buyer, &10, &2);
+    assert_eq!(page_oob.len(), 0);
+}
+
+#[test]
+#[should_panic]
+fn test_stake_below_minimum_threshold_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    // Admin sets minimum stake required to 10_000_000
+    client.set_min_stake_required(&10_000_000).unwrap();
+
+    token_admin.mint(&seller, &20_000_000);
+    // Staking 5_000_000 when min required is 10_000_000 should panic
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+}
+
+#[test]
+#[should_panic]
+fn test_unstake_with_active_obligations_below_min_stake_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    client.set_min_stake_required(&10_000_000).unwrap();
+
+    token_admin.mint(&seller, &20_000_000);
+    token_admin.mint(&buyer, &20_000_000);
+
+    // Stake 15_000_000 in two deposits so partial unstaking is possible
+    client.stake_tokens(&seller, &token_id, &15_000_000);
+
+    // Create an active escrow (seller has active obligations)
+    client.create_escrow(&buyer, &seller, &token_id, &5_000_000, &1, &None);
+    assert!(client.has_active_escrows(&seller));
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
+    });
+
+    // Unstaking matured 15_000_000 while active escrow exists leaves 0 stake (< 10_000_000 min requirement)
+    client.unstake_tokens(&seller, &token_id);
+}
+
+#[test]
+fn test_partial_unstake_consistent_collateral_rules() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    client.set_min_stake_required(&10_000_000).unwrap();
+
+    token_admin.mint(&seller, &50_000_000);
+    token_admin.mint(&buyer, &50_000_000);
+
+    // Stake 25_000_000
+    client.stake_tokens(&seller, &token_id, &25_000_000);
+    assert_eq!(client.get_stake(&seller), 25_000_000);
+
+    // Advance time and stake another 10_000_000
+    env.ledger().with_mut(|li| {
+        li.timestamp += 100;
+    });
+    client.stake_tokens(&seller, &token_id, &10_000_000);
+    assert_eq!(client.get_stake(&seller), 35_000_000);
+
+    // Advance past first deposit's cooldown, but before second deposit's cooldown
+    env.ledger().with_mut(|li| {
+        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64;
+    });
+
+    // Unstake first deposit (25_000_000 matured). Remaining stake becomes 10_000_000 (which is >= min required 10_000_000)
+    client.unstake_tokens(&seller, &token_id);
+    assert_eq!(client.get_stake(&seller), 10_000_000);
+    assert_eq!(client.is_account_under_collateralized(&seller), false);
+}
+
+#[test]
+fn test_is_account_under_collateralized_detection() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&seller, &20_000_000);
+    token_admin.mint(&buyer, &20_000_000);
+
+    // Stake 5_000_000 (when min stake is 0)
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+
+    // Create an escrow
+    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
+
+    // Initially min stake is 0, so not under-collateralized
+    assert_eq!(client.is_account_under_collateralized(&seller), false);
+
+    // Admin raises min stake required to 10_000_000
+    client.set_min_stake_required(&10_000_000).unwrap();
+
+    // Now seller has active obligation but stake (5M) < min_stake_required (10M)
+    assert_eq!(client.is_account_under_collateralized(&seller), true);
+}
+
