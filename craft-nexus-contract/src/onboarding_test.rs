@@ -2656,7 +2656,7 @@ fn test_get_verification_queue_extends_ttl_for_every_slot() {
             .filter(|slot| {
                 env.storage()
                     .persistent()
-                    .has(&DataKey::VerificationQueueIndex(*slot))
+                    .has(&DataKey::VerifQueueIdx(*slot))
             })
             .count()
     });
@@ -2667,7 +2667,7 @@ fn test_get_verification_queue_extends_ttl_for_every_slot() {
 
     env.as_contract(&client.address, || {
         for slot in 0..users.len() as u64 {
-            let key = DataKey::VerificationQueueIndex(slot);
+            let key = DataKey::VerifQueueIdx(slot);
             assert!(
                 env.storage().persistent().has(&key),
                 "queue slot {slot} should still be live"
@@ -2704,7 +2704,7 @@ fn test_read_paths_refresh_ttl_on_touched_entries() {
     env.as_contract(&client.address, || {
         for key in [
             DataKey::UserProfile(user.clone()),
-            DataKey::UsernameChangeFee,
+            DataKey::UsernameFee,
         ] {
             assert!(env.storage().persistent().has(&key));
             assert!(
@@ -2740,9 +2740,9 @@ fn test_read_helpers_do_not_create_absent_entries() {
     env.as_contract(&client.address, || {
         for key in [
             DataKey::UserMetrics(user.clone()),
-            DataKey::UsernameChangeFee,
-            DataKey::ActiveContractCount(user.clone()),
-            DataKey::UsernameChangeFeeToken,
+            DataKey::UsernameFee,
+            DataKey::ActiveCount(user.clone()),
+            DataKey::UsernameFeeToken,
             DataKey::UserPortfolio(user.clone()),
         ] {
             assert!(

@@ -511,10 +511,10 @@ fn test_recover_admin_with_zero_window_fails() {
             .set(&DataKey::FallbackAdmin, &admin);
         env.storage()
             .persistent()
-            .set(&DataKey::AdminRecoveryTime, &current_time);
+            .set(&DataKey::AdminRecovTime, &current_time);
         env.storage()
             .persistent()
-            .set(&DataKey::AdminRecoveryDelay, &0u64);
+            .set(&DataKey::AdminRecovDelay, &0u64);
     });
 
     let recovered_admin = Address::generate(&env);
@@ -2957,7 +2957,7 @@ fn test_whitelist_stores_tokens_as_individual_keys() {
     assert!(env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .has(&DataKey::WhitelistedTokenIndexed(token_id.clone()))
+            .has(&DataKey::TokenAllowed(token_id.clone()))
     }));
     assert!(env.as_contract(&client.address, || {
         !env.storage().persistent().has(&DataKey::WhitelistedTokens)
@@ -2965,7 +2965,7 @@ fn test_whitelist_stores_tokens_as_individual_keys() {
     let count: u32 = env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .get(&DataKey::WhitelistedTokenCount)
+            .get(&DataKey::TokenCount)
             .unwrap_or(0u32)
     });
     assert_eq!(count, 1);
@@ -3102,7 +3102,7 @@ fn test_migrate_fee_token_configs_migrates_twenty_tokens_and_emits_summary() {
     env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .set(&DataKey::FeeTokenIndex, &fee_tokens);
+            .set(&DataKey::FeeIndex, &fee_tokens);
     });
 
     let migrated = client.migrate_fee_token_configs();
@@ -3161,13 +3161,13 @@ fn test_migrate_fee_token_configs_is_idempotent_and_preserves_existing_configs()
     env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .set(&DataKey::FeeTokenIndex, &fee_tokens);
+            .set(&DataKey::FeeIndex, &fee_tokens);
 
         let preset_one = fee_tokens.get(3).unwrap();
         let preset_two = fee_tokens.get(11).unwrap();
 
         env.storage().persistent().set(
-            &DataKey::FeeTokenConfig(preset_one.clone()),
+            &DataKey::FeeConfig(preset_one.clone()),
             &FeeTokenInfo {
                 active: false,
                 custom_fee_bps: Some(250),
@@ -3175,7 +3175,7 @@ fn test_migrate_fee_token_configs_is_idempotent_and_preserves_existing_configs()
             },
         );
         env.storage().persistent().set(
-            &DataKey::FeeTokenConfig(preset_two.clone()),
+            &DataKey::FeeConfig(preset_two.clone()),
             &FeeTokenInfo {
                 active: true,
                 custom_fee_bps: Some(900),
@@ -3750,7 +3750,7 @@ fn test_get_escrow_count_tracks_100_global_indices() {
     assert_eq!(stored_count, 100);
 
     for index in 0u32..100 {
-        let index_key = DataKey::GlobalEscrowIdIndexed(index);
+        let index_key = DataKey::EscrowIndex(index);
         let stored_id: u32 = env.as_contract(&client.address, || {
             env.storage().persistent().get(&index_key).unwrap()
         });
@@ -3911,7 +3911,7 @@ fn test_legacy_all_escrow_ids_migrates_on_get_escrow_count() {
     assert!(!has_legacy);
 
     for (index, expected_id) in [11u32, 22, 33, 44].into_iter().enumerate() {
-        let index_key = DataKey::GlobalEscrowIdIndexed(index as u32);
+        let index_key = DataKey::EscrowIndex(index as u32);
         let stored_id: u32 = env.as_contract(&client.address, || {
             env.storage().persistent().get(&index_key).unwrap()
         });
@@ -3982,7 +3982,7 @@ fn test_legacy_all_escrow_ids_migration_is_idempotent_after_first_read() {
     assert!(!has_legacy);
 
     for (index, expected_id) in [5u32, 15, 25].into_iter().enumerate() {
-        let index_key = DataKey::GlobalEscrowIdIndexed(index as u32);
+        let index_key = DataKey::EscrowIndex(index as u32);
         let stored_id: u32 = env.as_contract(&client.address, || {
             env.storage().persistent().get(&index_key).unwrap()
         });
@@ -3998,9 +3998,9 @@ fn test_legacy_all_escrow_ids_migration_preserves_existing_indexed_entries() {
 
     let legacy_key = DataKey::AllEscrowIds;
     let count_key = DataKey::EscrowCount;
-    let existing_index_key = DataKey::GlobalEscrowIdIndexed(0);
-    let missing_index_key = DataKey::GlobalEscrowIdIndexed(1);
-    let tail_index_key = DataKey::GlobalEscrowIdIndexed(2);
+    let existing_index_key = DataKey::EscrowIndex(0);
+    let missing_index_key = DataKey::EscrowIndex(1);
+    let tail_index_key = DataKey::EscrowIndex(2);
     let mut legacy_ids = soroban_sdk::Vec::new(&env);
     for order_id in [10u32, 20, 30] {
         legacy_ids.push_back(order_id);
