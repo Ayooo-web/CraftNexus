@@ -503,7 +503,7 @@ pub struct RecurringEscrow {
     pub frequency: u64,
     pub duration: u32,
     pub current_cycle: u64,
-    pub last_release_time: u64,
+    pub last_release_time: u32,
     pub is_active: bool,
 }
 
@@ -516,7 +516,7 @@ pub struct RecurringEscrowEvent {
     pub buyer: Address,
     pub artisan: Address,
     pub amount: i128,
-    pub timestamp: u64,
+    pub timestamp: u32,
 }
 
 #[contracttype]
@@ -563,12 +563,12 @@ pub struct Escrow {
     pub ipfs_hash: Option<String>,
     pub metadata_hash: Option<Bytes>,
     pub dispute_reason: Option<Symbol>,
-    pub dispute_initiated_at: Option<u64>,
+    pub dispute_initiated_at: Option<u32>,
     pub funded: bool,
     /// Ledger timestamp after which any party (or admin) may cancel this escrow
     /// if it has not yet been funded. Set to created_at + UNFUNDED_CANCEL_TIMEOUT
     /// for unfunded escrows; None for escrows that were funded at creation (#656).
-    pub funding_deadline: Option<u64>,
+    pub funding_deadline: Option<u32>,
 }
 
 #[contracttype]
@@ -586,7 +586,7 @@ struct LegacyEscrow {
     pub ipfs_hash: Option<String>,
     pub metadata_hash: Option<Bytes>,
     pub dispute_reason: Option<String>,
-    pub dispute_initiated_at: Option<u64>,
+    pub dispute_initiated_at: Option<u32>,
 }
 
 #[contracttype]
@@ -605,7 +605,7 @@ struct EscrowWithoutBatch {
     pub ipfs_hash: Option<String>,
     pub metadata_hash: Option<Bytes>,
     pub dispute_reason: Option<String>,
-    pub dispute_initiated_at: Option<u64>,
+    pub dispute_initiated_at: Option<u32>,
 }
 
 #[contracttype]
@@ -3150,7 +3150,7 @@ impl CraftNexusContract {
         Self::validate_optional_metadata_hash(&env, &metadata_hash);
 
         // Compute the deadline after which any party may cancel the unfunded stub (#656).
-        let funding_deadline = created_at_u64 + UNFUNDED_CANCEL_TIMEOUT;
+        let funding_deadline = (created_at_u64 + UNFUNDED_CANCEL_TIMEOUT) as u32;
 
         let escrow = Escrow {
             version: CURRENT_ESCROW_VERSION,
@@ -3284,6 +3284,7 @@ impl CraftNexusContract {
         // created before this field was added.
         let deadline = escrow
             .funding_deadline
+            .map(|d| d as u64)
             .unwrap_or((escrow.created_at as u64) + UNFUNDED_CANCEL_TIMEOUT);
 
         if current_time >= deadline {
@@ -3363,6 +3364,7 @@ impl CraftNexusContract {
             // Skip escrows that haven't yet reached their funding deadline
             let deadline = escrow
                 .funding_deadline
+                .map(|d| d as u64)
                 .unwrap_or((escrow.created_at as u64) + UNFUNDED_CANCEL_TIMEOUT);
             if current_time < deadline {
                 continue;
@@ -5133,7 +5135,7 @@ impl CraftNexusContract {
 
         escrow.status = EscrowStatus::Disputed;
         escrow.dispute_reason = Some(dispute_reason); // Assign Symbol
-        escrow.dispute_initiated_at = Some(env.ledger().timestamp());
+        escrow.dispute_initiated_at = Some(env.ledger().timestamp() as u32);
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
 
         Self::emit_escrow_created(
@@ -6077,7 +6079,7 @@ impl CraftNexusContract {
         let current_time = env.ledger().timestamp();
 
         let config = Self::get_platform_config_internal(&env);
-        if initiated_at + config.max_dispute_duration as u64 > current_time {
+        if (initiated_at as u64) + config.max_dispute_duration as u64 > current_time {
             return Err(Error::DisputeExpired);
         }
 
@@ -7208,7 +7210,7 @@ impl CraftNexusContract {
             frequency,
             duration,
             current_cycle: 0,
-            last_release_time: now,
+            last_release_time: now as u32,
             is_active: true,
         };
 
@@ -7239,7 +7241,7 @@ impl CraftNexusContract {
                 buyer,
                 artisan,
                 amount: total_amount,
-                timestamp: now,
+                timestamp: now as u32,
             },
         );
 
@@ -7264,7 +7266,7 @@ impl CraftNexusContract {
         }
 
         let now = env.ledger().timestamp();
-        if now < escrow.last_release_time + escrow.frequency {
+        if now < (escrow.last_release_time as u64) + escrow.frequency {
             env.panic_with_error(crate::Error::CycleNotReady);
         }
 
@@ -7294,7 +7296,7 @@ impl CraftNexusContract {
         // Update escrow state
         escrow.released_amount += cycle_amount;
         escrow.current_cycle += 1;
-        escrow.last_release_time = now;
+        escrow.last_release_time = now as u32;
 
         let became_inactive = escrow.current_cycle == escrow.duration as u64;
         if became_inactive {
@@ -7320,7 +7322,7 @@ impl CraftNexusContract {
                 buyer: escrow.buyer.clone(),
                 artisan: escrow.artisan.clone(),
                 amount: cycle_amount,
-                timestamp: now,
+                timestamp: now as u32,
             },
         );
 
@@ -7400,7 +7402,7 @@ impl CraftNexusContract {
                 buyer: escrow.buyer.clone(),
                 artisan: escrow.artisan.clone(),
                 amount: remaining,
-                timestamp: env.ledger().timestamp(),
+                timestamp: env.ledger().timestamp() as u32,
             },
         );
     }
