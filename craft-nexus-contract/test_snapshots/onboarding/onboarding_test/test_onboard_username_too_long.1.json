@@ -125,6 +125,22 @@
                     },
                     {
                       "key": {
+                        "symbol": "rate_limit_max_calls"
+                      },
+                      "val": {
+                        "u32": 5
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "rate_limit_window"
+                      },
+                      "val": {
+                        "u32": 3600
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "require_username"
                       },
                       "val": {
@@ -494,6 +510,22 @@
                 },
                 {
                   "key": {
+                    "symbol": "rate_limit_max_calls"
+                  },
+                  "val": {
+                    "u32": 5
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "rate_limit_window"
+                  },
+                  "val": {
+                    "u32": 3600
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "require_username"
                   },
                   "val": {
@@ -558,7 +590,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'String::copy_into_slice with mismatched slice length' from contract function 'Symbol(obj#89)'"
+                  "string": "caught panic 'String::copy_into_slice with mismatched slice length' from contract function 'Symbol(obj#97)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"

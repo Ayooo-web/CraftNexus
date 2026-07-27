@@ -102,10 +102,6 @@ fn test_create_escrow_success() {
     assert!(!events.is_empty(), "No events emitted");
     let last_event = events.last().unwrap();
     assert_eq!(last_event.0, client.address);
-    let last_event = events.last();
-    let last_event = last_event.unwrap();
-    assert_eq!(last_event.0, client.address);
-    assert_eq!(last_event.0, client.address);
     // Topics: ["escrow_created", escrow_id]
     assert_eq!(
         last_event.1,
@@ -163,6 +159,26 @@ fn test_release_funds_success() {
     assert_eq!(client.get_total_fees_collected(), 2_500_000);
 
     // Event verified by balance/status assertions above.
+}
+
+#[test]
+fn test_fund_movements_create_audit_records() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+
+    let history = client.get_fund_audit_history(&buyer);
+    assert_eq!(history.len(), 1);
+
+    let entry = history.get(0).unwrap();
+    assert_eq!(entry.actor, buyer);
+    assert_eq!(entry.amount, 50_000_000);
+    assert_eq!(entry.reason, Symbol::new(&env, "escrow_funded"));
+    assert_eq!(entry.balance_impact, -50_000_000);
+    assert!(entry.timestamp > 0);
 }
 
 #[test]
@@ -407,6 +423,11 @@ fn test_resolve_dispute_release_to_seller() {
     client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
     client.dispute_escrow(&1, &Symbol::new(&env, "Non_delivery"), &buyer);
 
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
+
     // Arbitrator is setup in setup_test as a random Address and mock_all_auths bypasses auth
     client.resolve_dispute(&1, &Resolution::ReleaseToSeller, &admin);
 
@@ -428,6 +449,11 @@ fn test_resolve_dispute_refund_to_buyer() {
     token_admin.mint(&buyer, &100_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
     client.dispute_escrow(&1, &Symbol::new(&env, "Late_shipping"), &buyer);
+
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
 
     client.resolve_dispute(&1, &Resolution::RefundToBuyer, &admin);
 
@@ -451,6 +477,11 @@ fn test_resolve_dispute_by_moderator() {
     token_admin.mint(&buyer, &100_000_000);
     client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
     client.dispute_escrow(&1, &Symbol::new(&env, "Moderator_review"), &buyer);
+
+    // Advance past the evidence challenge window (#942) before finalizing.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2 * 24 * 60 * 60 + 1;
+    });
 
     client.resolve_dispute(&1, &Resolution::RefundToBuyer, &moderator);
 
@@ -476,10 +507,10 @@ fn test_recover_admin_with_zero_window_fails() {
             .set(&DataKey::FallbackAdmin, &admin);
         env.storage()
             .persistent()
-            .set(&DataKey::AdminRecoveryTime, &current_time);
+            .set(&DataKey::AdminRecovTime, &current_time);
         env.storage()
             .persistent()
-            .set(&DataKey::AdminRecoveryDelay, &0u64);
+            .set(&DataKey::AdminRecovDelay, &0u64);
     });
 
     let recovered_admin = Address::generate(&env);
@@ -1120,9 +1151,10 @@ fn test_recover_admin_timelock_returns_standard_error() {
     });
 
     let recovered_admin = Address::generate(&env);
-    let initial_result = client.try_recover_admin_access(&recovered_admin);
-    assert_admin_recovery_failed(initial_result);
+    // Initiation must succeed (Ok) so the timelock persists under Soroban semantics.
+    client.recover_admin_access(&recovered_admin);
 
+    // Second call before the delay elapses remains blocked.
     let locked_result = client.try_recover_admin_access(&recovered_admin);
     assert_admin_recovery_failed(locked_result);
 }
@@ -1369,6 +1401,20 @@ fn test_unstake_rejects_different_token_than_original_stake() {
     });
 
     client.unstake_tokens(&seller, &other_token_contract.address());
+}
+
+#[test]
+#[should_panic(expected = "Stake cooldown active. Remaining seconds: 604800")]
+fn test_unstake_too_early_returns_remaining_seconds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&seller, &20_000_000);
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+
+    // Try to unstake immediately (remaining seconds should be 604800)
+    client.unstake_tokens(&seller, &token_id);
 }
 
 #[test]
@@ -1765,6 +1811,45 @@ fn test_get_version_initially() {
     env.mock_all_auths();
     let (client, _, _, _, _, _, _) = setup_test(&env, true);
     assert_eq!(client.get_version(), 1);
+}
+
+#[test]
+fn test_execute_upgrade_rejects_legacy_storage_layout_without_migration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::StorageLayoutVersion);
+    });
+
+    let hash = BytesN::from_array(&env, &[9u8; 32]);
+    let result = client.try_execute_upgrade(&hash);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), Error::StorageLayoutMismatch);
+}
+
+#[test]
+fn test_migrate_storage_layout_marks_current_layout_and_preserves_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::StorageLayoutVersion);
+    });
+
+    let migrated = client.migrate_storage_layout();
+    assert_eq!(migrated, 1);
+    assert_eq!(client.get_storage_layout_version(), CURRENT_STORAGE_LAYOUT_VERSION);
+
+    let escrow = client.get_escrow(&1);
+    assert_eq!(escrow.buyer, buyer);
+    assert_eq!(escrow.amount, 50_000_000);
+    assert_eq!(escrow.status, EscrowStatus::Active);
 }
 
 // ===== Multi-sig upgrade tests =====
@@ -2869,7 +2954,7 @@ fn test_whitelist_stores_tokens_as_individual_keys() {
     assert!(env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .has(&DataKey::WhitelistedTokenIndexed(token_id.clone()))
+            .has(&DataKey::TokenAllowed(token_id.clone()))
     }));
     assert!(env.as_contract(&client.address, || {
         !env.storage().persistent().has(&DataKey::WhitelistedTokens)
@@ -2877,7 +2962,7 @@ fn test_whitelist_stores_tokens_as_individual_keys() {
     let count: u32 = env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .get(&DataKey::WhitelistedTokenCount)
+            .get(&DataKey::TokenCount)
             .unwrap_or(0u32)
     });
     assert_eq!(count, 1);
@@ -3014,7 +3099,7 @@ fn test_migrate_fee_token_configs_migrates_twenty_tokens_and_emits_summary() {
     env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .set(&DataKey::FeeTokenIndex, &fee_tokens);
+            .set(&DataKey::FeeIndex, &fee_tokens);
     });
 
     let migrated = client.migrate_fee_token_configs();
@@ -3073,13 +3158,13 @@ fn test_migrate_fee_token_configs_is_idempotent_and_preserves_existing_configs()
     env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .set(&DataKey::FeeTokenIndex, &fee_tokens);
+            .set(&DataKey::FeeIndex, &fee_tokens);
 
         let preset_one = fee_tokens.get(3).unwrap();
         let preset_two = fee_tokens.get(11).unwrap();
 
         env.storage().persistent().set(
-            &DataKey::FeeTokenConfig(preset_one.clone()),
+            &DataKey::FeeConfig(preset_one.clone()),
             &FeeTokenInfo {
                 active: false,
                 custom_fee_bps: Some(250),
@@ -3087,7 +3172,7 @@ fn test_migrate_fee_token_configs_is_idempotent_and_preserves_existing_configs()
             },
         );
         env.storage().persistent().set(
-            &DataKey::FeeTokenConfig(preset_two.clone()),
+            &DataKey::FeeConfig(preset_two.clone()),
             &FeeTokenInfo {
                 active: true,
                 custom_fee_bps: Some(900),
@@ -3291,34 +3376,40 @@ fn test_set_paused_emits_platform_status_events() {
     client.set_paused(&true);
 
     let events = env.events().all();
-    let last_event = events.last().unwrap();
-    assert_eq!(
-        last_event.1,
-        vec![
-            &env,
-            Symbol::new(&env, "admin_platform_paused").into_val(&env),
-            admin.clone().into_val(&env),
-        ]
-    );
-
-    let paused_event: PlatformPausedEvent = last_event.2.try_into_val(&env).unwrap();
+    let paused_topics = vec![
+        &env,
+        Symbol::new(&env, "admin_platform_paused").into_val(&env),
+        admin.clone().into_val(&env),
+    ];
+    let paused_event_entry = events
+        .iter()
+        .rev()
+        .find(|e| e.1 == paused_topics)
+        .expect("platform_paused event missing");
+    let paused_event: PlatformPausedEvent = paused_event_entry.2.try_into_val(&env).unwrap();
     assert_eq!(paused_event.initiator, admin.clone());
     assert_eq!(paused_event.timestamp, 1711368000);
+
+    // Emergency framework also records a deterministic pause audit entry.
+    let op = client.get_emergency_operation().unwrap();
+    assert_eq!(op.kind, EmergencyOpKind::Pause);
+    assert_eq!(op.phase, EmergencyOpPhase::Completed);
+    assert!(op.success);
 
     client.set_paused(&false);
 
     let events = env.events().all();
-    let last_event = events.last().unwrap();
-    assert_eq!(
-        last_event.1,
-        vec![
-            &env,
-            Symbol::new(&env, "admin_platform_unpaused").into_val(&env),
-            admin.clone().into_val(&env),
-        ]
-    );
-
-    let unpaused_event: PlatformUnpausedEvent = last_event.2.try_into_val(&env).unwrap();
+    let unpaused_topics = vec![
+        &env,
+        Symbol::new(&env, "admin_platform_unpaused").into_val(&env),
+        admin.clone().into_val(&env),
+    ];
+    let unpaused_event_entry = events
+        .iter()
+        .rev()
+        .find(|e| e.1 == unpaused_topics)
+        .expect("platform_unpaused event missing");
+    let unpaused_event: PlatformUnpausedEvent = unpaused_event_entry.2.try_into_val(&env).unwrap();
     assert_eq!(unpaused_event.initiator, admin);
     assert_eq!(unpaused_event.timestamp, 1711368000);
 }
@@ -3662,7 +3753,7 @@ fn test_get_escrow_count_tracks_100_global_indices() {
     assert_eq!(stored_count, 100);
 
     for index in 0u32..100 {
-        let index_key = DataKey::GlobalEscrowIdIndexed(index);
+        let index_key = DataKey::EscrowIndex(index);
         let stored_id: u32 = env.as_contract(&client.address, || {
             env.storage().persistent().get(&index_key).unwrap()
         });
@@ -3823,7 +3914,7 @@ fn test_legacy_all_escrow_ids_migrates_on_get_escrow_count() {
     assert!(!has_legacy);
 
     for (index, expected_id) in [11u32, 22, 33, 44].into_iter().enumerate() {
-        let index_key = DataKey::GlobalEscrowIdIndexed(index as u32);
+        let index_key = DataKey::EscrowIndex(index as u32);
         let stored_id: u32 = env.as_contract(&client.address, || {
             env.storage().persistent().get(&index_key).unwrap()
         });
@@ -3894,7 +3985,7 @@ fn test_legacy_all_escrow_ids_migration_is_idempotent_after_first_read() {
     assert!(!has_legacy);
 
     for (index, expected_id) in [5u32, 15, 25].into_iter().enumerate() {
-        let index_key = DataKey::GlobalEscrowIdIndexed(index as u32);
+        let index_key = DataKey::EscrowIndex(index as u32);
         let stored_id: u32 = env.as_contract(&client.address, || {
             env.storage().persistent().get(&index_key).unwrap()
         });
@@ -3910,9 +4001,9 @@ fn test_legacy_all_escrow_ids_migration_preserves_existing_indexed_entries() {
 
     let legacy_key = DataKey::AllEscrowIds;
     let count_key = DataKey::EscrowCount;
-    let existing_index_key = DataKey::GlobalEscrowIdIndexed(0);
-    let missing_index_key = DataKey::GlobalEscrowIdIndexed(1);
-    let tail_index_key = DataKey::GlobalEscrowIdIndexed(2);
+    let existing_index_key = DataKey::EscrowIndex(0);
+    let missing_index_key = DataKey::EscrowIndex(1);
+    let tail_index_key = DataKey::EscrowIndex(2);
     let mut legacy_ids = soroban_sdk::Vec::new(&env);
     for order_id in [10u32, 20, 30] {
         legacy_ids.push_back(order_id);
@@ -4280,7 +4371,7 @@ fn test_funding_deadline_set_on_create() {
         .funding_deadline
         .expect("funding_deadline must be set");
     // created_at is stored as u32 (truncated ledger timestamp); deadline is created_at + 86400
-    assert_eq!(deadline, escrow.created_at as u64 + 24 * 60 * 60);
+    assert_eq!(deadline, escrow.created_at + 24 * 60 * 60);
 }
 
 /// Buyer may cancel an unfunded escrow voluntarily before the deadline.
@@ -4483,4 +4574,159 @@ fn test_get_escrows_pagination_large_dataset() {
     assert_eq!(seller_page0.len(), 50, "seller page0 should have 50 items");
     let seller_page1 = client.get_escrows_by_seller(&seller, &1, &50, &false);
     assert_eq!(seller_page1.len(), 50, "seller page1 should have 50 items");
+}
+
+#[test]
+fn test_fund_audit_escrow_release_and_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+
+    // Escrow 1: funding & release
+    client.create_escrow(&buyer, &seller, &token_id, &40_000_000, &1, &None);
+    client.release_funds(&1);
+
+    // Check buyer history: funding entry
+    let buyer_count = client.get_fund_audit_count(&buyer);
+    assert_eq!(buyer_count, 1);
+    let buyer_history = client.get_fund_audit_history(&buyer);
+    assert_eq!(
+        buyer_history.get(0).unwrap().reason,
+        Symbol::new(&env, "escrow_funded")
+    );
+
+    // Check seller history: release entry
+    let seller_count = client.get_fund_audit_count(&seller);
+    assert_eq!(seller_count, 1);
+    let seller_history = client.get_fund_audit_history(&seller);
+    let seller_entry = seller_history.get(0).unwrap();
+    assert_eq!(seller_entry.actor, seller);
+    assert_eq!(seller_entry.reason, Symbol::new(&env, "escrow_released"));
+    assert!(seller_entry.amount > 0);
+    assert!(seller_entry.balance_impact > 0);
+
+    // Escrow 2: funding & refund
+    client.create_escrow(&buyer, &seller, &token_id, &30_000_000, &2, &None);
+    client.refund(&2);
+
+    // Check buyer history now has 3 entries: funded (1), funded (2), refund (2)
+    assert_eq!(client.get_fund_audit_count(&buyer), 3);
+    let buyer_history_updated = client.get_fund_audit_history(&buyer);
+    let refund_entry = buyer_history_updated.get(2).unwrap();
+    assert_eq!(refund_entry.reason, Symbol::new(&env, "refund"));
+    assert_eq!(refund_entry.amount, 30_000_000);
+    assert_eq!(refund_entry.balance_impact, 30_000_000);
+}
+
+#[test]
+fn test_fund_audit_staking_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&seller, &50_000_000);
+
+    // Stake
+    client.stake_tokens(&seller, &token_id, &20_000_000);
+    assert_eq!(client.get_fund_audit_count(&seller), 1);
+    let stake_history = client.get_fund_audit_history(&seller);
+    let stake_entry = stake_history.get(0).unwrap();
+    assert_eq!(stake_entry.actor, seller);
+    assert_eq!(stake_entry.amount, 20_000_000);
+    assert_eq!(stake_entry.reason, Symbol::new(&env, "stake_deposit"));
+    assert_eq!(stake_entry.balance_impact, -20_000_000);
+
+    // Fast forward timestamp past stake cooldown
+    env.ledger().with_mut(|li| {
+        li.timestamp += 8 * 86400;
+    });
+
+    // Unstake
+    client.unstake_tokens(&seller, &token_id);
+    assert_eq!(client.get_fund_audit_count(&seller), 2);
+    let unstake_history = client.get_fund_audit_history(&seller);
+    let unstake_entry = unstake_history.get(1).unwrap();
+    assert_eq!(unstake_entry.reason, Symbol::new(&env, "stake_unstaked"));
+    assert_eq!(unstake_entry.amount, 20_000_000);
+    assert_eq!(unstake_entry.balance_impact, 20_000_000);
+}
+
+#[test]
+fn test_fund_audit_recurring_escrow_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+
+    // Create recurring escrow: 10_000_000 total, 100s frequency, 2 cycles
+    let rec = client.create_recurring_escrow(&buyer, &seller, &token_id, &10_000_000, &100, &2);
+    assert_eq!(client.get_fund_audit_count(&buyer), 1);
+    let buyer_hist = client.get_fund_audit_history(&buyer);
+    assert_eq!(
+        buyer_hist.get(0).unwrap().reason,
+        Symbol::new(&env, "recurring_escrow_locked")
+    );
+
+    // Fast forward timestamp past cycle frequency
+    env.ledger().with_mut(|li| {
+        li.timestamp += 100;
+    });
+
+    // Release next cycle
+    client.release_next_cycle(&rec.id);
+    assert_eq!(client.get_fund_audit_count(&seller), 1);
+    let seller_hist = client.get_fund_audit_history(&seller);
+    assert_eq!(
+        seller_hist.get(0).unwrap().reason,
+        Symbol::new(&env, "recurring_release")
+    );
+
+    // Cancel remaining
+    client.cancel_recurring_escrow(&rec.id);
+    assert_eq!(client.get_fund_audit_count(&buyer), 2);
+    let buyer_cancel_hist = client.get_fund_audit_history(&buyer);
+    assert_eq!(
+        buyer_cancel_hist.get(1).unwrap().reason,
+        Symbol::new(&env, "recurring_cancel_refund")
+    );
+}
+
+#[test]
+fn test_fund_audit_pagination_and_immutability() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &500_000_000);
+
+    for i in 1u32..=5u32 {
+        let amt = (i as i128) * 10_000_000;
+        client.create_escrow(&buyer, &seller, &token_id, &amt, &i, &None);
+    }
+
+    assert_eq!(client.get_fund_audit_count(&buyer), 5);
+
+    // Test page 0 (offset 0, limit 2)
+    let page0 = client.get_fund_audit_history_paginated(&buyer, &0, &2);
+    assert_eq!(page0.len(), 2);
+    assert_eq!(page0.get(0).unwrap().amount, 10_000_000);
+    assert_eq!(page0.get(1).unwrap().amount, 20_000_000);
+
+    // Test page 1 (offset 2, limit 2)
+    let page1 = client.get_fund_audit_history_paginated(&buyer, &2, &2);
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page1.get(0).unwrap().amount, 30_000_000);
+    assert_eq!(page1.get(1).unwrap().amount, 40_000_000);
+
+    // Test page 2 (offset 4, limit 2 -> returns remaining 1)
+    let page2 = client.get_fund_audit_history_paginated(&buyer, &4, &2);
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2.get(0).unwrap().amount, 50_000_000);
+
+    // Test out of bounds (offset 10, limit 2 -> empty)
+    let page_oob = client.get_fund_audit_history_paginated(&buyer, &10, &2);
+    assert_eq!(page_oob.len(), 0);
 }

@@ -91,7 +91,7 @@ const TTL_THRESHOLD: u32 = 10_000;
 const READ_TTL_THRESHOLD: u32 = 1_000;
 /// Standard TTL extension for persistent storage (approx 30 days)
 const TTL_EXTENSION: u32 = 518_400;
-const CURRENT_USER_PROFILE_VERSION: u32 = 5;
+const CURRENT_USER_PROFILE_VERSION: u32 = 6;
 
 const BASE58_BTC_CHARSET: [bool; 256] = {
     let mut chars = [false; 256];
@@ -140,6 +140,10 @@ const BASE58_BTC_CHARSET: [bool; 256] = {
 const USERNAME_CHANGE_COOLDOWN: u64 = 30 * 24 * 60 * 60;
 /// Maximum verification history entries retained per user (#519).
 const MAX_VERIFICATION_HISTORY: u32 = 10;
+/// Default sliding window (seconds) for rate-limiting `onboard_user` retries (#943).
+const DEFAULT_RATE_LIMIT_WINDOW: u32 = 60 * 60;
+/// Default maximum `onboard_user` calls per account per `rate_limit_window` (#943).
+const DEFAULT_RATE_LIMIT_MAX_CALLS: u32 = 5;
 
 #[cfg(not(target_family = "wasm"))]
 #[path = "decimal_test_token.rs"]
@@ -165,25 +169,30 @@ pub enum DataKey {
     UserProfile(Address),
     /// Dedicated portfolio CID storage keyed by user to keep the main profile flat.
     UserPortfolio(Address),
+    /// Dedicated profile picture CID storage keyed by user (#723).
+    UserProfilePic(Address),
     /// Maps a normalized username to the owning address (uniqueness index)
     Username(String),
     /// Contract configuration ([`OnboardingConfig`])
     Config,
     /// Activity metrics per user (escrow count and volume for auto-verification) (#63)
     UserMetrics(Address),
-    /// Active contract counter per user (Issue #39)
+    /// Active contract counter per user (Issue #39).
     /// Tracks the number of active escrows/agreements for an address.
-    ActiveContractCount(Address),
-    /// Number of profiles currently in active status.
-    ActiveUserCount,
-    /// Pending manual verification request marker keyed by user (#138)
-    VerificationRequest(Address),
-    /// Queue head pointer for manual verification requests (#138)
-    VerificationQueueHead,
-    /// Queue tail pointer for manual verification requests (#138)
-    VerificationQueueTail,
-    /// Queue index -> address mapping for manual verification requests (#138)
-    VerificationQueueIndex(u64),
+    /// Formerly `ActiveContractCount`.
+    ActiveCount(Address),
+    /// Pending manual verification request marker keyed by user (#138).
+    /// Formerly `VerificationRequest`.
+    VerifRequest(Address),
+    /// Queue head pointer for manual verification requests (#138).
+    /// Formerly `VerificationQueueHead`.
+    VerifQueueHead,
+    /// Queue tail pointer for manual verification requests (#138).
+    /// Formerly `VerificationQueueTail`.
+    VerifQueueTail,
+    /// Queue index -> address mapping for manual verification requests (#138).
+    /// Formerly `VerificationQueueIndex`.
+    VerifQueueIdx(u64),
     /// DEPRECATED: Legacy Vec-based verification history (#63).
     /// Migrated lazily to indexed compact entries (#519).
     VerificationHistory(Address),
@@ -199,6 +208,20 @@ pub enum DataKey {
     UsernameChangeFeeWallet,
     /// Timestamp of last username change per user - Issue #114
     LastUsernameChange(Address),
+    /// Sliding rate-limit window state for `onboard_user` retries, keyed by
+    /// the registering account (#943)
+    RateLimit(Address),
+}
+
+/// Fixed-window rate limit counter for a single account's `onboard_user`
+/// retries (#943). See `CraftNexusContract`'s identically-shaped
+/// `RateLimitState` for the sliding/fixed-window semantics.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct RateLimitState {
+    pub window_start: u64,
+    pub count: u32,
 }
 
 /// User roles in the CraftNexus platform.
@@ -277,6 +300,12 @@ pub struct UserProfile {
     /// this field from `get_user` / `get_user_by_username` responses or
     /// subscribe to `PortfolioUpdated` events for live updates.
     pub portfolio_cid: Option<Bytes>,
+    /// Optional IPFS content identifier for the user's profile picture (#723).
+    ///
+    /// `None` when unset or after removal via `update_profile_pic`. When
+    /// present, the CID must conform to the same validation rules as
+    /// portfolio CIDs (see `validate_ipfs_cid`).
+    pub profile_pic_cid: Option<Bytes>,
     /// Status of the user profile - Issue #113
     pub status: ProfileStatus,
 }
@@ -416,6 +445,10 @@ pub struct OnboardCallFailedEvent {
     pub timestamp: u64,
 }
 
+/// Event emitted when a user's metrics cross auto-verification thresholds.
+///
+/// Topic: `(symbol "AutoVerifiedEvent",)`; payload contains `user`,
+/// `escrow_count`, and `volume` (normalized stroop units).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoVerifiedEvent {
@@ -448,13 +481,13 @@ pub struct AutoVerifiedEvent {
 ///
 /// ## Storage side-effects
 /// Entries are stored under two key patterns:
-/// - `DataKey::VerificationHistoryCount(Address)` — count of entries (u32)
-/// - `DataKey::VerificationHistoryIndexed(Address, u32)` — per-entry compact
+/// - `DataKey::VerifHistCount(Address)` — count of entries (u32)
+/// - `DataKey::VerifHistEntry(Address, u32)` — per-entry compact
 ///   record ([`CompactVerificationEntry`]); the `action` field is stored as
 ///   [`VerificationActionCode`] to minimise on-chain size.
 ///
 /// Both keys have their TTL extended on every write and on reads that touch
-/// the history. The legacy `DataKey::VerificationHistory(Address)` Vec-based
+/// the history. The legacy `DataKey::VerifHistLegacy(Address)` Vec-based
 /// key is migrated lazily on first read and should not be written by new code.
 ///
 /// ## Emitted events
@@ -504,7 +537,7 @@ pub struct VerificationEntry {
 ///
 /// ## Storage side-effects
 /// - Stored as the `action` field inside
-///   [`DataKey::VerificationHistoryIndexed`]`(Address, u32)` entries.
+///   [`DataKey::VerifHistEntry`]`(Address, u32)` entries.
 /// - Discriminant values are **stable** — adding new variants is safe;
 ///   reordering or removing variants is a breaking schema change.
 ///
@@ -532,17 +565,17 @@ enum VerificationActionCode {
 ///
 /// ## Purpose
 /// `CompactVerificationEntry` is the actual bytes persisted under
-/// [`DataKey::VerificationHistoryIndexed`]`(Address, u32)`. It mirrors
+/// [`DataKey::VerifHistEntry`]`(Address, u32)`. It mirrors
 /// [`VerificationEntry`] but stores `action` as a [`VerificationActionCode`]
 /// discriminant rather than a heap-allocated [`Symbol`], keeping each
 /// storage entry small and rent-efficient.
 ///
 /// ## Storage side-effects
-/// - Key: `DataKey::VerificationHistoryIndexed(user_address, index_u32)`
+/// - Key: `DataKey::VerifHistEntry(user_address, index_u32)`
 /// - TTL is extended immediately after every write and on reads within
 ///   `get_verification_history`.
 /// - The corresponding count is maintained under
-///   `DataKey::VerificationHistoryCount(user_address)`.
+///   `DataKey::VerifHistCount(user_address)`.
 ///
 /// ## Off-chain consumers
 /// Indexers receive the decoded [`VerificationEntry`] form (with
@@ -621,6 +654,12 @@ pub struct OnboardingConfig {
     /// Address of the ESCROW_CONTRACT authorized to call `update_reputation` / `update_user_metrics`.
     /// If `None`, the `platform_admin` is used as fallback caller. (#63, #100)
     pub escrow_contract: Option<Address>,
+    /// Sliding window (seconds) used to rate-limit `onboard_user` retries per
+    /// account (default: 1 hour). `0` disables the limiter (#943).
+    pub rate_limit_window: u32,
+    /// Maximum `onboard_user` calls a single account may make within
+    /// `rate_limit_window` (default: 5) (#943).
+    pub rate_limit_max_calls: u32,
 }
 
 /// Errors returned by the onboarding contract.
@@ -663,6 +702,8 @@ pub enum Error {
     ActiveContractUnderflow = 15,
     /// The escrow contract is paused — onboarding is temporarily disabled
     ContractPaused = 16,
+    /// Caller has exceeded the configured rate limit for `onboard_user` retries (#943)
+    RateLimitExceeded = 17,
 }
 
 /// Cross-contract interface the onboarding contract uses to query the escrow
@@ -1065,7 +1106,7 @@ impl OnboardingContract {
     }
 
     fn is_verification_pending_internal(env: &Env, user: &Address) -> bool {
-        let key = DataKey::VerificationRequest(user.clone());
+        let key = DataKey::VerifRequest(user.clone());
         let is_pending = env.storage().persistent().has(&key);
         if is_pending {
             Self::extend_persistent(env, &key);
@@ -1074,26 +1115,26 @@ impl OnboardingContract {
     }
 
     fn enqueue_verification_request(env: &Env, user: &Address) {
-        let tail = Self::get_queue_pointer(env, &DataKey::VerificationQueueTail);
-        let queue_index_key = DataKey::VerificationQueueIndex(tail);
+        let tail = Self::get_queue_pointer(env, &DataKey::VerifQueueTail);
+        let queue_index_key = DataKey::VerifQueueIdx(tail);
         env.storage().persistent().set(&queue_index_key, user);
         Self::extend_persistent(env, &queue_index_key);
 
-        let pending_key = DataKey::VerificationRequest(user.clone());
+        let pending_key = DataKey::VerifRequest(user.clone());
         env.storage()
             .persistent()
             .set(&pending_key, &env.ledger().timestamp());
         Self::extend_persistent(env, &pending_key);
 
-        Self::set_queue_pointer(env, DataKey::VerificationQueueTail, tail + 1);
+        Self::set_queue_pointer(env, DataKey::VerifQueueTail, tail + 1);
     }
 
     fn advance_verification_head(env: &Env) {
-        let mut head = Self::get_queue_pointer(env, &DataKey::VerificationQueueHead);
-        let tail = Self::get_queue_pointer(env, &DataKey::VerificationQueueTail);
+        let mut head = Self::get_queue_pointer(env, &DataKey::VerifQueueHead);
+        let tail = Self::get_queue_pointer(env, &DataKey::VerifQueueTail);
 
         while head < tail {
-            let queue_index_key = DataKey::VerificationQueueIndex(head);
+            let queue_index_key = DataKey::VerifQueueIdx(head);
             let queued_user: Option<Address> = env.storage().persistent().get(&queue_index_key);
 
             let Some(queued_user) = queued_user else {
@@ -1110,25 +1151,25 @@ impl OnboardingContract {
             head += 1;
         }
 
-        Self::set_queue_pointer(env, DataKey::VerificationQueueHead, head);
+        Self::set_queue_pointer(env, DataKey::VerifQueueHead, head);
     }
 
     fn clear_verification_request(env: &Env, user: &Address) {
-        let pending_key = DataKey::VerificationRequest(user.clone());
+        let pending_key = DataKey::VerifRequest(user.clone());
         env.storage().persistent().remove(&pending_key);
         Self::advance_verification_head(env);
     }
 
     fn read_username_fee_token(env: &Env) -> Option<Address> {
-        Self::read_persistent(env, &DataKey::UsernameChangeFeeToken)
+        Self::read_persistent(env, &DataKey::UsernameFeeToken)
     }
 
     /// Resolve the wallet that receives username-change fees.
     ///
-    /// Reads `DataKey::UsernameChangeFeeWallet`; when unset, falls back to
+    /// Reads `DataKey::UsernameFeeWallet`; when unset, falls back to
     /// `config.platform_admin`. Extends TTL when the key exists.
     fn read_username_fee_wallet(env: &Env, config: &OnboardingConfig) -> Address {
-        Self::read_persistent(env, &DataKey::UsernameChangeFeeWallet)
+        Self::read_persistent(env, &DataKey::UsernameFeeWallet)
             .unwrap_or_else(|| config.platform_admin.clone())
     }
 
@@ -1238,7 +1279,7 @@ impl OnboardingContract {
     }
 
     fn migrate_legacy_verification_history(env: &Env, user: &Address) {
-        let legacy_key = DataKey::VerificationHistory(user.clone());
+        let legacy_key = DataKey::VerifHistLegacy(user.clone());
         if !env.storage().persistent().has(&legacy_key) {
             return;
         }
@@ -1249,7 +1290,7 @@ impl OnboardingContract {
             .get(&legacy_key)
             .unwrap_or(Vec::new(env));
 
-        let count_key = DataKey::VerificationHistoryCount(user.clone());
+        let count_key = DataKey::VerifHistCount(user.clone());
         let mut count: u32 = 0;
         for i in 0..history.len() {
             if let Some(entry) = history.get(i) {
@@ -1258,7 +1299,7 @@ impl OnboardingContract {
                     action: Self::parse_verification_action(env, &entry.action),
                     by: entry.by.clone(),
                 };
-                let entry_key = DataKey::VerificationHistoryIndexed(user.clone(), i);
+                let entry_key = DataKey::VerifHistEntry(user.clone(), i);
                 env.storage().persistent().set(&entry_key, &compact);
                 Self::extend_persistent(env, &entry_key);
                 count = i + 1;
@@ -1280,8 +1321,8 @@ impl OnboardingContract {
     /// to enforce bounded storage while preserving temporal ordering of recent events.
     ///
     /// Developer note: the historical record is stored in indexed slots under
-    /// `DataKey::VerificationHistoryIndexed(user, slot)` and the logical order is defined by
-    /// `DataKey::VerificationHistoryCount(user)`. Readers must iterate from slot `0` through
+    /// `DataKey::VerifHistEntry(user, slot)` and the logical order is defined by
+    /// `DataKey::VerifHistCount(user)`. Readers must iterate from slot `0` through
     /// `count - 1`; writers must not write to an arbitrary slot based on timestamps or the
     /// current append count once the buffer is full. When the buffer reaches capacity, older
     /// entries are shifted down and the new entry is written to the tail slot. This preserves
@@ -1297,8 +1338,8 @@ impl OnboardingContract {
     /// * `by` - Optional moderator/admin address that triggered the action
     ///
     /// # Storage Side-Effects
-    /// - Reads/writes `DataKey::VerificationHistoryCount(user)` (4 bytes)
-    /// - Reads/writes up to 10 entries of `DataKey::VerificationHistoryIndexed(user, slot)`
+    /// - Reads/writes `DataKey::VerifHistCount(user)` (4 bytes)
+    /// - Reads/writes up to 10 entries of `DataKey::VerifHistEntry(user, slot)`
     /// - Each entry is ~24 bytes (timestamp u64 + action u32 + optional address 32 bytes)
     /// - Extends TTL on count and all affected entries to prevent archival
     ///
@@ -1319,7 +1360,7 @@ impl OnboardingContract {
     ) {
         Self::migrate_legacy_verification_history(env, user);
 
-        let count_key = DataKey::VerificationHistoryCount(user.clone());
+        let count_key = DataKey::VerifHistCount(user.clone());
         // [PERFORMANCE #94] Extend TTL on read so the count key does not expire while
         // the buffer is still in active use. Without this bump a count entry close to
         // its TTL deadline could be archived on the same ledger as the write that follows,
@@ -1337,13 +1378,13 @@ impl OnboardingContract {
         let slot = if count >= MAX_VERIFICATION_HISTORY {
             // Shift entries: move index i down to i-1 for all i in [1, MAX-1]
             for i in 1..MAX_VERIFICATION_HISTORY {
-                let src_key = DataKey::VerificationHistoryIndexed(user.clone(), i);
+                let src_key = DataKey::VerifHistEntry(user.clone(), i);
                 if let Some(entry) = env
                     .storage()
                     .persistent()
                     .get::<DataKey, CompactVerificationEntry>(&src_key)
                 {
-                    let dst_key = DataKey::VerificationHistoryIndexed(user.clone(), i - 1);
+                    let dst_key = DataKey::VerifHistEntry(user.clone(), i - 1);
                     env.storage().persistent().set(&dst_key, &entry);
                     Self::extend_persistent(env, &dst_key);
                     env.storage().persistent().remove(&src_key);
@@ -1359,7 +1400,7 @@ impl OnboardingContract {
             action,
             by,
         };
-        let entry_key = DataKey::VerificationHistoryIndexed(user.clone(), slot);
+        let entry_key = DataKey::VerifHistEntry(user.clone(), slot);
         env.storage().persistent().set(&entry_key, &entry);
         Self::extend_persistent(env, &entry_key);
 
@@ -1381,14 +1422,14 @@ impl OnboardingContract {
         let fee_amount: i128 = env
             .storage()
             .persistent()
-            .get(&DataKey::UsernameChangeFee)
+            .get(&DataKey::UsernameFee)
             .unwrap_or(0);
 
         if fee_amount <= 0 {
             return;
         }
 
-        Self::extend_persistent(env, &DataKey::UsernameChangeFee);
+        Self::extend_persistent(env, &DataKey::UsernameFee);
 
         let fee_token = match snapshotted_token {
             Some(ref token) => {
@@ -1415,7 +1456,11 @@ impl OnboardingContract {
         cid_bytes
     }
 
-    fn stored_to_public(stored: StoredUserProfile, portfolio_cid: Option<Bytes>) -> UserProfile {
+    fn stored_to_public(
+        stored: StoredUserProfile,
+        portfolio_cid: Option<Bytes>,
+        profile_pic_cid: Option<Bytes>,
+    ) -> UserProfile {
         UserProfile {
             version: stored.version,
             address: stored.address,
@@ -1426,6 +1471,7 @@ impl OnboardingContract {
             successful_trades: stored.successful_trades,
             disputed_trades: stored.disputed_trades,
             portfolio_cid,
+            profile_pic_cid,
             status: stored.status,
         }
     }
@@ -1460,6 +1506,23 @@ impl OnboardingContract {
         }
     }
 
+    fn read_profile_pic_cid(env: &Env, user: &Address) -> Option<Bytes> {
+        Self::read_persistent(env, &DataKey::UserProfilePic(user.clone()))
+    }
+
+    fn write_profile_pic_cid(env: &Env, user: &Address, cid: Option<Bytes>) {
+        let key = DataKey::UserProfilePic(user.clone());
+        match cid {
+            Some(cid) => {
+                env.storage().persistent().set(&key, &cid);
+                Self::extend_persistent(env, &key);
+            }
+            None => {
+                env.storage().persistent().remove(&key);
+            }
+        }
+    }
+
     fn persist_stored_user_profile(env: &Env, user: &Address, profile: &StoredUserProfile) {
         let key = DataKey::UserProfile(user.clone());
         env.storage().persistent().set(&key, profile);
@@ -1469,6 +1532,7 @@ impl OnboardingContract {
     fn persist_public_user_profile(env: &Env, user: &Address, profile: &UserProfile) {
         Self::persist_stored_user_profile(env, user, &Self::public_to_stored(profile));
         Self::write_portfolio_cid(env, user, profile.portfolio_cid.clone());
+        Self::write_profile_pic_cid(env, user, profile.profile_pic_cid.clone());
     }
 
     fn migrate_embedded_versioned_profile(
@@ -1478,6 +1542,9 @@ impl OnboardingContract {
     ) -> (StoredUserProfile, bool) {
         if profile.portfolio_cid.is_some() {
             Self::write_portfolio_cid(env, user, profile.portfolio_cid.clone());
+        }
+        if profile.profile_pic_cid.is_some() {
+            Self::write_profile_pic_cid(env, user, profile.profile_pic_cid.clone());
         }
 
         let stored = StoredUserProfile {
@@ -1560,12 +1627,31 @@ impl OnboardingContract {
     fn try_get_user_profile(env: &Env, user: Address) -> Option<UserProfile> {
         let (stored, _) = Self::try_get_stored_user_profile(env, user.clone())?;
         let portfolio_cid = Self::read_portfolio_cid(env, &user);
-        Some(Self::stored_to_public(stored, portfolio_cid))
+        let profile_pic_cid = Self::read_profile_pic_cid(env, &user);
+        Some(Self::stored_to_public(stored, portfolio_cid, profile_pic_cid))
     }
 
     fn get_user_profile(env: &Env, user: Address) -> UserProfile {
         Self::try_get_user_profile(env, user)
             .unwrap_or_else(|| env.panic_with_error(Error::UserNotFound))
+    }
+
+    /// Assert that `user` is onboarded and their profile is currently active.
+    ///
+    /// Panics with [`Error::UserNotFound`] when no profile exists, or with
+    /// [`Error::ProfileDeactivated`] when the profile's status is
+    /// [`ProfileStatus::Deactivated`]. Used by state-mutating endpoints that
+    /// must not operate on deactivated accounts (e.g. `update_user_role`,
+    /// `deactivate_profile`).
+    ///
+    /// # Returns
+    /// The loaded [`UserProfile`] so callers do not have to fetch it again.
+    fn assert_user_onboarded_and_active(env: &Env, user: Address) -> UserProfile {
+        let profile = Self::get_user_profile(env, user);
+        if profile.status == ProfileStatus::Deactivated {
+            env.panic_with_error(Error::ProfileDeactivated);
+        }
+        profile
     }
 
     /// Extend the TTL of a persistent storage entry using standardized values.
@@ -1591,6 +1677,56 @@ impl OnboardingContract {
         env.storage()
             .persistent()
             .extend_ttl(key, READ_TTL_THRESHOLD, TTL_EXTENSION);
+    }
+
+    /// Enforce a per-account fixed-window rate limit on `onboard_user` (#943).
+    ///
+    /// Mirrors `CraftNexusContract::enforce_rate_limit`: counts calls in a
+    /// window of `config.rate_limit_window` seconds, resetting once the
+    /// window elapses. `rate_limit_window == 0` disables the limiter.
+    ///
+    /// Keyed by `config.platform_admin` (the required co-signer on every
+    /// `onboard_user` call) rather than the registering user. A single
+    /// address can only ever *successfully* onboard once (subsequent calls
+    /// hit `Error::AlreadyOnboarded`), and Soroban discards all storage
+    /// writes from a call that ultimately panics — so a per-user counter
+    /// could never observe more than one increment and would never trigger.
+    /// The admin, by contrast, co-signs a new (and generally successful)
+    /// onboarding for every distinct user, making it the account whose call
+    /// volume this limiter can meaningfully throttle.
+    fn enforce_rate_limit(
+        env: &Env,
+        account: &Address,
+        config: &OnboardingConfig,
+    ) -> Result<(), Error> {
+        if config.rate_limit_window == 0 {
+            return Ok(());
+        }
+
+        let key = DataKey::RateLimit(account.clone());
+        let now = env.ledger().timestamp();
+        let mut state: RateLimitState =
+            env.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(RateLimitState {
+                    window_start: now,
+                    count: 0,
+                });
+
+        if now >= state.window_start + config.rate_limit_window as u64 {
+            state.window_start = now;
+            state.count = 0;
+        }
+
+        if state.count >= config.rate_limit_max_calls {
+            return Err(Error::RateLimitExceeded);
+        }
+
+        state.count += 1;
+        env.storage().persistent().set(&key, &state);
+        Self::extend_persistent(env, &key);
+        Ok(())
     }
 
     /// Load a persistent entry and refresh its TTL in a single storage pass
@@ -1643,7 +1779,7 @@ impl OnboardingContract {
     /// # Storage Optimization Strategy
     /// - Compact representation: Only stores minimal required state per entry
     /// - Lazy TTL refresh: Only bump when entry is actively accessed (read pattern)
-    /// - Indexed access: O(1) lookups via `DataKey::VerificationHistoryIndexed(user, slot)`
+    /// - Indexed access: O(1) lookups via `DataKey::VerifHistEntry(user, slot)`
     /// - No Vec allocations: Eliminates runtime allocation overhead (Issue #82)
     ///
     /// # Arguments
@@ -1780,6 +1916,8 @@ impl OnboardingContract {
             min_escrow_count_for_verify: 5,
             min_volume_for_verify: 10_000_000_000, // 1000 USDC at 7 decimals
             escrow_contract: None,
+            rate_limit_window: DEFAULT_RATE_LIMIT_WINDOW,
+            rate_limit_max_calls: DEFAULT_RATE_LIMIT_MAX_CALLS,
         };
 
         // Store the configuration
@@ -1800,6 +1938,7 @@ impl OnboardingContract {
             successful_trades: 0,
             disputed_trades: 0,
             portfolio_cid: None,
+            profile_pic_cid: None,
             status: ProfileStatus::Active,
         };
 
@@ -1912,7 +2051,7 @@ impl OnboardingContract {
     /// * [`Error::AlreadyOnboarded`] — the address already has a profile.
     /// * [`Error::UsernameTaken`] — the normalized username is in use.
     /// * [`Error::UsernameTooShort`] / [`Error::UsernameTooLong`].
-    pub fn onboard_user(env: Env, user: Address, username: String, role: UserRole) -> UserProfile {
+    pub fn onboard_user(env: Env, user: Address, username: String, role: UserRole, profile_pic_cid: Option<String>) -> UserProfile {
         // [SECURITY] Endpoint #93: The registering user must prove ownership of the
         // supplied address. Unauthorized invocation without a valid user signature is
         // rejected before any state mutation.
@@ -1923,6 +2062,15 @@ impl OnboardingContract {
             Self::emit_onboard_failed_and_panic(&env, &user, Error::InvalidRole);
         }
 
+        // Validate profile picture CID format if provided (#723)
+        if let Some(ref cid) = profile_pic_cid {
+            if !validate_ipfs_cid(cid) {
+                Self::emit_onboard_failed_and_panic(&env, &user, Error::InvalidProfilePicCid);
+            }
+        }
+        let optimized_profile_pic_cid =
+            profile_pic_cid.map(|cid_str| Self::string_to_bytes(&env, &cid_str));
+
         // Get configuration
         let config: OnboardingConfig = env
             .storage()
@@ -1932,6 +2080,13 @@ impl OnboardingContract {
                 Self::emit_onboard_failed_and_panic(&env, &user, Error::NotInitialized)
             });
         Self::extend_persistent(&env, &DataKey::Config);
+
+        // [SECURITY] Issue #943: Throttle the volume of onboard_user calls the
+        // platform admin co-signs within a sliding window, preventing a
+        // compromised or scripted admin key from mass-onboarding accounts.
+        if let Err(e) = Self::enforce_rate_limit(&env, &config.platform_admin, &config) {
+            Self::emit_onboard_failed_and_panic(&env, &user, e);
+        }
 
         // [SECURITY] Endpoint #93: Only verified platform roles may approve new user
         // registrations. The platform admin must co-sign every onboarding transaction
@@ -2017,6 +2172,7 @@ impl OnboardingContract {
             successful_trades: 0,
             disputed_trades: 0,
             portfolio_cid: None,
+            profile_pic_cid: optimized_profile_pic_cid,
             status: ProfileStatus::Active,
         };
 
@@ -2160,7 +2316,7 @@ impl OnboardingContract {
             .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
         Self::extend_persistent(&env, &DataKey::Config);
 
-        let local_key = DataKey::ActiveContractCount(user.clone());
+        let local_key = DataKey::ActiveCount(user.clone());
         if let Some(count) = env.storage().persistent().get::<_, u32>(&local_key) {
             Self::extend_persistent(&env, &local_key);
             return count > 0;
@@ -2183,7 +2339,7 @@ impl OnboardingContract {
     /// scenarios — staggered multi-order settlement, reputation weighting by
     /// concurrent workload, and off-chain risk dashboards — need the exact
     /// concurrency level, not just a flag. This endpoint exposes the locally
-    /// maintained `DataKey::ActiveContractCount(user)` counter so off-chain
+    /// maintained `DataKey::ActiveCount(user)` counter so off-chain
     /// indexers and client UIs can read it directly without replaying every
     /// escrow event or making a cross-contract call.
     ///
@@ -2202,7 +2358,7 @@ impl OnboardingContract {
     /// # Storage side-effects
     /// - Reads and extends TTL on `DataKey::Config`.
     /// - Reads and (when present) extends TTL on
-    ///   `DataKey::ActiveContractCount(user)`.
+    ///   `DataKey::ActiveCount(user)`.
     /// - No `UserProfile` shape is touched, so no profile-version upgrade is
     ///   required (`CURRENT_USER_PROFILE_VERSION` unaffected).
     ///
@@ -2223,7 +2379,7 @@ impl OnboardingContract {
             .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
         Self::extend_persistent(&env, &DataKey::Config);
 
-        let key = DataKey::ActiveContractCount(user);
+        let key = DataKey::ActiveCount(user);
         match env.storage().persistent().get::<_, u32>(&key) {
             Some(count) => {
                 Self::extend_persistent(&env, &key);
@@ -2447,8 +2603,8 @@ impl OnboardingContract {
             _ => {} // Proceed for Buyer, Artisan, Moderator
         }
 
-        // Fetch and validate existing profile before mutation
-        let mut profile = Self::get_user_profile(&env, user.clone());
+        // Fetch and validate existing profile; reject deactivated accounts before mutation
+        let mut profile = Self::assert_user_onboarded_and_active(&env, user.clone());
 
         // [SECURITY] Prevent unnecessary state mutations and replay attacks
         // by recording state transition audit trail for forensic analysis
@@ -2504,11 +2660,7 @@ impl OnboardingContract {
     /// - User is the admin
     pub fn deactivate_profile(env: Env, user: Address) {
         user.require_auth();
-        let mut profile = Self::get_user_profile(&env, user.clone());
-
-        if profile.status == ProfileStatus::Deactivated {
-            env.panic_with_error(Error::ProfileDeactivated);
-        }
+        let mut profile = Self::assert_user_onboarded_and_active(&env, user.clone());
 
         let username_string = String::from_str(&env, profile.username.to_string().as_ref());
         let normalized = normalize_username(&env, &username_string);
@@ -2516,7 +2668,7 @@ impl OnboardingContract {
             env.panic_with_error(Error::Unauthorized);
         }
 
-        let local_key = DataKey::ActiveContractCount(user.clone());
+        let local_key = DataKey::ActiveCount(user.clone());
         if let Some(count) = env.storage().persistent().get::<_, u32>(&local_key) {
             Self::extend_persistent(&env, &local_key);
             if count > 0 {
@@ -2889,6 +3041,27 @@ impl OnboardingContract {
         Self::extend_persistent(&env, &DataKey::Config);
     }
 
+    /// Admin sets the `onboard_user` rate limit (#943).
+    ///
+    /// `window_seconds` is the sliding window length; `max_calls` is the
+    /// maximum number of `onboard_user` attempts a single account may make
+    /// within that window. `window_seconds == 0` disables rate limiting.
+    pub fn set_rate_limit_config(env: Env, window_seconds: u32, max_calls: u32) {
+        let mut config: OnboardingConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
+        Self::extend_persistent(&env, &DataKey::Config);
+
+        config.platform_admin.require_auth();
+        config.rate_limit_window = window_seconds;
+        config.rate_limit_max_calls = max_calls;
+
+        env.storage().persistent().set(&DataKey::Config, &config);
+        Self::extend_persistent(&env, &DataKey::Config);
+    }
+
     /// Get activity metrics for a user.
     ///
     /// # Integration notes — issue #469 / component #68
@@ -3043,7 +3216,7 @@ impl OnboardingContract {
     ///
     /// # Storage side-effects
     /// - Reads and extends TTL on `DataKey::Config`.
-    /// - Reads/writes and extends TTL on `DataKey::ActiveContractCount(user)`.
+    /// - Reads/writes and extends TTL on `DataKey::ActiveCount(user)`.
     /// - Extends TTL (if present) on `DataKey::UserProfile(user)` and
     ///   `DataKey::UserMetrics(user)` so active users do not silently fall out of
     ///   onboarding state due to key expiry between settlements.
@@ -3079,7 +3252,7 @@ impl OnboardingContract {
         // exists, so the removal below needs no extra `has` probe. The TTL is
         // not refreshed here either: this write path always ends by either
         // removing the entry or rewriting it with a fresh TTL (#447).
-        let key = DataKey::ActiveContractCount(user.clone());
+        let key = DataKey::ActiveCount(user.clone());
         let stored = env.storage().persistent().get::<_, u32>(&key);
         let current = stored.unwrap_or(0u32);
 
@@ -3277,7 +3450,7 @@ impl OnboardingContract {
     /// - Reads, writes, and extends TTL on `DataKey::UserProfile(user)`,
     ///   updating only `is_verified` to match `approve`. Profile version
     ///   (`CURRENT_USER_PROFILE_VERSION`) and all other fields are preserved.
-    /// - Removes `DataKey::VerificationRequest(user)` and compacts the queue.
+    /// - Removes `DataKey::VerifRequest(user)` and compacts the queue.
     /// - Appends a compact history entry with action `"approved"` or
     ///   `"rejected"` and `by = Some(platform_admin)`.
     ///
@@ -3368,8 +3541,8 @@ impl OnboardingContract {
     ///
     /// # Storage side-effects
     /// - Reads and extends TTL on `DataKey::Config`.
-    /// - Removes `DataKey::VerificationRequest(user)` (if present) and compacts
-    ///   the queue by advancing `DataKey::VerificationQueueHead`.
+    /// - Removes `DataKey::VerifRequest(user)` (if present) and compacts
+    ///   the queue by advancing `DataKey::VerifQueueHead`.
     /// - No `UserProfile` shape is touched, so no profile-version upgrade is
     ///   required (`CURRENT_USER_PROFILE_VERSION` unaffected).
     ///
@@ -3411,12 +3584,12 @@ impl OnboardingContract {
 
         Self::migrate_legacy_verification_history(&env, &user);
 
-        let count_key = DataKey::VerificationHistoryCount(user.clone());
+        let count_key = DataKey::VerifHistCount(user.clone());
         let count: u32 = Self::read_persistent(&env, &count_key).unwrap_or(0);
 
         let mut result = Vec::new(&env);
         for index in 0..count {
-            let entry_key = DataKey::VerificationHistoryIndexed(user.clone(), index);
+            let entry_key = DataKey::VerifHistEntry(user.clone(), index);
             if let Some(compact) =
                 Self::read_persistent::<_, CompactVerificationEntry>(&env, &entry_key)
             {
@@ -3434,12 +3607,12 @@ impl OnboardingContract {
     ///
     /// Advances the queue head past any stale entries (users whose pending
     /// request was cleared) before building the result. Returns only addresses
-    /// that still have an active [`DataKey::VerificationRequest`] entry.
+    /// that still have an active [`DataKey::VerifRequest`] entry.
     ///
     /// # Storage Side-Effects
-    /// - **Read** [`DataKey::VerificationQueueHead`] / [`DataKey::VerificationQueueTail`] — TTL extended.
-    /// - **Read** [`DataKey::VerificationQueueIndex(i)`] for each slot — stale entries removed.
-    /// - **Read** [`DataKey::VerificationRequest(user)`] for each candidate — TTL extended if active.
+    /// - **Read** [`DataKey::VerifQueueHead`] / [`DataKey::VerifQueueTail`] — TTL extended.
+    /// - **Read** [`DataKey::VerifQueueIdx(i)`] for each slot — stale entries removed.
+    /// - **Read** [`DataKey::VerifRequest(user)`] for each candidate — TTL extended if active.
     ///
     /// # Emitted Events
     /// None.
@@ -3459,8 +3632,8 @@ impl OnboardingContract {
 
         Self::advance_verification_head(&env);
 
-        let head = Self::get_queue_pointer(&env, &DataKey::VerificationQueueHead);
-        let tail = Self::get_queue_pointer(&env, &DataKey::VerificationQueueTail);
+        let head = Self::get_queue_pointer(&env, &DataKey::VerifQueueHead);
+        let tail = Self::get_queue_pointer(&env, &DataKey::VerifQueueTail);
         let mut queue = Vec::new(&env);
 
         for index in head..tail {
@@ -3468,7 +3641,7 @@ impl OnboardingContract {
             // the head slot that `advance_verification_head` touches. Without
             // this, a queue entry sitting behind a long-lived head request could
             // be archived and silently drop its user from the queue.
-            let queue_index_key = DataKey::VerificationQueueIndex(index);
+            let queue_index_key = DataKey::VerifQueueIdx(index);
             if let Some(user) = Self::read_persistent::<_, Address>(&env, &queue_index_key) {
                 if Self::is_verification_pending_internal(&env, &user) {
                     queue.push_back(user);
@@ -3601,14 +3774,14 @@ impl OnboardingContract {
     /// # Storage Side-Effects
     /// - **Read** [`DataKey::Config`] — reads bounds, TTL extended.
     /// - **Read** [`DataKey::UserProfile(user)`] — reads current username, TTL extended.
-    /// - **Read** [`DataKey::LastUsernameChange(user)`] — cooldown check.
-    /// - **Read** [`DataKey::UsernameChangeFee`] — reads fee amount, TTL extended.
-    /// - **Read** [`DataKey::UsernameChangeFeeToken`] — reads fee token, TTL extended.
+    /// - **Read** [`DataKey::LastUNameChange(user)`] — cooldown check.
+    /// - **Read** [`DataKey::UsernameFee`] — reads fee amount, TTL extended.
+    /// - **Read** [`DataKey::UsernameFeeToken`] — reads fee token, TTL extended.
     /// - **Remove** [`DataKey::Username(old_normalized)`] — releases old username.
     /// - **Write** [`DataKey::Username(new_normalized)`] — reserves new username, TTL extended.
     /// - **Write** [`DataKey::UserProfile(user)`] — new username + `is_verified = false`, TTL extended.
-    /// - **Write** [`DataKey::LastUsernameChange(user)`] — records timestamp, TTL extended.
-    /// - **Read/Write** [`DataKey::VerificationHistory(user)`] — appends `"username_changed_revoked"`.
+    /// - **Write** [`DataKey::LastUNameChange(user)`] — records timestamp, TTL extended.
+    /// - **Read/Write** [`DataKey::VerifHistLegacy(user)`] — appends `"username_changed_revoked"`.
     ///
     /// # Emitted Events
     /// - Topic: `("UsernameChanged",)` — Data: `user` address.
@@ -3660,7 +3833,7 @@ impl OnboardingContract {
         );
 
         // Enforce cooldown between username changes for the same user.
-        let cooldown_key = DataKey::LastUsernameChange(user.clone());
+        let cooldown_key = DataKey::LastUNameChange(user.clone());
         if let Some(last_change) = Self::read_persistent::<_, u64>(&env, &cooldown_key) {
             let current_time = env.ledger().timestamp();
             assert!(
@@ -3704,13 +3877,13 @@ impl OnboardingContract {
 
         // Record timestamp of username change
         env.storage().persistent().set(
-            &DataKey::LastUsernameChange(user.clone()),
+            &DataKey::LastUNameChange(user.clone()),
             &env.ledger().timestamp(),
         );
-        Self::extend_persistent(&env, &DataKey::LastUsernameChange(user.clone()));
+        Self::extend_persistent(&env, &DataKey::LastUNameChange(user.clone()));
 
         // Add history entry for revocation
-        let hist_key = DataKey::VerificationHistory(user.clone());
+        let hist_key = DataKey::VerifHistLegacy(user.clone());
         let mut history: Vec<VerificationEntry> = env
             .storage()
             .persistent()
@@ -3754,7 +3927,7 @@ impl OnboardingContract {
     ///
     /// # Storage Side-Effects
     /// - **Read** [`DataKey::Config`] — reads admin address, TTL extended.
-    /// - **Write** [`DataKey::UsernameChangeFee`] — stores fee, TTL extended.
+    /// - **Write** [`DataKey::UsernameFee`] — stores fee, TTL extended.
     ///
     /// # Emitted Events
     /// None.
@@ -3785,8 +3958,8 @@ impl OnboardingContract {
         Self::extend_persistent(&env, &DataKey::Config);
         env.storage()
             .persistent()
-            .set(&DataKey::UsernameChangeFee, &fee);
-        Self::extend_persistent(&env, &DataKey::UsernameChangeFee);
+            .set(&DataKey::UsernameFee, &fee);
+        Self::extend_persistent(&env, &DataKey::UsernameFee);
     }
 
     /// Set the token used to collect username change fees (admin only).
@@ -3803,7 +3976,7 @@ impl OnboardingContract {
     ///
     /// # Storage Side-Effects
     /// - **Read** [`DataKey::Config`] — reads admin address, TTL extended.
-    /// - **Write** [`DataKey::UsernameChangeFeeToken`] — stores token address, TTL extended.
+    /// - **Write** [`DataKey::UsernameFeeToken`] — stores token address, TTL extended.
     ///
     /// # Emitted Events
     /// None.
@@ -3828,8 +4001,8 @@ impl OnboardingContract {
         Self::extend_persistent(&env, &DataKey::Config);
         env.storage()
             .persistent()
-            .set(&DataKey::UsernameChangeFeeToken, &token);
-        Self::extend_persistent(&env, &DataKey::UsernameChangeFeeToken);
+            .set(&DataKey::UsernameFeeToken, &token);
+        Self::extend_persistent(&env, &DataKey::UsernameFeeToken);
     }
 
     /// Set the wallet that receives username change fees (admin only).
@@ -3843,7 +4016,7 @@ impl OnboardingContract {
     ///
     /// ## Storage side-effects
     /// - Reads and extends TTL on `DataKey::Config`.
-    /// - Writes and extends TTL on `DataKey::UsernameChangeFeeWallet`.
+    /// - Writes and extends TTL on `DataKey::UsernameFeeWallet`.
     /// - Does not modify profile shapes or `CURRENT_USER_PROFILE_VERSION`.
     ///
     /// ## Emitted events
@@ -3877,8 +4050,8 @@ impl OnboardingContract {
         Self::extend_persistent(&env, &DataKey::Config);
         env.storage()
             .persistent()
-            .set(&DataKey::UsernameChangeFeeWallet, &wallet);
-        Self::extend_persistent(&env, &DataKey::UsernameChangeFeeWallet);
+            .set(&DataKey::UsernameFeeWallet, &wallet);
+        Self::extend_persistent(&env, &DataKey::UsernameFeeWallet);
     }
 
     /// Get the current username change fee — Issue #114.
@@ -3886,7 +4059,7 @@ impl OnboardingContract {
     /// Returns `0` if no fee has been configured.
     ///
     /// # Storage Side-Effects
-    /// - **Read** [`DataKey::UsernameChangeFee`] — no TTL extension.
+    /// - **Read** [`DataKey::UsernameFee`] — no TTL extension.
     ///
     /// # Emitted Events
     /// None.
@@ -3894,7 +4067,7 @@ impl OnboardingContract {
     /// # Errors
     /// None.
     pub fn get_username_change_fee(env: Env) -> i128 {
-        Self::read_persistent(&env, &DataKey::UsernameChangeFee).unwrap_or(0)
+        Self::read_persistent(&env, &DataKey::UsernameFee).unwrap_or(0)
     }
 
     /// Get the configured token used for username change fees.
@@ -3902,7 +4075,7 @@ impl OnboardingContract {
     /// Returns `None` if no fee token has been set via [`set_username_fee_token`].
     ///
     /// # Storage Side-Effects
-    /// - **Read** [`DataKey::UsernameChangeFeeToken`] — TTL extended if key exists.
+    /// - **Read** [`DataKey::UsernameFeeToken`] — TTL extended if key exists.
     ///
     /// # Emitted Events
     /// None.
@@ -3922,7 +4095,7 @@ impl OnboardingContract {
     /// - No auth required; safe for simulation and read-only client previews.
     ///
     /// ## Storage side-effects
-    /// - Reads `DataKey::UsernameChangeFeeWallet` via `read_username_fee_wallet`.
+    /// - Reads `DataKey::UsernameFeeWallet` via `read_username_fee_wallet`.
     /// - When the key exists, extends its persistent TTL by `TTL_EXTENSION`
     ///   ledgers (~30 days).
     /// - When unset, returns `OnboardingConfig::platform_admin` without writing
@@ -4039,6 +4212,41 @@ impl OnboardingContract {
         // Emit event
         env.events()
             .publish((Symbol::new(&env, "PortfolioUpdated"),), &user);
+
+        profile
+    }
+
+    /// Update a user's profile picture IPFS CID (#723).
+    ///
+    /// Sets or clears the IPFS content identifier for a user's profile
+    /// picture. Available to all onboarded users (both buyers and artisans).
+    /// When set, the CID must pass `validate_ipfs_cid` checks.
+    ///
+    /// # Arguments
+    /// * `user` - User's wallet address (must sign)
+    /// * `profile_pic_cid` - IPFS CID to set, or `None` to remove
+    ///
+    /// # Returns
+    /// Updated `UserProfile` reflecting the new `profile_pic_cid` value.
+    ///
+    /// # Reverts if
+    /// - User not onboarded (`Error::UserNotFound`)
+    /// - Invalid CID format when `profile_pic_cid` is `Some`
+    pub fn update_profile_pic(env: Env, user: Address, profile_pic_cid: Option<String>) -> UserProfile {
+        user.require_auth();
+
+        let mut profile = Self::get_user_profile(&env, user.clone());
+
+        if let Some(ref cid) = profile_pic_cid {
+            assert!(validate_ipfs_cid(cid), "Invalid profile picture CID format");
+        }
+        let optimized_cid = profile_pic_cid.map(|cid_str| Self::string_to_bytes(&env, &cid_str));
+
+        Self::write_profile_pic_cid(&env, &user, optimized_cid.clone());
+        profile.profile_pic_cid = optimized_cid;
+
+        env.events()
+            .publish((Symbol::new(&env, "ProfilePicUpdated"),), &user);
 
         profile
     }
