@@ -342,7 +342,7 @@ fn test_cancel_recurring_escrow_cei_pattern() {
     let escrow: RecurringEscrow = env.as_contract(&contract_id, || {
         env.storage()
             .persistent()
-            .get(&DataKey::RecurringEscrow(id))
+            .get(&DataKey::RecurEscrow(id))
             .unwrap()
     });
     assert_eq!(escrow.is_active, false);
@@ -407,7 +407,6 @@ fn test_dispute_expired_recurring_escrow_arbitrator_fees() {
     let escrow = client.get_escrow(&order_id);
     assert_eq!(escrow.status, EscrowStatus::Resolved);
 }
-
 
 #[test]
 fn test_auto_release_cei_pattern() {

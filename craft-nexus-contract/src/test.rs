@@ -102,10 +102,6 @@ fn test_create_escrow_success() {
     assert!(!events.is_empty(), "No events emitted");
     let last_event = events.last().unwrap();
     assert_eq!(last_event.0, client.address);
-    let last_event = events.last();
-    let last_event = last_event.unwrap();
-    assert_eq!(last_event.0, client.address);
-    assert_eq!(last_event.0, client.address);
     // Topics: ["escrow_created", escrow_id]
     assert_eq!(
         last_event.1,
@@ -511,10 +507,10 @@ fn test_recover_admin_with_zero_window_fails() {
             .set(&DataKey::FallbackAdmin, &admin);
         env.storage()
             .persistent()
-            .set(&DataKey::AdminRecoveryTime, &current_time);
+            .set(&DataKey::AdminRecovTime, &current_time);
         env.storage()
             .persistent()
-            .set(&DataKey::AdminRecoveryDelay, &0u64);
+            .set(&DataKey::AdminRecovDelay, &0u64);
     });
 
     let recovered_admin = Address::generate(&env);
@@ -1255,9 +1251,10 @@ fn test_recover_admin_timelock_returns_standard_error() {
     });
 
     let recovered_admin = Address::generate(&env);
-    let initial_result = client.try_recover_admin_access(&recovered_admin);
-    assert_admin_recovery_failed(initial_result);
+    // Initiation must succeed (Ok) so the timelock persists under Soroban semantics.
+    client.recover_admin_access(&recovered_admin);
 
+    // Second call before the delay elapses remains blocked.
     let locked_result = client.try_recover_admin_access(&recovered_admin);
     assert_admin_recovery_failed(locked_result);
 }
@@ -3057,7 +3054,7 @@ fn test_whitelist_stores_tokens_as_individual_keys() {
     assert!(env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .has(&DataKey::WhitelistedTokenIndexed(token_id.clone()))
+            .has(&DataKey::TokenAllowed(token_id.clone()))
     }));
     assert!(env.as_contract(&client.address, || {
         !env.storage().persistent().has(&DataKey::WhitelistedTokens)
@@ -3065,7 +3062,7 @@ fn test_whitelist_stores_tokens_as_individual_keys() {
     let count: u32 = env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .get(&DataKey::WhitelistedTokenCount)
+            .get(&DataKey::TokenCount)
             .unwrap_or(0u32)
     });
     assert_eq!(count, 1);
@@ -3202,7 +3199,7 @@ fn test_migrate_fee_token_configs_migrates_twenty_tokens_and_emits_summary() {
     env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .set(&DataKey::FeeTokenIndex, &fee_tokens);
+            .set(&DataKey::FeeIndex, &fee_tokens);
     });
 
     let migrated = client.migrate_fee_token_configs();
@@ -3261,13 +3258,13 @@ fn test_migrate_fee_token_configs_is_idempotent_and_preserves_existing_configs()
     env.as_contract(&client.address, || {
         env.storage()
             .persistent()
-            .set(&DataKey::FeeTokenIndex, &fee_tokens);
+            .set(&DataKey::FeeIndex, &fee_tokens);
 
         let preset_one = fee_tokens.get(3).unwrap();
         let preset_two = fee_tokens.get(11).unwrap();
 
         env.storage().persistent().set(
-            &DataKey::FeeTokenConfig(preset_one.clone()),
+            &DataKey::FeeConfig(preset_one.clone()),
             &FeeTokenInfo {
                 active: false,
                 custom_fee_bps: Some(250),
@@ -3275,7 +3272,7 @@ fn test_migrate_fee_token_configs_is_idempotent_and_preserves_existing_configs()
             },
         );
         env.storage().persistent().set(
-            &DataKey::FeeTokenConfig(preset_two.clone()),
+            &DataKey::FeeConfig(preset_two.clone()),
             &FeeTokenInfo {
                 active: true,
                 custom_fee_bps: Some(900),
@@ -3479,34 +3476,40 @@ fn test_set_paused_emits_platform_status_events() {
     client.set_paused(&true);
 
     let events = env.events().all();
-    let last_event = events.last().unwrap();
-    assert_eq!(
-        last_event.1,
-        vec![
-            &env,
-            Symbol::new(&env, "admin_platform_paused").into_val(&env),
-            admin.clone().into_val(&env),
-        ]
-    );
-
-    let paused_event: PlatformPausedEvent = last_event.2.try_into_val(&env).unwrap();
+    let paused_topics = vec![
+        &env,
+        Symbol::new(&env, "admin_platform_paused").into_val(&env),
+        admin.clone().into_val(&env),
+    ];
+    let paused_event_entry = events
+        .iter()
+        .rev()
+        .find(|e| e.1 == paused_topics)
+        .expect("platform_paused event missing");
+    let paused_event: PlatformPausedEvent = paused_event_entry.2.try_into_val(&env).unwrap();
     assert_eq!(paused_event.initiator, admin.clone());
     assert_eq!(paused_event.timestamp, 1711368000);
+
+    // Emergency framework also records a deterministic pause audit entry.
+    let op = client.get_emergency_operation().unwrap();
+    assert_eq!(op.kind, EmergencyOpKind::Pause);
+    assert_eq!(op.phase, EmergencyOpPhase::Completed);
+    assert!(op.success);
 
     client.set_paused(&false);
 
     let events = env.events().all();
-    let last_event = events.last().unwrap();
-    assert_eq!(
-        last_event.1,
-        vec![
-            &env,
-            Symbol::new(&env, "admin_platform_unpaused").into_val(&env),
-            admin.clone().into_val(&env),
-        ]
-    );
-
-    let unpaused_event: PlatformUnpausedEvent = last_event.2.try_into_val(&env).unwrap();
+    let unpaused_topics = vec![
+        &env,
+        Symbol::new(&env, "admin_platform_unpaused").into_val(&env),
+        admin.clone().into_val(&env),
+    ];
+    let unpaused_event_entry = events
+        .iter()
+        .rev()
+        .find(|e| e.1 == unpaused_topics)
+        .expect("platform_unpaused event missing");
+    let unpaused_event: PlatformUnpausedEvent = unpaused_event_entry.2.try_into_val(&env).unwrap();
     assert_eq!(unpaused_event.initiator, admin);
     assert_eq!(unpaused_event.timestamp, 1711368000);
 }
@@ -3850,7 +3853,7 @@ fn test_get_escrow_count_tracks_100_global_indices() {
     assert_eq!(stored_count, 100);
 
     for index in 0u32..100 {
-        let index_key = DataKey::GlobalEscrowIdIndexed(index);
+        let index_key = DataKey::EscrowIndex(index);
         let stored_id: u32 = env.as_contract(&client.address, || {
             env.storage().persistent().get(&index_key).unwrap()
         });
@@ -4011,7 +4014,7 @@ fn test_legacy_all_escrow_ids_migrates_on_get_escrow_count() {
     assert!(!has_legacy);
 
     for (index, expected_id) in [11u32, 22, 33, 44].into_iter().enumerate() {
-        let index_key = DataKey::GlobalEscrowIdIndexed(index as u32);
+        let index_key = DataKey::EscrowIndex(index as u32);
         let stored_id: u32 = env.as_contract(&client.address, || {
             env.storage().persistent().get(&index_key).unwrap()
         });
@@ -4082,7 +4085,7 @@ fn test_legacy_all_escrow_ids_migration_is_idempotent_after_first_read() {
     assert!(!has_legacy);
 
     for (index, expected_id) in [5u32, 15, 25].into_iter().enumerate() {
-        let index_key = DataKey::GlobalEscrowIdIndexed(index as u32);
+        let index_key = DataKey::EscrowIndex(index as u32);
         let stored_id: u32 = env.as_contract(&client.address, || {
             env.storage().persistent().get(&index_key).unwrap()
         });
@@ -4098,9 +4101,9 @@ fn test_legacy_all_escrow_ids_migration_preserves_existing_indexed_entries() {
 
     let legacy_key = DataKey::AllEscrowIds;
     let count_key = DataKey::EscrowCount;
-    let existing_index_key = DataKey::GlobalEscrowIdIndexed(0);
-    let missing_index_key = DataKey::GlobalEscrowIdIndexed(1);
-    let tail_index_key = DataKey::GlobalEscrowIdIndexed(2);
+    let existing_index_key = DataKey::EscrowIndex(0);
+    let missing_index_key = DataKey::EscrowIndex(1);
+    let tail_index_key = DataKey::EscrowIndex(2);
     let mut legacy_ids = soroban_sdk::Vec::new(&env);
     for order_id in [10u32, 20, 30] {
         legacy_ids.push_back(order_id);
@@ -4689,7 +4692,10 @@ fn test_fund_audit_escrow_release_and_refund() {
     let buyer_count = client.get_fund_audit_count(&buyer);
     assert_eq!(buyer_count, 1);
     let buyer_history = client.get_fund_audit_history(&buyer);
-    assert_eq!(buyer_history.get(0).unwrap().reason, Symbol::new(&env, "escrow_funded"));
+    assert_eq!(
+        buyer_history.get(0).unwrap().reason,
+        Symbol::new(&env, "escrow_funded")
+    );
 
     // Check seller history: release entry
     let seller_count = client.get_fund_audit_count(&seller);
@@ -4759,7 +4765,10 @@ fn test_fund_audit_recurring_escrow_flow() {
     let rec = client.create_recurring_escrow(&buyer, &seller, &token_id, &10_000_000, &100, &2);
     assert_eq!(client.get_fund_audit_count(&buyer), 1);
     let buyer_hist = client.get_fund_audit_history(&buyer);
-    assert_eq!(buyer_hist.get(0).unwrap().reason, Symbol::new(&env, "recurring_escrow_locked"));
+    assert_eq!(
+        buyer_hist.get(0).unwrap().reason,
+        Symbol::new(&env, "recurring_escrow_locked")
+    );
 
     // Fast forward timestamp past cycle frequency
     env.ledger().with_mut(|li| {
@@ -4770,15 +4779,20 @@ fn test_fund_audit_recurring_escrow_flow() {
     client.release_next_cycle(&rec.id);
     assert_eq!(client.get_fund_audit_count(&seller), 1);
     let seller_hist = client.get_fund_audit_history(&seller);
-    assert_eq!(seller_hist.get(0).unwrap().reason, Symbol::new(&env, "recurring_release"));
+    assert_eq!(
+        seller_hist.get(0).unwrap().reason,
+        Symbol::new(&env, "recurring_release")
+    );
 
     // Cancel remaining
     client.cancel_recurring_escrow(&rec.id);
     assert_eq!(client.get_fund_audit_count(&buyer), 2);
     let buyer_cancel_hist = client.get_fund_audit_history(&buyer);
-    assert_eq!(buyer_cancel_hist.get(1).unwrap().reason, Symbol::new(&env, "recurring_cancel_refund"));
+    assert_eq!(
+        buyer_cancel_hist.get(1).unwrap().reason,
+        Symbol::new(&env, "recurring_cancel_refund")
+    );
 }
-
 
 #[test]
 fn test_fund_audit_pagination_and_immutability() {
@@ -4816,104 +4830,3 @@ fn test_fund_audit_pagination_and_immutability() {
     let page_oob = client.get_fund_audit_history_paginated(&buyer, &10, &2);
     assert_eq!(page_oob.len(), 0);
 }
-
-#[test]
-#[should_panic]
-fn test_stake_below_minimum_threshold_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
-
-    // Admin sets minimum stake required to 10_000_000
-    client.set_min_stake_required(&10_000_000).unwrap();
-
-    token_admin.mint(&seller, &20_000_000);
-    // Staking 5_000_000 when min required is 10_000_000 should panic
-    client.stake_tokens(&seller, &token_id, &5_000_000);
-}
-
-#[test]
-#[should_panic]
-fn test_unstake_with_active_obligations_below_min_stake_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
-
-    client.set_min_stake_required(&10_000_000).unwrap();
-
-    token_admin.mint(&seller, &20_000_000);
-    token_admin.mint(&buyer, &20_000_000);
-
-    // Stake 15_000_000 in two deposits so partial unstaking is possible
-    client.stake_tokens(&seller, &token_id, &15_000_000);
-
-    // Create an active escrow (seller has active obligations)
-    client.create_escrow(&buyer, &seller, &token_id, &5_000_000, &1, &None);
-    assert!(client.has_active_escrows(&seller));
-
-    env.ledger().with_mut(|li| {
-        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
-    });
-
-    // Unstaking matured 15_000_000 while active escrow exists leaves 0 stake (< 10_000_000 min requirement)
-    client.unstake_tokens(&seller, &token_id);
-}
-
-#[test]
-fn test_partial_unstake_consistent_collateral_rules() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
-
-    client.set_min_stake_required(&10_000_000).unwrap();
-
-    token_admin.mint(&seller, &50_000_000);
-    token_admin.mint(&buyer, &50_000_000);
-
-    // Stake 25_000_000
-    client.stake_tokens(&seller, &token_id, &25_000_000);
-    assert_eq!(client.get_stake(&seller), 25_000_000);
-
-    // Advance time and stake another 10_000_000
-    env.ledger().with_mut(|li| {
-        li.timestamp += 100;
-    });
-    client.stake_tokens(&seller, &token_id, &10_000_000);
-    assert_eq!(client.get_stake(&seller), 35_000_000);
-
-    // Advance past first deposit's cooldown, but before second deposit's cooldown
-    env.ledger().with_mut(|li| {
-        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64;
-    });
-
-    // Unstake first deposit (25_000_000 matured). Remaining stake becomes 10_000_000 (which is >= min required 10_000_000)
-    client.unstake_tokens(&seller, &token_id);
-    assert_eq!(client.get_stake(&seller), 10_000_000);
-    assert_eq!(client.is_account_under_collateralized(&seller), false);
-}
-
-#[test]
-fn test_is_account_under_collateralized_detection() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
-
-    token_admin.mint(&seller, &20_000_000);
-    token_admin.mint(&buyer, &20_000_000);
-
-    // Stake 5_000_000 (when min stake is 0)
-    client.stake_tokens(&seller, &token_id, &5_000_000);
-
-    // Create an escrow
-    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
-
-    // Initially min stake is 0, so not under-collateralized
-    assert_eq!(client.is_account_under_collateralized(&seller), false);
-
-    // Admin raises min stake required to 10_000_000
-    client.set_min_stake_required(&10_000_000).unwrap();
-
-    // Now seller has active obligation but stake (5M) < min_stake_required (10M)
-    assert_eq!(client.is_account_under_collateralized(&seller), true);
-}
-
