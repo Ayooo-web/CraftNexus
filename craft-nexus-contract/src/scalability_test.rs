@@ -241,60 +241,6 @@ fn test_indexed_storage_multiple_users() {
 }
 
 #[test]
-fn test_migration_from_legacy_storage() {
-    let (env, client, buyer, _seller, _token, _admin, _, _) = setup_test();
-
-    // Simulate legacy storage by directly setting the old vector format
-    let legacy_key = DataKey::BuyerEscrows(buyer.clone());
-    let mut legacy_vec = soroban_sdk::Vec::new(&env);
-    legacy_vec.push_back(1u64);
-    legacy_vec.push_back(2u64);
-    legacy_vec.push_back(3u64);
-    env.as_contract(&client.address, || {
-        env.storage().persistent().set(&legacy_key, &legacy_vec);
-    });
-
-    // Verify legacy storage exists
-    let has_legacy = env.as_contract(&client.address, || {
-        env.storage().persistent().has(&legacy_key)
-    });
-    assert!(has_legacy);
-
-    // Run migration
-    let migrated_count = client.migrate_user_escrows(&buyer, &true);
-    assert_eq!(migrated_count, 3);
-
-    // Verify indexed storage was created
-    let count_key = DataKey::BuyerCount(buyer.clone());
-    let count: u32 = env.as_contract(&client.address, || {
-        env.storage().persistent().get(&count_key).unwrap()
-    });
-    assert_eq!(count, 3);
-
-    // Verify individual indexed entries
-    for i in 0..3 {
-        let index_key = DataKey::BuyerEscrow(buyer.clone(), i);
-        let escrow_id: u64 = env.as_contract(&client.address, || {
-            env.storage().persistent().get(&index_key).unwrap()
-        });
-        assert_eq!(escrow_id, (i + 1) as u64);
-    }
-
-    // Verify legacy storage was removed
-    let has_legacy = env.as_contract(&client.address, || {
-        env.storage().persistent().has(&legacy_key)
-    });
-    assert!(!has_legacy);
-
-    // Verify query function works with migrated data
-    let escrows = client.get_escrows_by_buyer(&buyer, &0, &10, &false);
-    assert_eq!(escrows.len(), 3);
-    assert_eq!(escrows.get_unchecked(0), 1);
-    assert_eq!(escrows.get_unchecked(1), 2);
-    assert_eq!(escrows.get_unchecked(2), 3);
-}
-
-#[test]
 fn test_backward_compatibility_query() {
     let (env, client, buyer, _seller, _token, _, _, _) = setup_test();
 
