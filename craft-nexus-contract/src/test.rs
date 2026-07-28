@@ -1147,6 +1147,87 @@ fn test_recover_admin_timelock_returns_standard_error() {
     assert_admin_recovery_failed(locked_result);
 }
 
+// ===== Admin recovery edge case snapshot tests =====
+
+#[test]
+fn test_recover_admin_access_zero_cooldown_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _buyer, _seller, _token_id, _token_admin, _platform_wallet, admin) =
+        setup_test(&env, true);
+
+    // Simulate a direct-storage bypass attempt: the time lock has already
+    // elapsed (recovery_time == current_time) but the recorded cooldown
+    // delay is zero. This must be rejected even though the timelock check
+    // itself would otherwise pass.
+    let current_time = env.ledger().timestamp();
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::FallbackAdmin, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AdminRecoveryTime, &current_time);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AdminRecoveryDelay, &0u64);
+    });
+
+    let recovered_admin = Address::generate(&env);
+    let result = client.try_recover_admin_access(&recovered_admin);
+    assert_admin_recovery_failed(result);
+}
+
+#[test]
+fn test_recover_admin_access_same_address_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _buyer, _seller, _token_id, _token_admin, _platform_wallet, admin) =
+        setup_test(&env, true);
+
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::FallbackAdmin, &admin);
+    });
+
+    // Attempting to "recover" to the address that is already the current
+    // admin must fail rather than silently succeeding as a no-op.
+    let result = client.try_recover_admin_access(&admin);
+    assert_admin_recovery_failed(result);
+}
+
+#[test]
+fn test_recover_admin_access_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _buyer, _seller, _token_id, _token_admin, _platform_wallet, admin) =
+        setup_test(&env, true);
+
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::FallbackAdmin, &admin);
+    });
+
+    let recovered_admin = Address::generate(&env);
+
+    // First call initiates the 7-day time lock and fails.
+    let initial_result = client.try_recover_admin_access(&recovered_admin);
+    assert_admin_recovery_failed(initial_result);
+
+    // Advance the ledger past the minimum recovery cooldown.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 7 * 24 * 60 * 60 + 1;
+    });
+
+    // Second call, after the time lock has elapsed, must succeed.
+    client.try_recover_admin_access(&recovered_admin).unwrap().unwrap();
+
+    let config = client.get_platform_config();
+    assert_eq!(config.admin, recovered_admin);
+}
+
 #[test]
 fn test_wasm_upgrade_grace_period() {
     let env = Env::default();
