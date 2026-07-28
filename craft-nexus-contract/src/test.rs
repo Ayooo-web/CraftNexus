@@ -2475,6 +2475,119 @@ fn test_create_batch_escrow_requires_authorization_for_each_distinct_buyer() {
     client.create_batch_escrow(&1u64, &escrow_params);
 }
 
+// ===== Issue #111 — batch escrow boundary scenarios =====
+
+#[test]
+fn test_create_batch_escrow_at_max_size() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &1_000_000_000);
+
+    let mut batch_params = vec![&env];
+    for i in 0..MAX_BATCH_SIZE {
+        batch_params.push_back(EscrowCreateParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: token_id.clone(),
+            amount: 1_000,
+            order_id: 500 + i,
+            release_window: Some(3600),
+            ipfs_hash: None,
+            metadata_hash: None,
+        });
+    }
+    assert_eq!(batch_params.len(), MAX_BATCH_SIZE);
+
+    let results = client.create_batch_escrow(&10u64, &batch_params);
+    assert_eq!(results.len(), MAX_BATCH_SIZE);
+
+    for i in 0..MAX_BATCH_SIZE {
+        let escrow = client.get_escrow(&(500 + i));
+        assert_eq!(escrow.status, EscrowStatus::Active);
+        assert_eq!(escrow.batch_id, Some(10u64));
+    }
+}
+
+#[test]
+fn test_create_batch_escrow_exceeds_max_size() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &1_000_000_000);
+
+    let mut batch_params = vec![&env];
+    for i in 0..(MAX_BATCH_SIZE + 1) {
+        batch_params.push_back(EscrowCreateParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: token_id.clone(),
+            amount: 1_000,
+            order_id: 600 + i,
+            release_window: Some(3600),
+            ipfs_hash: None,
+            metadata_hash: None,
+        });
+    }
+    assert_eq!(batch_params.len(), MAX_BATCH_SIZE + 1);
+
+    // The whole batch must be rejected — none of the escrows should be created.
+    let result = client.try_create_batch_escrow(&11u64, &batch_params);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), Ok(Error::BatchLimitExceeded));
+
+    for i in 0..(MAX_BATCH_SIZE + 1) {
+        let escrow_result = client.try_get_escrow(&(600 + i));
+        assert!(
+            escrow_result.is_err(),
+            "no escrow should have been created when the batch exceeds MAX_BATCH_SIZE"
+        );
+    }
+}
+
+#[test]
+#[should_panic]
+fn test_create_batch_escrow_multi_buyer_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    let second_buyer = Address::generate(&env);
+    token_admin.mint(&buyer, &1_000_000_000);
+    token_admin.mint(&second_buyer, &1_000_000_000);
+
+    let escrow_params = vec![
+        &env,
+        EscrowCreateParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: token_id.clone(),
+            amount: 1_000,
+            order_id: 700,
+            release_window: Some(3600),
+            ipfs_hash: None,
+            metadata_hash: None,
+        },
+        EscrowCreateParams {
+            buyer: second_buyer.clone(),
+            seller: seller.clone(),
+            token: token_id.clone(),
+            amount: 2_000,
+            order_id: 701,
+            release_window: Some(3600),
+            ipfs_hash: None,
+            metadata_hash: None,
+        },
+    ];
+
+    // Strip all mocked authorizations so neither buyer — in particular the
+    // second, distinct buyer — has a valid auth entry for this call.
+    env.set_auths(&[]);
+    client.create_batch_escrow(&12u64, &escrow_params);
+}
+
 #[test]
 fn test_release_batch_funds_success() {
     let env = Env::default();
