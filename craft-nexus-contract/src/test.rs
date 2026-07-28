@@ -2118,6 +2118,204 @@ fn test_signer_rotation_cannot_inflate_approval_count() {
     assert!(client.get_upgrade_proposal().is_some(), "proposal must commit after 2 of 2 original signers");
 }
 
+// ===== Issue #95 — multi-sig threshold boundary scenarios =====
+
+/// Threshold of 1 with a single, explicitly configured signer (not the
+/// admin-fallback default). A lone signer's approval must commit immediately.
+#[test]
+fn test_multisig_threshold_one_explicit_signer_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let sole_signer = Address::generate(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(sole_signer.clone());
+    client.set_upgrade_signers(&signers);
+    client.set_upgrade_threshold(&1);
+
+    let hash = BytesN::from_array(&env, &[20u8; 32]);
+
+    // The admin itself is no longer a signer once an explicit list is set,
+    // so it must be rejected.
+    let admin_result = client.try_propose_upgrade_wasm(&admin, &hash);
+    assert!(admin_result.is_err(), "admin is not in the explicit signer list");
+
+    client.propose_upgrade_wasm(&sole_signer, &hash);
+    let proposal = client.get_upgrade_proposal().expect("proposal missing");
+    assert_eq!(proposal.wasm_hash, hash);
+    assert_eq!(proposal.proposed_by, sole_signer);
+}
+
+/// Threshold exactly equal to the number of configured signers (3-of-3):
+/// every single signer must approve before the proposal commits.
+#[test]
+fn test_multisig_threshold_equals_signer_count_three_of_three() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let signer3 = Address::generate(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer2.clone());
+    signers.push_back(signer3.clone());
+
+    client.set_upgrade_signers(&signers);
+    client.set_upgrade_threshold(&3);
+
+    let hash = BytesN::from_array(&env, &[21u8; 32]);
+
+    client.propose_upgrade_wasm(&admin, &hash);
+    assert!(client.get_upgrade_proposal().is_none(), "1 of 3 must not commit");
+
+    client.propose_upgrade_wasm(&signer2, &hash);
+    assert!(client.get_upgrade_proposal().is_none(), "2 of 3 must not commit");
+
+    client.propose_upgrade_wasm(&signer3, &hash);
+    let proposal = client.get_upgrade_proposal().expect("proposal missing");
+    assert_eq!(proposal.wasm_hash, hash);
+    assert_eq!(proposal.proposed_by, signer3);
+}
+
+/// Removing a signer from the live `UpgradeSigners` list mid-round must not
+/// invalidate that signer's already-recorded approval, since the round's
+/// signer set was snapshotted when the round opened (complements the
+/// signer-addition case in `test_signer_rotation_cannot_inflate_approval_count`).
+#[test]
+fn test_signer_removed_mid_round_does_not_invalidate_recorded_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let signer3 = Address::generate(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer2.clone());
+    signers.push_back(signer3.clone());
+
+    client.set_upgrade_signers(&signers);
+    client.set_upgrade_threshold(&3);
+
+    let hash = BytesN::from_array(&env, &[22u8; 32]);
+
+    // Round opens: snapshot captures {admin, signer2, signer3}, threshold=3.
+    client.propose_upgrade_wasm(&admin, &hash);
+
+    // signer3 is removed from the live signers list after the round opened.
+    let mut reduced_signers = Vec::new(&env);
+    reduced_signers.push_back(admin.clone());
+    reduced_signers.push_back(signer2.clone());
+    client.set_upgrade_signers(&reduced_signers);
+
+    // signer2 (still live) approves.
+    client.propose_upgrade_wasm(&signer2, &hash);
+    assert!(client.get_upgrade_proposal().is_none(), "2 of 3 snapshotted signers must not commit");
+
+    // signer3, though removed from the live list, was part of this round's
+    // snapshot and must still be able to complete it.
+    client.propose_upgrade_wasm(&signer3, &hash);
+    let proposal = client.get_upgrade_proposal().expect("proposal missing");
+    assert_eq!(proposal.wasm_hash, hash);
+    assert_eq!(proposal.proposed_by, signer3);
+}
+
+/// A committed proposal that is never executed before its operators move on
+/// ("expires" in practice) must be cancellable and, after the
+/// cancel-repropose cooldown elapses, replaceable with a new proposal.
+#[test]
+fn test_stale_upgrade_proposal_cancelled_and_reproposed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let stale_hash = BytesN::from_array(&env, &[23u8; 32]);
+    client.propose_upgrade_wasm(&admin, &stale_hash);
+    let stale_proposal = client.get_upgrade_proposal().expect("proposal missing");
+    assert_eq!(stale_proposal.wasm_hash, stale_hash);
+
+    // Let a long time pass without executing — the proposal goes stale but
+    // remains pending since there is no automatic expiry, only the cooldown
+    // gate on execute_upgrade.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 30 * 24 * 60 * 60; // 30 days
+    });
+    assert!(client.get_upgrade_proposal().is_some(), "no automatic expiry — proposal still pending");
+
+    // The stale proposal is cancelled instead of executed.
+    client.cancel_upgrade_wasm();
+    assert!(client.get_upgrade_proposal().is_none());
+
+    // Advance past CANCEL_REPROPOSE_COOLDOWN (7 days + 1s) so a new proposal
+    // is accepted.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 7 * 24 * 60 * 60 + 1;
+    });
+
+    let new_hash = BytesN::from_array(&env, &[24u8; 32]);
+    client.propose_upgrade_wasm(&admin, &new_hash);
+    let proposal = client.get_upgrade_proposal().expect("proposal missing");
+    assert_eq!(proposal.wasm_hash, new_hash);
+}
+
+/// `get_upgrade_history` must append exactly one record per successful
+/// `execute_upgrade`, preserving from/to version pairs across multiple
+/// upgrades.
+#[test]
+fn test_get_upgrade_history_records_each_successful_upgrade() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    assert_eq!(client.get_upgrade_history().len(), 0);
+
+    // First upgrade: version 1 -> 2.
+    let wasm_one = Bytes::from_array(&env, &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+    let hash_one = env.deployer().upload_contract_wasm(wasm_one);
+
+    client.propose_upgrade_wasm(&admin, &hash_one);
+    env.ledger().with_mut(|li| {
+        li.timestamp += 7 * 24 * 60 * 60 + 1;
+    });
+    client.execute_upgrade(&hash_one);
+    assert_eq!(client.get_version(), 2);
+
+    let history_after_first = client.get_upgrade_history();
+    assert_eq!(history_after_first.len(), 1);
+    let first_record = history_after_first.get(0).unwrap();
+    assert_eq!(first_record.from_version, 1);
+    assert_eq!(first_record.to_version, 2);
+    assert_eq!(first_record.wasm_hash, hash_one);
+    assert_eq!(first_record.admin, admin);
+
+    // Second upgrade: version 2 -> 3. A distinct (but still structurally
+    // valid — magic + version + one empty custom section) module so its
+    // hash differs from the first.
+    let wasm_two = Bytes::from_array(
+        &env,
+        &[
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+        ],
+    );
+    let hash_two = env.deployer().upload_contract_wasm(wasm_two);
+
+    client.propose_upgrade_wasm(&admin, &hash_two);
+    env.ledger().with_mut(|li| {
+        li.timestamp += 7 * 24 * 60 * 60 + 1;
+    });
+    client.execute_upgrade(&hash_two);
+    assert_eq!(client.get_version(), 3);
+
+    let history_after_second = client.get_upgrade_history();
+    assert_eq!(history_after_second.len(), 2);
+    let second_record = history_after_second.get(1).unwrap();
+    assert_eq!(second_record.from_version, 2);
+    assert_eq!(second_record.to_version, 3);
+    assert_eq!(second_record.wasm_hash, hash_two);
+}
+
 /// AC3: A pending proposal remains immutable after threshold approval is reached.
 /// After the proposal is committed via propose_upgrade_wasm, any call to
 /// propose_upgrade_wasm for the same hash must fail with UpgradeProposalExists.
