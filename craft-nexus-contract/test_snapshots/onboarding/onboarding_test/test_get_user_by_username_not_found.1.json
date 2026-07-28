@@ -125,22 +125,6 @@
                     },
                     {
                       "key": {
-                        "symbol": "rate_limit_max_calls"
-                      },
-                      "val": {
-                        "u32": 5
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "rate_limit_window"
-                      },
-                      "val": {
-                        "u32": 3600
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "require_username"
                       },
                       "val": {
@@ -510,22 +494,6 @@
                 },
                 {
                   "key": {
-                    "symbol": "rate_limit_max_calls"
-                  },
-                  "val": {
-                    "u32": 5
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "rate_limit_window"
-                  },
-                  "val": {
-                    "u32": 3600
-                  }
-                },
-                {
-                  "key": {
                     "symbol": "require_username"
                   },
                   "val": {
@@ -580,7 +548,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Username not found' from contract function 'Symbol(obj#95)'"
+                  "string": "caught panic 'Username not found' from contract function 'Symbol(obj#87)'"
                 },
                 {
                   "string": "nonexistent"
