@@ -32,7 +32,7 @@ fn setup_test(
     let admin = Address::generate(env);
 
     let token_admin = Address::generate(env);
-    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_contract = env.register_stellar_asset_contract(token_admin.clone());
     let token_admin_client = token::StellarAssetClient::new(env, &token_contract.address());
 
     let arbitrator = Address::generate(env);
@@ -611,7 +611,7 @@ fn test_platform_fee_deduction_10_percent() {
     let admin = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_contract = env.register_stellar_asset_contract(token_admin.clone());
     let token_admin_client = token::StellarAssetClient::new(&env, &token_contract.address());
 
     let arbitrator = Address::generate(&env);
@@ -721,7 +721,7 @@ fn test_update_platform_fee() {
     let seller = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_contract = env.register_stellar_asset_contract(token_admin.clone());
     let token_admin_client = token::StellarAssetClient::new(&env, &token_contract.address());
 
     let arbitrator = Address::generate(&env);
@@ -786,7 +786,7 @@ fn test_update_platform_fee_too_high() {
     let platform_wallet = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let _token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let _token_contract = env.register_stellar_asset_contract(token_admin.clone());
 
     let arbitrator = Address::generate(&env);
 
@@ -1277,13 +1277,13 @@ fn test_integration_multiple_tokens_and_escrows() {
 
     // Token A
     let token_a_admin = Address::generate(&env);
-    let token_a_contract = env.register_stellar_asset_contract_v2(token_a_admin.clone());
+    let token_a_contract = env.register_stellar_asset_contract(token_a_admin.clone());
     let token_a_asset = token::StellarAssetClient::new(&env, &token_a_contract.address());
     token_a_asset.mint(&buyer, &100_000_000);
 
     // Token B
     let token_b_admin = Address::generate(&env);
-    let token_b_contract = env.register_stellar_asset_contract_v2(token_b_admin.clone());
+    let token_b_contract = env.register_stellar_asset_contract(token_b_admin.clone());
     let token_b_asset = token::StellarAssetClient::new(&env, &token_b_contract.address());
     token_b_asset.mint(&buyer, &200_000_000);
 
@@ -1376,7 +1376,7 @@ fn test_unstake_rejects_different_token_than_original_stake() {
     let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
     let other_token_admin = Address::generate(&env);
-    let other_token_contract = env.register_stellar_asset_contract_v2(other_token_admin.clone());
+    let other_token_contract = env.register_stellar_asset_contract(other_token_admin.clone());
     let other_token_admin_client =
         token::StellarAssetClient::new(&env, &other_token_contract.address());
 
@@ -1695,7 +1695,7 @@ fn test_contract_address_admin_is_authorized() {
     let admin_contract = env.register_contract(None, CraftNexusContract);
     let arbitrator = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_contract = env.register_stellar_asset_contract(token_admin.clone());
 
     env.ledger().with_mut(|li| {
         li.timestamp = 1711368000;
@@ -1787,7 +1787,102 @@ fn test_get_version_initially() {
     assert_eq!(client.get_version(), 1);
 }
 
-// ===== Multi-sig upgrade tests =====
+#[test]
+fn test_execute_upgrade_rejects_legacy_storage_layout_without_migration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::StorageLayoutVersion);
+    });
+
+    let hash = BytesN::from_array(&env, &[9u8; 32]);
+    let result = client.try_execute_upgrade(&hash);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), Ok(Error::StorageLayoutMismatch));
+}
+
+#[test]
+fn test_migrate_storage_layout_marks_current_layout_and_preserves_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::StorageLayoutVersion);
+    });
+
+    let migrated = client.migrate_storage_layout();
+    assert_eq!(migrated, 1);
+    assert_eq!(client.get_storage_layout_version(), CURRENT_STORAGE_LAYOUT_VERSION);
+
+    let escrow = client.get_escrow(&1);
+    assert_eq!(escrow.buyer, buyer);
+    assert_eq!(escrow.amount, 50_000_000);
+    assert_eq!(escrow.status, EscrowStatus::Active);
+}
+
+// ===== Multi-sig / timelocked admin action tests =====
+
+#[test]
+fn test_pending_admin_action_requires_approvals_and_timelock() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer2.clone());
+    client.set_admin_action_signers(&signers);
+    client.set_admin_action_threshold(&2);
+    client.set_admin_action_timelock_delay(&60);
+
+    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
+    assert_eq!(action.threshold, 2);
+    assert_eq!(action.approvals.len(), 1);
+    assert!(!client.is_paused());
+
+    let result = client.try_execute_admin_action(&action.id);
+    assert!(matches!(result, Err(Ok(Error::AdminActionTimelockActive))));
+
+    let second = client.approve_admin_action(&action.id, &signer2);
+    assert_eq!(second.approvals.len(), 2);
+
+    let result = client.try_execute_admin_action(&action.id);
+    assert!(matches!(result, Err(Ok(Error::AdminActionTimelockActive))));
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += 61;
+    });
+
+    client.execute_admin_action(&action.id);
+    assert!(client.is_paused());
+}
+
+#[test]
+fn test_pending_admin_action_is_cancelable() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    client.set_admin_action_threshold(&1);
+    client.set_admin_action_timelock_delay(&60);
+
+    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
+    let cancelled = client.cancel_admin_action(&action.id);
+    assert!(cancelled.cancelled);
+
+    let pending = client.get_pending_admin_actions();
+    assert!(pending.is_empty());
+
+    let result = client.try_execute_admin_action(&action.id);
+    assert!(matches!(result, Err(Ok(Error::AdminActionTerminal))));
+}
 
 #[test]
 fn test_upgrade_default_threshold_is_one() {
@@ -1851,7 +1946,8 @@ fn test_multisig_threshold_two_of_two() {
         client.get_upgrade_proposal().is_none(),
         "proposal committed too early"
     );
-    assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
+    // Nonce is 0 on the first round (no cancellations yet).
+    assert_eq!(client.get_upgrade_approvals(&0).len(), 1);
 
     // Second approval — threshold reached, proposal committed.
     client.propose_upgrade_wasm(&signer2, &hash);
@@ -1880,7 +1976,8 @@ fn test_duplicate_approval_returns_already_approved() {
     assert!(result.is_err());
     assert!(result.is_err());
 
-    assert_eq!(client.get_upgrade_approvals(&hash).len(), 1);
+    // Nonce is 0; admin approved once; signer2 has not approved yet.
+    assert_eq!(client.get_upgrade_approvals(&0).len(), 1);
     assert!(client.get_upgrade_proposal().is_none());
 }
 
@@ -1941,6 +2038,235 @@ fn test_set_upgrade_signers_empty_resets_to_admin() {
     let hash = BytesN::from_array(&env, &[6u8; 32]);
     client.propose_upgrade_wasm(&admin, &hash);
     assert!(client.get_upgrade_proposal().is_some());
+}
+
+
+// ============== Upgrade Governance Security Tests ==============
+
+/// AC2: Signer rotation after first approval cannot inflate the approval count.
+/// After the first signer approves (locking the snapshot), the admin adds a
+/// new signer and changes the threshold.  The new signer should be treated as
+/// part of the NEW round's signer set, but the snapshot for the CURRENT round
+/// is already fixed.  The current round must NOT count the new signer.
+#[test]
+fn test_signer_rotation_cannot_inflate_approval_count() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let evil_signer = Address::generate(&env);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer2.clone());
+    client.set_upgrade_signers(&signers);
+    client.set_upgrade_threshold(&2);
+
+    let hash = BytesN::from_array(&env, &[10u8; 32]);
+
+    // Round opens: admin approves (snapshot captured: {admin, signer2}, threshold=2).
+    client.propose_upgrade_wasm(&admin, &hash);
+    assert!(client.get_upgrade_proposal().is_none(), "proposal should not be committed yet");
+
+    // Admin rotates signers to include evil_signer AFTER the round has opened.
+    let mut new_signers = Vec::new(&env);
+    new_signers.push_back(admin.clone());
+    new_signers.push_back(evil_signer.clone());
+    client.set_upgrade_signers(&new_signers);
+    // Admin also tries to lower threshold to 1 after the round is open.
+    client.set_upgrade_threshold(&1);
+
+    // evil_signer was NOT in the snapshot — must be rejected.
+    let result = client.try_propose_upgrade_wasm(&evil_signer, &hash);
+    assert!(
+        result.is_err(),
+        "evil_signer added after round open must not be able to approve"
+    );
+
+    // Proposal still not committed — the threshold snapshot (2) was not met.
+    assert!(client.get_upgrade_proposal().is_none(),
+        "proposal must not be committed despite threshold change");
+
+    // Only the original signer2 (from the snapshot) can complete this round.
+    client.propose_upgrade_wasm(&signer2, &hash);
+    assert!(client.get_upgrade_proposal().is_some(), "proposal must commit after 2 of 2 original signers");
+}
+
+/// AC3: A pending proposal remains immutable after threshold approval is reached.
+/// After the proposal is committed via propose_upgrade_wasm, any call to
+/// propose_upgrade_wasm for the same hash must fail with UpgradeProposalExists.
+#[test]
+fn test_committed_proposal_is_immutable() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let hash = BytesN::from_array(&env, &[11u8; 32]);
+
+    // threshold=1 (default), admin is sole signer — one call commits.
+    client.propose_upgrade_wasm(&admin, &hash);
+    assert!(client.get_upgrade_proposal().is_some());
+
+    // Any subsequent propose call must fail with UpgradeProposalExists.
+    let result = client.try_propose_upgrade_wasm(&admin, &hash);
+    assert!(result.is_err());
+}
+
+/// AC4: Cancellation clears stale approvals — after cancel, the nonce is
+/// incremented and any old partial approvals are unreachable.  Re-proposing
+/// after the cooldown starts a fresh round that requires new approvals.
+///
+/// Flow:
+/// 1. Round 0: admin sole-approves (threshold=1) → proposal committed.
+/// 2. Cancel → nonce bumped to 1, old state cleared.
+/// 3. Advance past cooldown.
+/// 4. Round 1: admin approves again → fresh state, nonce=1.
+/// 5. Old approvals for nonce 0 are empty; new round has exactly 1 approval.
+#[test]
+fn test_cancel_clears_stale_approvals_and_increments_nonce() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    // Threshold=1 so a single admin approval commits the proposal immediately.
+    let hash_a = BytesN::from_array(&env, &[12u8; 32]);
+    let hash_b = BytesN::from_array(&env, &[13u8; 32]);
+
+    // Round 0, nonce=0: admin approves hash_a → commits.
+    assert_eq!(client.get_upgrade_proposal_nonce(), 0, "nonce starts at 0");
+    client.propose_upgrade_wasm(&admin, &hash_a);
+    assert!(client.get_upgrade_proposal().is_some(), "proposal must commit at threshold=1");
+    // Approval state is removed on commit, so get_upgrade_approvals returns empty.
+    assert_eq!(client.get_upgrade_approvals(&0).len(), 0,
+        "approvals are cleared after commit");
+
+    // Cancel the committed proposal → nonce bumps to 1.
+    client.cancel_upgrade_wasm();
+    assert_eq!(client.get_upgrade_proposal_nonce(), 1, "nonce must be 1 after cancel");
+    assert!(client.get_upgrade_proposal().is_none(), "proposal must be removed after cancel");
+    // Old nonce 0 approvals remain empty (never re-populated after commit+cancel).
+    assert_eq!(client.get_upgrade_approvals(&0).len(), 0,
+        "old nonce 0 approvals must be empty after cancel");
+
+    // Advance past CANCEL_REPROPOSE_COOLDOWN (7 days + 1 s).
+    env.ledger().with_mut(|li| { li.timestamp += 7 * 24 * 60 * 60 + 1; });
+
+    // Round 1, nonce=1: admin proposes a different hash → fresh state.
+    client.propose_upgrade_wasm(&admin, &hash_b);
+    assert!(client.get_upgrade_proposal().is_some(),
+        "proposal must commit in fresh round");
+    // Nonce 0 still returns empty — old state was not replayed.
+    assert_eq!(client.get_upgrade_approvals(&0).len(), 0,
+        "nonce 0 must still be empty in round 1");
+}
+
+/// AC4 (simplified): cancel_upgrade_wasm increments the proposal nonce.
+#[test]
+fn test_cancel_increments_proposal_nonce() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let hash = BytesN::from_array(&env, &[13u8; 32]);
+
+    // Commit a proposal (threshold=1, admin is sole signer).
+    client.propose_upgrade_wasm(&admin, &hash);
+    let nonce_before = client.get_upgrade_proposal_nonce();
+    assert_eq!(nonce_before, 0, "nonce starts at 0");
+
+    // Cancel increments the nonce.
+    client.cancel_upgrade_wasm();
+    let nonce_after = client.get_upgrade_proposal_nonce();
+    assert_eq!(nonce_after, 1, "nonce must be 1 after first cancel");
+}
+
+/// Replay protection: after cancel + cooldown, re-proposing the same hash
+/// with the same signers starts a completely new round (nonce=1, empty approvals).
+#[test]
+fn test_repropose_same_hash_starts_fresh_round_after_cancel() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer2.clone());
+    client.set_upgrade_signers(&signers);
+    client.set_upgrade_threshold(&2);
+
+    let hash = BytesN::from_array(&env, &[14u8; 32]);
+
+    // Round 0: admin approves. Threshold not yet met.
+    // To get a partial approval we need threshold=2; but cancel requires a committed
+    // proposal. Lower threshold to 1 to commit, then cancel.
+    client.set_upgrade_threshold(&1);
+    client.propose_upgrade_wasm(&admin, &hash);
+    // Committed. Cancel it.
+    client.cancel_upgrade_wasm();
+    // Nonce is now 1.
+    assert_eq!(client.get_upgrade_proposal_nonce(), 1);
+
+    // Advance past cooldown.
+    env.ledger().with_mut(|li| { li.timestamp += 7 * 24 * 60 * 60 + 1; });
+
+    // Round 1: admin approves again for the SAME hash.
+    client.set_upgrade_threshold(&2);
+    client.propose_upgrade_wasm(&admin, &hash);
+
+    // Nonce is still 1 (cancel hasn't been called again).
+    assert_eq!(client.get_upgrade_proposal_nonce(), 1);
+
+    // Only 1 approval in round 1 — admin's prior approval from round 0 is NOT counted.
+    assert_eq!(client.get_upgrade_approvals(&1).len(), 1,
+        "round 1 must have exactly 1 fresh approval, not carry over from round 0");
+
+    // Proposal must NOT be committed (threshold=2, only 1 approval so far).
+    assert!(client.get_upgrade_proposal().is_none(),
+        "proposal must not commit with only 1 of 2 required approvals in fresh round");
+
+    // signer2 approves to complete round 1.
+    client.propose_upgrade_wasm(&signer2, &hash);
+    assert!(client.get_upgrade_proposal().is_some(), "proposal must commit after 2nd approval");
+}
+
+/// Threshold snapshot: changing threshold mid-round does not affect the current round.
+#[test]
+fn test_threshold_change_mid_round_does_not_affect_current_round() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let signer3 = Address::generate(&env);
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer2.clone());
+    signers.push_back(signer3.clone());
+    client.set_upgrade_signers(&signers);
+    client.set_upgrade_threshold(&3); // requires all 3
+
+    let hash = BytesN::from_array(&env, &[15u8; 32]);
+
+    // admin approves first — snapshot captures threshold=3.
+    client.propose_upgrade_wasm(&admin, &hash);
+    assert!(client.get_upgrade_proposal().is_none());
+
+    // Admin lowers threshold to 1 after the round has opened.
+    client.set_upgrade_threshold(&1);
+
+    // signer2 approves — with the NEW threshold=1 this would be sufficient,
+    // but the snapshot still requires 3.
+    client.propose_upgrade_wasm(&signer2, &hash);
+    assert!(
+        client.get_upgrade_proposal().is_none(),
+        "proposal must not commit: snapshot threshold is 3, only 2 approvals so far"
+    );
+
+    // Third approval completes the snapshotted requirement.
+    client.propose_upgrade_wasm(&signer3, &hash);
+    assert!(client.get_upgrade_proposal().is_some(), "proposal must commit after 3 of 3 approvals");
 }
 
 // ============== Batch Operations Tests ==============
@@ -2725,7 +3051,7 @@ fn test_create_escrow_non_whitelisted_token_rejected() {
 
     // Attempt to create an escrow with a different, non-whitelisted token
     let other_token_admin = Address::generate(&env);
-    let other_token = env.register_stellar_asset_contract_v2(other_token_admin.clone());
+    let other_token = env.register_stellar_asset_contract(other_token_admin.clone());
     let other_token_client = token::StellarAssetClient::new(&env, &other_token.address());
     other_token_client.mint(&buyer, &100_000_000);
 
@@ -2799,7 +3125,7 @@ fn test_batch_escrow_non_whitelisted_token_rejected() {
 
     // Build a batch with a non-whitelisted second token
     let other_token_admin = Address::generate(&env);
-    let other_token = env.register_stellar_asset_contract_v2(other_token_admin.clone());
+    let other_token = env.register_stellar_asset_contract(other_token_admin.clone());
 
     let params = soroban_sdk::vec![
         &env,
@@ -2861,7 +3187,7 @@ fn test_multiple_tokens_on_whitelist() {
 
     // Register a second token
     let token2_admin = Address::generate(&env);
-    let token2 = env.register_stellar_asset_contract_v2(token2_admin.clone());
+    let token2 = env.register_stellar_asset_contract(token2_admin.clone());
     let token2_client = token::StellarAssetClient::new(&env, &token2.address());
     token2_client.mint(&buyer, &100_000_000);
 
@@ -4648,4 +4974,365 @@ fn test_fund_audit_pagination_and_immutability() {
     let page_oob = client.get_fund_audit_history_paginated(&buyer, &10, &2);
     assert_eq!(page_oob.len(), 0);
 }
+
+#[test]
+#[should_panic]
+fn test_stake_below_minimum_threshold_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    // Admin sets minimum stake required to 10_000_000
+    client.set_min_stake_required(&10_000_000);
+
+    token_admin.mint(&seller, &20_000_000);
+    // Staking 5_000_000 when min required is 10_000_000 should panic
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+}
+
+#[test]
+#[should_panic]
+fn test_unstake_with_active_obligations_below_min_stake_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    client.set_min_stake_required(&10_000_000);
+
+    token_admin.mint(&seller, &20_000_000);
+    token_admin.mint(&buyer, &20_000_000);
+
+    // Stake 15_000_000 in two deposits so partial unstaking is possible
+    client.stake_tokens(&seller, &token_id, &15_000_000);
+
+    // Create an active escrow (seller has active obligations)
+    client.create_escrow(&buyer, &seller, &token_id, &5_000_000, &1, &None);
+    assert!(client.has_active_escrows(&seller));
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
+    });
+
+    // Unstaking matured 15_000_000 while active escrow exists leaves 0 stake (< 10_000_000 min requirement)
+    client.unstake_tokens(&seller, &token_id);
+}
+
+#[test]
+fn test_partial_unstake_consistent_collateral_rules() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    client.set_min_stake_required(&10_000_000);
+
+    token_admin.mint(&seller, &50_000_000);
+    token_admin.mint(&buyer, &50_000_000);
+
+    // Stake 25_000_000 — this opens the first cooldown window.
+    client.stake_tokens(&seller, &token_id, &25_000_000);
+    assert_eq!(client.get_stake(&seller), 25_000_000);
+
+    // Advance past the first cooldown and unstake 25_000_000.
+    // Now the queue is empty; the next deposit will open a fresh cooldown.
+    env.ledger().with_mut(|li| {
+        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
+    });
+    client.unstake_tokens(&seller, &token_id);
+    assert_eq!(client.get_stake(&seller), 0);
+
+    // Stake 25_000_000 again — opens a new cooldown window starting now.
+    client.stake_tokens(&seller, &token_id, &25_000_000);
+    assert_eq!(client.get_stake(&seller), 25_000_000);
+
+    // Advance 100 s and add a second deposit of 10_000_000.
+    // This inherits the existing cooldown_end (anti-gaming rule), so both
+    // deposits mature at the same time.
+    env.ledger().with_mut(|li| {
+        li.timestamp += 100;
+    });
+    client.stake_tokens(&seller, &token_id, &10_000_000);
+    assert_eq!(client.get_stake(&seller), 35_000_000);
+
+    // Advance past the shared cooldown. Both deposits mature together.
+    env.ledger().with_mut(|li| {
+        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64;
+    });
+
+    // Both deposits mature; total released = 35_000_000; remaining = 0.
+    // The collateral check does not block unstake because no active obligations exist.
+    client.unstake_tokens(&seller, &token_id);
+    assert_eq!(client.get_stake(&seller), 0);
+    assert_eq!(client.is_account_under_collateralized(&seller), false);
+}
+
+#[test]
+fn test_is_account_under_collateralized_detection() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&seller, &20_000_000);
+    token_admin.mint(&buyer, &20_000_000);
+
+    // Stake 5_000_000 (when min stake is 0)
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+
+    // Create an escrow
+    client.create_escrow(&buyer, &seller, &token_id, &2_000_000, &1, &None);
+
+    // Initially min stake is 0, so not under-collateralized
+    assert_eq!(client.is_account_under_collateralized(&seller), false);
+
+    // Admin raises min stake required to 10_000_000
+    client.set_min_stake_required(&10_000_000);
+
+    // Now seller has active obligation but stake (5M) < min_stake_required (10M)
+    assert_eq!(client.is_account_under_collateralized(&seller), true);
+}
+
+// ===== Multi-Sig Admin Action Tests (#932) =====
+
+#[test]
+fn test_admin_action_propose_requires_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let stranger = Address::generate(&env);
+    let action = AdminActionKind::PausePlatform(true);
+    let result = client.try_propose_admin_action(&stranger, &action);
+    assert!(matches!(result, Err(Ok(Error::NotAnAdminActionSigner))));
+}
+
+#[test]
+fn test_admin_action_approve_requires_signer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signers = vec![&env, admin.clone()];
+    client.set_admin_action_signers(&signers);
+    client.set_admin_action_threshold(&1);
+    client.set_admin_action_timelock_delay(&60);
+
+    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
+
+    let stranger = Address::generate(&env);
+    let result = client.try_approve_admin_action(&action.id, &stranger);
+    assert!(matches!(result, Err(Ok(Error::NotAnAdminActionSigner))));
+}
+
+#[test]
+fn test_admin_action_needs_approvals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signers = vec![&env, admin.clone()];
+    client.set_admin_action_signers(&signers);
+    client.set_admin_action_threshold(&2);
+    client.set_admin_action_timelock_delay(&1);
+
+    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
+    assert_eq!(action.approvals.len(), 1);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += 2;
+    });
+
+    let result = client.try_execute_admin_action(&action.id);
+    assert!(matches!(result, Err(Ok(Error::AdminActionNeedsApprovals))));
+}
+
+#[test]
+fn test_admin_action_timelock_blocks_execution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let signers = vec![&env, admin.clone(), signer2.clone()];
+    client.set_admin_action_signers(&signers);
+    client.set_admin_action_threshold(&2);
+    client.set_admin_action_timelock_delay(&60);
+
+    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
+    client.approve_admin_action(&action.id, &signer2);
+
+    let result = client.try_execute_admin_action(&action.id);
+    assert!(matches!(result, Err(Ok(Error::AdminActionTimelockActive))));
+}
+
+#[test]
+fn test_admin_action_executes_after_timelock_and_approvals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signer2 = Address::generate(&env);
+    let signers = vec![&env, admin.clone(), signer2.clone()];
+    client.set_admin_action_signers(&signers);
+    client.set_admin_action_threshold(&2);
+    client.set_admin_action_timelock_delay(&60);
+
+    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
+    assert_eq!(action.threshold, 2);
+    assert_eq!(action.approvals.len(), 1);
+    assert!(!client.is_paused());
+
+    client.approve_admin_action(&action.id, &signer2);
+
+    let result = client.try_execute_admin_action(&action.id);
+    assert!(matches!(result, Err(Ok(Error::AdminActionTimelockActive))));
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += 61;
+    });
+
+    client.execute_admin_action(&action.id);
+    assert!(client.is_paused());
+}
+
+#[test]
+fn test_admin_action_cancel_blocks_execution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    client.set_admin_action_threshold(&1);
+    client.set_admin_action_timelock_delay(&60);
+
+    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
+    let cancelled = client.cancel_admin_action(&action.id);
+    assert!(cancelled.cancelled);
+
+    let pending = client.get_pending_admin_actions();
+    assert!(pending.is_empty());
+
+    let result = client.try_execute_admin_action(&action.id);
+    assert!(matches!(result, Err(Ok(Error::AdminActionTerminal))));
+}
+
+#[test]
+fn test_admin_action_double_approval_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signers = vec![&env, admin.clone()];
+    client.set_admin_action_signers(&signers);
+    client.set_admin_action_threshold(&2);
+    client.set_admin_action_timelock_delay(&60);
+
+    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
+    let result = client.try_approve_admin_action(&action.id, &admin);
+    assert!(matches!(result, Err(Ok(Error::AlreadyApproved))));
+}
+
+#[test]
+fn test_admin_action_get_pending_actions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    client.set_admin_action_threshold(&1);
+    client.set_admin_action_timelock_delay(&60);
+
+    let action1 = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
+    let action2 = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(false));
+
+    let pending = client.get_pending_admin_actions();
+    assert_eq!(pending.len(), 2);
+
+    client.cancel_admin_action(action1.id);
+    let pending = client.get_pending_admin_actions();
+    assert_eq!(pending.len(), 1);
+}
+
+#[test]
+fn test_admin_action_set_max_dispute_duration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signers = vec![&env, admin.clone()];
+    client.set_admin_action_signers(&signers);
+    client.set_admin_action_threshold(&1);
+    client.set_admin_action_timelock_delay(&60);
+
+    let new_duration = 50_000u32;
+    let action = client.propose_admin_action(
+        &admin,
+        &AdminActionKind::SetMaxDisputeDuration(new_duration),
+    );
+    assert_eq!(action.kind, AdminActionKind::SetMaxDisputeDuration(new_duration));
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += 61;
+    });
+
+    client.execute_admin_action(&action.id);
+    assert_eq!(client.get_max_dispute_duration(), new_duration);
+}
+
+#[test]
+fn test_admin_action_set_stake_cooldown() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signers = vec![&env, admin.clone()];
+    client.set_admin_action_signers(&signers);
+    client.set_admin_action_threshold(&1);
+    client.set_admin_action_timelock_delay(&60);
+
+    let new_cooldown = 1_000_000u32;
+    let action = client.propose_admin_action(
+        &admin,
+        &AdminActionKind::SetStakeCooldown(new_cooldown),
+    );
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += 61;
+    });
+
+    client.execute_admin_action(&action.id);
+    assert_eq!(client.get_stake_cooldown(), new_cooldown);
+}
+
+#[test]
+fn test_admin_action_set_moderator() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let signers = vec![&env, admin.clone()];
+    client.set_admin_action_signers(&signers);
+    client.set_admin_action_threshold(&1);
+    client.set_admin_action_timelock_delay(&60);
+
+    let moderator = Address::generate(&env);
+    let action = client.propose_admin_action(
+        &admin,
+        &AdminActionKind::SetModerator(moderator.clone()),
+    );
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += 61;
+    });
+
+    client.execute_admin_action(&action.id);
+    assert_eq!(client.get_moderator(), Some(moderator));
+}
+
+#[test]
+fn test_admin_action_zero_threshold_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+
+    let result = client.try_set_admin_action_threshold(&0);
+    assert!(matches!(result, Err(Error::InvalidFee)));
+}
+
 
