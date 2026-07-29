@@ -33,7 +33,7 @@ fn setup_test(
 
     let token_admin = Address::generate(env);
     let token_contract = env.register_stellar_asset_contract(token_admin.clone());
-    let token_admin_client = token::StellarAssetClient::new(env, &token_contract.address());
+    let token_admin_client = token::StellarAssetClient::new(env, &token_contract);
 
     let arbitrator = Address::generate(env);
     let onboarding_contract = Address::generate(env);
@@ -53,14 +53,14 @@ fn setup_test(
     );
 
     // Set min amount to 0 for tests to pass with small amounts
-    client.set_min_escrow_amount(&token_contract.address(), &0);
+    client.set_min_escrow_amount(&token_contract, &0);
     client.set_min_release_window(&1);
 
     (
         client,
         buyer,
         seller,
-        token_contract.address(),
+        token_contract,
         token_admin_client,
         platform_wallet,
         admin,
@@ -612,7 +612,7 @@ fn test_platform_fee_deduction_10_percent() {
 
     let token_admin = Address::generate(&env);
     let token_contract = env.register_stellar_asset_contract(token_admin.clone());
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract.address());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract);
 
     let arbitrator = Address::generate(&env);
 
@@ -623,7 +623,7 @@ fn test_platform_fee_deduction_10_percent() {
     client.create_escrow(
         &buyer,
         &seller,
-        &token_contract.address(),
+        &token_contract,
         &10_000_000,
         &1,
         &None,
@@ -631,7 +631,7 @@ fn test_platform_fee_deduction_10_percent() {
 
     client.release_funds(&1);
 
-    let token_client = token::Client::new(&env, &token_contract.address());
+    let token_client = token::Client::new(&env, &token_contract);
     assert_eq!(token_client.balance(&seller), 9_000_000); // 10,000,000 - 1,000,000
     assert_eq!(token_client.balance(&platform_wallet), 1_000_000);
 }
@@ -722,7 +722,7 @@ fn test_update_platform_fee() {
 
     let token_admin = Address::generate(&env);
     let token_contract = env.register_stellar_asset_contract(token_admin.clone());
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract.address());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract);
 
     let arbitrator = Address::generate(&env);
 
@@ -761,7 +761,7 @@ fn test_update_platform_fee() {
     client.create_escrow(
         &buyer,
         &seller,
-        &token_contract.address(),
+        &token_contract,
         &100_000_000,
         &1,
         &None,
@@ -769,7 +769,7 @@ fn test_update_platform_fee() {
 
     client.release_funds(&1);
 
-    let token_client = token::Client::new(&env, &token_contract.address());
+    let token_client = token::Client::new(&env, &token_contract);
     // 100,000,000 - 8,000,000 = 92,000,000
     assert_eq!(token_client.balance(&seller), 92_000_000);
     assert_eq!(token_client.balance(&platform_wallet), 8_000_000);
@@ -1278,19 +1278,19 @@ fn test_integration_multiple_tokens_and_escrows() {
     // Token A
     let token_a_admin = Address::generate(&env);
     let token_a_contract = env.register_stellar_asset_contract(token_a_admin.clone());
-    let token_a_asset = token::StellarAssetClient::new(&env, &token_a_contract.address());
+    let token_a_asset = token::StellarAssetClient::new(&env, &token_a_contract);
     token_a_asset.mint(&buyer, &100_000_000);
 
     // Token B
     let token_b_admin = Address::generate(&env);
     let token_b_contract = env.register_stellar_asset_contract(token_b_admin.clone());
-    let token_b_asset = token::StellarAssetClient::new(&env, &token_b_contract.address());
+    let token_b_asset = token::StellarAssetClient::new(&env, &token_b_contract);
     token_b_asset.mint(&buyer, &200_000_000);
 
     client.create_escrow(
         &buyer,
         &seller,
-        &token_a_contract.address(),
+        &token_a_contract,
         &10_000_000,
         &1,
         &None,
@@ -1298,7 +1298,7 @@ fn test_integration_multiple_tokens_and_escrows() {
     client.create_escrow(
         &buyer,
         &seller,
-        &token_b_contract.address(),
+        &token_b_contract,
         &10_000_000,
         &2,
         &None,
@@ -1307,8 +1307,8 @@ fn test_integration_multiple_tokens_and_escrows() {
     client.release_funds(&1);
     client.release_funds(&2);
 
-    let token_a = token::Client::new(&env, &token_a_contract.address());
-    let token_b = token::Client::new(&env, &token_b_contract.address());
+    let token_a = token::Client::new(&env, &token_a_contract);
+    let token_b = token::Client::new(&env, &token_b_contract);
 
     // Seller: 9.5M (token A) + 9.5M (token B)
     assert_eq!(token_a.balance(&seller), 9_500_000);
@@ -1320,11 +1320,11 @@ fn test_integration_multiple_tokens_and_escrows() {
     assert_eq!(fee_a, 500_000);
     assert_eq!(fee_b, 500_000);
     assert_eq!(
-        client.get_total_fees_for_token(&token_a_contract.address()),
+        client.get_total_fees_for_token(&token_a_contract),
         500_000
     );
     assert_eq!(
-        client.get_total_fees_for_token(&token_b_contract.address()),
+        client.get_total_fees_for_token(&token_b_contract),
         500_000
     );
     assert_eq!(client.get_total_fees_collected(), 1_000_000);
@@ -1378,7 +1378,7 @@ fn test_unstake_rejects_different_token_than_original_stake() {
     let other_token_admin = Address::generate(&env);
     let other_token_contract = env.register_stellar_asset_contract(other_token_admin.clone());
     let other_token_admin_client =
-        token::StellarAssetClient::new(&env, &other_token_contract.address());
+        token::StellarAssetClient::new(&env, &other_token_contract);
 
     token_admin.mint(&seller, &10_000_000);
     other_token_admin_client.mint(&seller, &10_000_000);
@@ -1388,7 +1388,7 @@ fn test_unstake_rejects_different_token_than_original_stake() {
         li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
     });
 
-    client.unstake_tokens(&seller, &other_token_contract.address());
+    client.unstake_tokens(&seller, &other_token_contract);
 }
 
 #[test]
@@ -1702,7 +1702,7 @@ fn test_contract_address_admin_is_authorized() {
     });
 
     client.initialize(&platform_wallet, &admin_contract, &arbitrator, &500, &None);
-    client.set_min_escrow_amount(&token_contract.address(), &0);
+    client.set_min_escrow_amount(&token_contract, &0);
 
     let config = client.get_platform_config();
     assert_eq!(config.admin, admin_contract);
@@ -1848,7 +1848,7 @@ fn test_pending_admin_action_requires_approvals_and_timelock() {
     assert!(!client.is_paused());
 
     let result = client.try_execute_admin_action(&action.id);
-    assert!(matches!(result, Err(Ok(Error::AdminActionTimelockActive))));
+    assert!(matches!(result, Err(Ok(Error::AdminActionNeedsApprovals))));
 
     let second = client.approve_admin_action(&action.id, &signer2);
     assert_eq!(second.approvals.len(), 2);
@@ -3052,13 +3052,13 @@ fn test_create_escrow_non_whitelisted_token_rejected() {
     // Attempt to create an escrow with a different, non-whitelisted token
     let other_token_admin = Address::generate(&env);
     let other_token = env.register_stellar_asset_contract(other_token_admin.clone());
-    let other_token_client = token::StellarAssetClient::new(&env, &other_token.address());
+    let other_token_client = token::StellarAssetClient::new(&env, &other_token);
     other_token_client.mint(&buyer, &100_000_000);
 
     client.create_escrow(
         &buyer,
         &seller,
-        &other_token.address(),
+        &other_token,
         &10_000,
         &2,
         &Some(3600),
@@ -3132,7 +3132,7 @@ fn test_batch_escrow_non_whitelisted_token_rejected() {
         EscrowCreateParams {
             buyer: buyer.clone(),
             seller: seller.clone(),
-            token: other_token.address(),
+            token: other_token,
             amount: 10_000,
             order_id: 10,
             release_window: Some(3600),
@@ -3188,18 +3188,18 @@ fn test_multiple_tokens_on_whitelist() {
     // Register a second token
     let token2_admin = Address::generate(&env);
     let token2 = env.register_stellar_asset_contract(token2_admin.clone());
-    let token2_client = token::StellarAssetClient::new(&env, &token2.address());
+    let token2_client = token::StellarAssetClient::new(&env, &token2);
     token2_client.mint(&buyer, &100_000_000);
 
     client.whitelist_token(&token_id);
-    client.whitelist_token(&token2.address());
+    client.whitelist_token(&token2);
 
     assert!(client.is_token_whitelisted(&token_id));
-    assert!(client.is_token_whitelisted(&token2.address()));
+    assert!(client.is_token_whitelisted(&token2));
 
     // Both should succeed in escrow creation
     client.create_escrow(&buyer, &seller, &token_id, &10_000, &1, &Some(3600));
-    client.create_escrow(&buyer, &seller, &token2.address(), &10_000, &2, &Some(3600));
+    client.create_escrow(&buyer, &seller, &token2, &10_000, &2, &Some(3600));
     assert_eq!(client.get_escrow(&1).status, EscrowStatus::Active);
     assert_eq!(client.get_escrow(&2).status, EscrowStatus::Active);
 }
@@ -5244,7 +5244,7 @@ fn test_admin_action_get_pending_actions() {
     let pending = client.get_pending_admin_actions();
     assert_eq!(pending.len(), 2);
 
-    client.cancel_admin_action(action1.id);
+    client.cancel_admin_action(&action1.id);
     let pending = client.get_pending_admin_actions();
     assert_eq!(pending.len(), 1);
 }
@@ -5332,7 +5332,7 @@ fn test_admin_action_zero_threshold_rejected() {
     let (client, _, _, _, _, _, admin) = setup_test(&env, true);
 
     let result = client.try_set_admin_action_threshold(&0);
-    assert!(matches!(result, Err(Error::InvalidFee)));
+    assert!(matches!(result, Err(Ok(Error::InvalidFee))));
 }
 
 

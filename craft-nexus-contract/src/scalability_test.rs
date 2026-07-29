@@ -880,3 +880,38 @@ fn test_index_read_budget_smoke() {
     env.budget().reset_default();
     let _ = client.has_active_escrows(&buyer);
 }
+
+#[test]
+fn test_escrow_counters_stay_in_sync_at_scale() {
+    let (env, client, buyer, seller, token, _, _, _) = setup_test();
+
+    for i in 0..100 {
+        client.create_escrow(&buyer, &seller, &token, &1000, &(i + 1), &Some(604800));
+    }
+
+    // Global counter (AllEscrowIds / EscrowCount) must match the number of escrows created.
+    assert_eq!(client.get_escrow_count(), 100);
+
+    // Buyer- and seller-scoped indexed counters must independently match too.
+    let buyer_count_key = DataKey::BuyerEscrowCount(buyer.clone());
+    let buyer_count: u32 = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&buyer_count_key)
+            .unwrap_or(0u32)
+    });
+    assert_eq!(buyer_count, 100);
+
+    let seller_count_key = DataKey::SellerEscrowCount(seller.clone());
+    let seller_count: u32 = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&seller_count_key)
+            .unwrap_or(0u32)
+    });
+    assert_eq!(seller_count, 100);
+
+    // Pagination surfaces must agree with the counters above.
+    assert_eq!(client.get_escrows_by_buyer(&buyer, &0, &100, &false).len(), 100);
+    assert_eq!(client.get_escrows_by_seller(&seller, &0, &100, &false).len(), 100);
+}
