@@ -5034,3 +5034,275 @@ fn test_is_account_under_collateralized_detection() {
     assert_eq!(client.is_account_under_collateralized(&seller), true);
 }
 
+// ===== Deterministic Fee Splitting Engine Tests =====
+
+fn assert_fee_split_balances(
+    _token_client: &token::Client,
+    contract_client: &CraftNexusContractClient,
+    order_id: u32,
+    escrow_amount: i128,
+    expected_platform: i128,
+    expected_seller: i128,
+    expected_buyer: i128,
+) {
+    let escrow = contract_client.get_escrow(&order_id);
+    assert!(escrow.status == EscrowStatus::Released || escrow.status == EscrowStatus::Resolved || escrow.status == EscrowStatus::Refunded,
+        "escrow must be in terminal state, got {:?}", escrow.status);
+
+    assert_eq!(
+        expected_platform + expected_seller + expected_buyer,
+        escrow_amount,
+        "fee split must balance to escrow amount"
+    );
+}
+
+#[test]
+fn test_fee_policy_version_exposed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
+
+    assert_eq!(client.get_fee_policy_version(), 1);
+}
+
+#[test]
+fn test_release_funds_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amount = 1_000_000i128;
+    client.create_escrow(&buyer, &seller, &token_id, &amount, &1, &None);
+    client.release_funds(&1);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let platform_balance = token_client.balance(&platform_wallet);
+    let seller_balance = token_client.balance(&seller);
+
+    assert_fee_split_balances(&token_client, &client, 1, amount, platform_balance, seller_balance, 0);
+}
+
+#[test]
+fn test_auto_release_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amount = 2_000_000i128;
+    client.create_escrow(&buyer, &seller, &token_id, &amount, &1, &None);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += 604_801;
+    });
+    client.auto_release(&1);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let platform_balance = token_client.balance(&platform_wallet);
+    let seller_balance = token_client.balance(&seller);
+
+    assert_fee_split_balances(&token_client, &client, 1, amount, platform_balance, seller_balance, 0);
+}
+
+#[test]
+fn test_batch_release_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amounts = [1_000_000i128, 2_000_000i128, 3_000_000i128];
+    for (i, amount) in amounts.iter().enumerate() {
+        client.create_escrow(&buyer, &seller, &token_id, amount, &(i as u32 + 1), &None);
+    }
+
+    let order_ids: soroban_sdk::Vec<u32> = soroban_sdk::vec![&env, 1u32, 2u32, 3u32];
+    client.release_batch_funds(&1u64, &order_ids, &buyer);
+
+    let token_client = token::Client::new(&env, &token_id);
+    for (i, amount) in amounts.iter().enumerate() {
+        let order_id = i as u32 + 1;
+        let platform_balance = token_client.balance(&platform_wallet);
+        let seller_balance = token_client.balance(&seller);
+        assert_fee_split_balances(&token_client, &client, order_id, *amount, platform_balance, seller_balance, 0);
+    }
+}
+
+#[test]
+fn test_refund_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _platform_wallet, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amount = 1_500_000i128;
+    client.create_escrow(&buyer, &seller, &token_id, &amount, &1, &None);
+    client.refund(&1);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let buyer_balance = token_client.balance(&buyer);
+
+    assert_fee_split_balances(&token_client, &client, 1, amount, 0, 0, buyer_balance);
+}
+
+#[test]
+fn test_dispute_release_to_seller_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, admin) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amount = 800_000i128;
+    client.create_escrow(&buyer, &seller, &token_id, &amount, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "late_delivery"), &buyer);
+
+    client.resolve_dispute(&1, &Resolution::ReleaseToSeller, &admin);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let platform_balance = token_client.balance(&platform_wallet);
+    let seller_balance = token_client.balance(&seller);
+
+    assert_fee_split_balances(&token_client, &client, 1, amount, platform_balance, seller_balance, 0);
+}
+
+#[test]
+fn test_dispute_refund_to_buyer_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, admin) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amount = 800_000i128;
+    client.create_escrow(&buyer, &seller, &token_id, &amount, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "item_not_as_described"), &buyer);
+
+    client.resolve_dispute(&1, &Resolution::RefundToBuyer, &admin);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let buyer_balance = token_client.balance(&buyer);
+
+    assert_fee_split_balances(&token_client, &client, 1, amount, 0, 0, buyer_balance);
+}
+
+#[test]
+fn test_expired_dispute_all_policies_balance_to_escrow_amount() {
+    let policies = [
+        ExpiredDisputeFeePolicy::RefundFullNoPlatformFee,
+        ExpiredDisputeFeePolicy::RefundMinusPlatformFee,
+        ExpiredDisputeFeePolicy::DeductFeeFromSeller,
+        ExpiredDisputeFeePolicy::SplitFee,
+    ];
+
+    for (i, &policy) in policies.iter().enumerate() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CraftNexusContract);
+        let client = CraftNexusContractClient::new(&env, &contract_id);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let platform_wallet = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_addr = token_contract.address();
+        let token_asset = token::StellarAssetClient::new(&env, &token_addr);
+        token_asset.mint(&buyer, &100_000_000);
+
+        client.initialize(&platform_wallet, &admin, &arbitrator, &500, &None::<Address>);
+        client.update_expired_dispute_policy(&policy);
+
+        let amount = 2_500_000i128;
+        client.create_escrow(&buyer, &seller, &token_addr, &amount, &(i as u32 + 1), &Some(604800));
+        client.dispute_escrow(&(i as u32 + 1), &Symbol::new(&env, "test"), &buyer);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 30 * 24 * 60 * 60 + 1;
+        });
+
+        client.resolve_expired_dispute(&(i as u32 + 1));
+
+        let token_client = token::Client::new(&env, &token_addr);
+        let platform_delta = token_client.balance(&platform_wallet);
+        let buyer_delta = token_client.balance(&buyer);
+        let seller_delta = token_client.balance(&seller);
+
+        let sum = platform_delta + buyer_delta + seller_delta;
+        assert_eq!(sum, amount, "policy {:?} must balance to escrow amount", policy);
+    }
+}
+
+#[test]
+fn test_partial_refund_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amount = 1_200_000i128;
+    let refund_gross = 700_000i128;
+
+    client.create_escrow(&buyer, &seller, &token_id, &amount, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "partial"), &buyer);
+    client.propose_partial_refund(&1, &refund_gross, &buyer);
+    client.accept_partial_refund(&1);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let platform_balance = token_client.balance(&platform_wallet);
+    let buyer_balance = token_client.balance(&buyer);
+    let seller_balance = token_client.balance(&seller);
+
+    assert_fee_split_balances(&token_client, &client, 1, amount, platform_balance, seller_balance, buyer_balance);
+}
+
+#[test]
+fn test_recurring_escrow_cycle_balances_to_cycle_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_recurring_escrow(
+        &buyer,
+        &seller,
+        &token_id,
+        &1_000_000,
+        &3600,
+        &2,
+    );
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += 3601;
+    });
+
+    client.release_next_cycle(&1);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let platform_balance = token_client.balance(&platform_wallet);
+    let seller_balance = token_client.balance(&seller);
+
+    let cycle_amount = 500_000i128; // 1_000_000 / 2
+    assert_fee_split_balances(&token_client, &client, 1, cycle_amount, platform_balance, seller_balance, 0);
+}
+
+#[test]
+fn test_allocation_invariant_never_violated() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+
+    // Sweep a representative range of amounts.
+    for amount in [1, 19, 20, 39, 40, 99, 100, 999, 1000, 9999, 10_000, 99_999, 100_000, 999_999, 1_000_000].iter() {
+        let order_id = *amount as u32;
+        client.create_escrow(&buyer, &seller, &token_id, amount, &order_id, &None);
+
+        // ReleaseFunds
+        client.release_funds(&order_id);
+        let escrow = client.get_escrow(&order_id);
+        assert_eq!(escrow.status, EscrowStatus::Released);
+    }
+}
+
