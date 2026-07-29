@@ -13,6 +13,8 @@ extern crate alloc;
 #[cfg(test)]
 mod enhanced_features_test;
 #[cfg(test)]
+mod error_coverage_test;
+#[cfg(test)]
 mod event_snapshot_test;
 #[cfg(test)]
 mod expired_dispute_fee_test;
@@ -5909,10 +5911,10 @@ impl CraftNexusContract {
             }
             ArtisanStakeData {
                 amount: existing_stake.amount + amount,
-                token,
+                token: token.clone(),
             }
         } else {
-            ArtisanStakeData { amount, token }
+            ArtisanStakeData { amount, token: token.clone() }
         };
 
         let config = Self::get_platform_config_internal(&env);
