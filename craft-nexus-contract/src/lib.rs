@@ -150,6 +150,8 @@ pub enum Error {
     AdminActionTimelockActive = 48,
     /// Caller is not an authorized admin action signer
     NotAnAdminActionSigner = 49,
+    /// Contract does not implement the supported token interface.
+    UnsupportedToken = 46,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -2235,16 +2237,25 @@ impl CraftNexusContract {
     /// normalization arithmetic in the onboarding contract and are rejected
     /// with [`Error::InvalidTokenDecimals`].
     pub fn whitelist_token(env: Env, token: Address) -> Result<(), Error> {
+        let _guard = ReentryGuardScope::new(&env);
         let config = Self::get_platform_config_internal(&env);
         config.admin.require_auth();
 
-        // Validate token decimals before storing; tokens with > 18 decimals would
-        // overflow the i128 volume normalization in the onboarding contract.
+        // Probe the SEP-41 read interface before persisting an administrator
+        // supplied address. Missing or malformed methods become a stable
+        // contract error instead of an opaque host panic.
         let token_client = token::Client::new(&env, &token);
-        let decimals = token_client.decimals();
+        let decimals = token_client
+            .try_decimals()
+            .map_err(|_| Error::UnsupportedToken)?
+            .map_err(|_| Error::UnsupportedToken)?;
         if decimals > 18 {
             return Err(Error::InvalidTokenDecimals);
         }
+        token_client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::UnsupportedToken)?
+            .map_err(|_| Error::UnsupportedToken)?;
 
         Self::migrate_legacy_whitelisted_tokens(&env);
         let token_key = DataKey::WhitelistedTokenIndexed(token.clone());
@@ -3376,12 +3387,9 @@ impl CraftNexusContract {
         Self::safe_update_active_contracts(&env, buyer.clone(), 1);
         Self::safe_update_active_contracts(&env, seller.clone(), 1);
 
-        // Transfer funds from buyer to contract and record audit
-        let client = token::Client::new(&env, &token);
-        Self::transfer_tokens_and_record_audit(&env, &token, &buyer, &env.current_contract_address(), amount, &buyer, Symbol::new(&env, "escrow_funded"), -amount);
-
-        // Track locked funds (#212)
+        // Commit locked accounting before the external token interaction.
         Self::update_total_locked(&env, &token, amount);
+        Self::transfer_tokens_and_record_audit(&env, &token, &buyer, &env.current_contract_address(), amount, &buyer, Symbol::new(&env, "escrow_funded"), -amount);
 
         Self::emit_escrow_created(
             &env,
@@ -3525,15 +3533,14 @@ impl CraftNexusContract {
 
         escrow.buyer.require_auth();
 
-        let client = token::Client::new(&env, &escrow.token);
-        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &escrow.buyer, &env.current_contract_address(), escrow.amount, &escrow.buyer, Symbol::new(&env, "escrow_funded"), -escrow.amount);
-
+        // Effects before interaction: a callback can never observe this escrow
+        // as unfunded after its balance has been pulled.
         escrow.funded = true;
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
         Self::extend_persistent(&env, &(ESCROW, order_id));
-
-        // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, escrow.amount);
+
+        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &escrow.buyer, &env.current_contract_address(), escrow.amount, &escrow.buyer, Symbol::new(&env, "escrow_funded"), -escrow.amount);
 
         Self::emit_escrow_created(
             &env,
@@ -3558,7 +3565,7 @@ impl CraftNexusContract {
     /// by passing their own address as `caller` to reclaim persistent-storage rent
     /// and prevent indefinite stub accumulation.
     pub fn cancel_unfunded_escrow(env: Env, order_id: u32, caller: Address) -> Result<(), Error> {
-        Self::enter_reentry_guard(&env);
+        let _guard = ReentryGuardScope::new(&env);
         let escrow = Self::get_stored_escrow(&env, order_id);
         if escrow.funded {
             return Err(Error::InvalidEscrowState);
@@ -3620,7 +3627,7 @@ impl CraftNexusContract {
         admin: Address,
         order_ids: soroban_sdk::Vec<u32>,
     ) -> Result<u32, Error> {
-        Self::enter_reentry_guard(&env);
+        let _guard = ReentryGuardScope::new(&env);
 
         // Verify caller is platform admin
         let stored_admin = Self::get_admin(&env)?;
@@ -3664,7 +3671,6 @@ impl CraftNexusContract {
             cancelled_count += 1;
         }
 
-        Self::exit_reentry_guard(&env);
         Ok(cancelled_count)
     }
 
@@ -4301,9 +4307,17 @@ impl CraftNexusContract {
             return;
         }
 
+        // Every transfer must be reached through a guarded public operation.
+        // This assertion makes omissions fail closed as new flows are added.
+        if !env.storage().temporary().has(&DataKey::ReentryGuard) {
+            env.panic_with_error(crate::Error::ReentryDetected);
+        }
+
+        // Commit effects before interaction. A failed token call rolls back the
+        // complete Soroban invocation, including this audit record.
+        Self::append_fund_audit_record(env, actor, amount, reason, balance_impact);
         let token_client = token::Client::new(env, token);
         token_client.transfer(from, to, &amount);
-        Self::append_fund_audit_record(env, actor, amount, reason, balance_impact);
     }
 
     fn transfer_platform_fee(
@@ -4392,17 +4406,16 @@ impl CraftNexusContract {
         Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
         Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
 
+        // Reserve accounting is part of the effects phase.
+        Self::update_total_locked(&env, &escrow.token, -escrow.amount);
+
         // Transfer platform fee to platform wallet
         if fee_amount > 0 {
             Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, fee_amount);
         }
 
         // Transfer remaining funds to seller and record audit
-        let token_client = token::Client::new(&env, &escrow.token);
         Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), seller_amount);
-
-        // Track locked funds (#212)
-        Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
         Self::emit_escrow_created(
             &env,
@@ -4487,13 +4500,14 @@ impl CraftNexusContract {
         Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
         Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
 
+        Self::update_total_locked(&env, &escrow.token, -escrow.amount);
+
         // Transfer platform fee to platform wallet
         if fee_amount > 0 {
             Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, fee_amount);
         }
 
         // Transfer remaining funds to seller and record audit
-        let token_client = token::Client::new(&env, &escrow.token);
         Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), seller_amount);
 
         Self::emit_escrow_created(
@@ -5109,12 +5123,10 @@ impl CraftNexusContract {
         Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
         Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
 
-        // Refund to buyer and record audit
-        let client = token::Client::new(&env, &escrow.token);
-        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(&env, "refund"), escrow.amount);
-
-        // Track locked funds (#212)
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
+
+        // Refund to buyer and record audit
+        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(&env, "refund"), escrow.amount);
 
         Self::emit_escrow_created(
             &env,
@@ -5164,23 +5176,18 @@ impl CraftNexusContract {
         let fee_amount = Self::calculate_fee(env, escrow.amount, fee_bps);
         let seller_amount = escrow.amount - fee_amount;
 
-        let token_client = token::Client::new(env, &escrow.token);
+        Self::update_total_locked(env, &escrow.token, -escrow.amount);
         if fee_amount > 0 {
             Self::transfer_platform_fee(env, &escrow.token, &config.platform_wallet, fee_amount);
         }
 
         Self::transfer_tokens_and_record_audit(env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_amount, &escrow.seller, Symbol::new(env, "escrow_released"), seller_amount);
 
-        // Track locked funds (#212)
-        Self::update_total_locked(env, &escrow.token, -escrow.amount);
     }
 
     fn refund_funds_to_buyer(env: &Env, escrow: &Escrow) {
-        let token_client = token::Client::new(env, &escrow.token);
-        Self::transfer_tokens_and_record_audit(env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(env, "refund"), escrow.amount);
-
-        // Track locked funds (#212)
         Self::update_total_locked(env, &escrow.token, -escrow.amount);
+        Self::transfer_tokens_and_record_audit(env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(env, "refund"), escrow.amount);
     }
 
     /// Get escrow details
@@ -5832,12 +5839,8 @@ impl CraftNexusContract {
         Self::update_active_obligations(env, &params.buyer, 1);
         Self::update_active_obligations(env, &params.seller, 1);
 
-        // Transfer funds from buyer to contract and record audit
-        let client = token::Client::new(env, &params.token);
-        Self::transfer_tokens_and_record_audit(env, &params.token, &params.buyer, &env.current_contract_address(), params.amount, &params.buyer, Symbol::new(env, "escrow_funded"), -params.amount);
-
-        // Track locked funds (#212)
         Self::update_total_locked(env, &params.token, params.amount);
+        Self::transfer_tokens_and_record_audit(env, &params.token, &params.buyer, &env.current_contract_address(), params.amount, &params.buyer, Symbol::new(env, "escrow_funded"), -params.amount);
 
         Self::emit_escrow_created(
             env,
@@ -6170,6 +6173,7 @@ impl CraftNexusContract {
 
                     Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
                     Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
+                    Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
                     // Transfer platform fee to platform wallet
                     if fee_amount > 0 {
@@ -6182,7 +6186,6 @@ impl CraftNexusContract {
                     }
 
                     // Transfer remaining funds to seller
-                    let token_client = token::Client::new(&env, &escrow.token);
                     Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), seller_amount);
 
                     // Emit release event
@@ -6287,6 +6290,7 @@ impl CraftNexusContract {
     /// the escrow is resolved according to the configured expired_dispute_fee_policy.
     /// Returns DisputeExpired error if the deadline has not yet passed.
     pub fn resolve_expired_dispute(env: Env, order_id: u32) -> Result<(), Error> {
+        let _guard = ReentryGuardScope::new(&env);
         let escrow_opt: Option<Escrow> = env.storage().persistent().get(&(ESCROW, order_id));
         if escrow_opt.is_none() {
             return Err(Error::EscrowNotFound);
@@ -6318,9 +6322,9 @@ impl CraftNexusContract {
 
         Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
         Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
+        Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
         // Now perform token transfers (external calls)
-        let token_client = token::Client::new(&env, &escrow.token);
         let fee_amount = Self::calculate_fee(&env, escrow.amount, config.platform_fee_bps);
 
         // Apply the configured fee policy
@@ -6353,9 +6357,6 @@ impl CraftNexusContract {
             }
         }
 
-        // Track locked funds (#212)
-        Self::update_total_locked(&env, &escrow.token, -escrow.amount);
-
         Self::emit_escrow_created(
             &env,
             EscrowEvent {
@@ -6385,17 +6386,14 @@ impl CraftNexusContract {
     /// Staked balances remain owned by the artisan. The contract does not accrue,
     /// distribute, or sweep interest/yield from these reserved funds into platform fees.
     pub fn stake_tokens(env: Env, artisan: Address, token: Address, amount: i128) {
+        let _guard = ReentryGuardScope::new(&env);
         artisan.require_auth();
 
         if amount <= 0 {
             env.panic_with_error(crate::Error::AmountBelowMinimum);
         }
 
-        // Transfer from artisan to contract and record audit
-        let _token_client = token::Client::new(&env, &token);
-        Self::transfer_tokens_and_record_audit(&env, &token, &artisan, &env.current_contract_address(), amount, &artisan, Symbol::new(&env, "stake_deposit"), -amount);
-
-        // Track staked funds (#212)
+        // Effects are committed before the token interaction.
         Self::update_total_staked(&env, &token, amount);
 
         // Accumulate stake in a single record with token metadata.
@@ -6460,6 +6458,8 @@ impl CraftNexusContract {
 
         // Add new deposit to bounded indexed queue
         Self::add_stake_deposit(&env, &artisan, amount, cooldown_end);
+
+        Self::transfer_tokens_and_record_audit(&env, &token, &artisan, &env.current_contract_address(), amount, &artisan, Symbol::new(&env, "stake_deposit"), -amount);
     }
 
     /// Add a stake deposit to the bounded indexed queue.
@@ -6550,6 +6550,7 @@ impl CraftNexusContract {
     /// prevents reserved artisan collateral from being treated as platform-managed fees.
     /// Enhanced with bounded indexed queue and automatic pruning for scalability.
     pub fn unstake_tokens(env: Env, artisan: Address, token: Address) {
+        let _guard = ReentryGuardScope::new(&env);
         artisan.require_auth();
 
         // Validate the requested token matches the token recorded at stake time.
@@ -6649,14 +6650,9 @@ impl CraftNexusContract {
             );
         }
 
-        // Return matured tokens to artisan and record audit
-        let _token_client = token::Client::new(&env, &token);
-        Self::transfer_tokens_and_record_audit(&env, &token, &env.current_contract_address(), &artisan, matured_amount, &artisan, Symbol::new(&env, "stake_unstaked"), matured_amount);
-
-        // Track staked funds (#212): the matured amount is the delta
-        // leaving the contract; the per-artisan stake record (if any) is
-        // already kept in sync above.
+        // Complete reserve accounting before returning tokens.
         Self::update_total_staked(&env, &token, -matured_amount);
+        Self::transfer_tokens_and_record_audit(&env, &token, &env.current_contract_address(), &artisan, matured_amount, &artisan, Symbol::new(&env, "stake_unstaked"), matured_amount);
 
         env.events().publish(
             (Symbol::new(&env, "tokens_unstaked"), artisan.clone()),
@@ -6910,6 +6906,7 @@ impl CraftNexusContract {
     /// `refund_amount - refund_fee`, seller receives the remainder minus seller-side
     /// platform fee. The escrow status is set to Resolved.
     pub fn accept_partial_refund(env: Env, order_id: u32) -> Result<(), Error> {
+        let _guard = ReentryGuardScope::new(&env);
         let escrow_opt: Option<Escrow> = env.storage().persistent().get(&(ESCROW, order_id));
         if escrow_opt.is_none() {
             return Err(Error::EscrowNotFound);
@@ -6960,9 +6957,9 @@ impl CraftNexusContract {
 
         Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
         Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
+        Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
         // CEI Pattern: INTERACTIONS - External calls AFTER state updates
-        let token_client = token::Client::new(&env, &escrow.token);
 
         // Refund buyer and record audit
         if refund_amount_net > 0 {
@@ -6982,9 +6979,6 @@ impl CraftNexusContract {
         // Pay seller
         if seller_net > 0 {
             Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_net, &escrow.seller, Symbol::new(&env, "partial_refund_seller"), seller_net);
-
-            // Track locked funds (#212)
-            Self::update_total_locked(&env, &escrow.token, -escrow.amount);
         }
 
         Self::emit_escrow_created(
@@ -7138,12 +7132,8 @@ impl CraftNexusContract {
         Self::safe_update_active_contracts(&env, buyer.clone(), 1);
         Self::safe_update_active_contracts(&env, artisan.clone(), 1);
 
-        // Lock funds upfront and record audit
-        let token_client = token::Client::new(&env, &token);
-        Self::transfer_tokens_and_record_audit(&env, &token, &buyer, &env.current_contract_address(), total_amount, &buyer, Symbol::new(&env, "recurring_escrow_locked"), -total_amount);
-
-        // Track locked funds (#212)
         Self::update_total_locked(&env, &token, total_amount);
+        Self::transfer_tokens_and_record_audit(&env, &token, &buyer, &env.current_contract_address(), total_amount, &buyer, Symbol::new(&env, "recurring_escrow_locked"), -total_amount);
 
         env.events().publish(
             (Symbol::new(&env, "recurring_escrow"), id),
@@ -7189,23 +7179,14 @@ impl CraftNexusContract {
             escrow.total_amount / (escrow.duration as i128)
         };
 
-        // Calculate and transfer platform fee
+        // Calculate distribution amounts.
         let config = Self::get_platform_config_internal(&env);
         let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.artisan.clone());
         let fee_amount = Self::calculate_fee(&env, cycle_amount, fee_bps);
         let artisan_amount = cycle_amount - fee_amount;
 
-        if fee_amount > 0 {
-            Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, fee_amount);
-        }
-
-        let token_client = token::Client::new(&env, &escrow.token);
-        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.artisan, artisan_amount, &escrow.artisan, Symbol::new(&env, "recurring_release"), artisan_amount);
-
-        // Track locked funds (#212)
+        // Effects: commit all cycle and reserve accounting first.
         Self::update_total_locked(&env, &escrow.token, -cycle_amount);
-
-        // Update escrow state
         escrow.released_amount += cycle_amount;
         escrow.current_cycle += 1;
         escrow.last_release_time = now;
@@ -7225,6 +7206,12 @@ impl CraftNexusContract {
             Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
             Self::safe_update_active_contracts(&env, escrow.artisan.clone(), -1);
         }
+
+        // Interactions: token callbacks can only observe the completed cycle.
+        if fee_amount > 0 {
+            Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, fee_amount);
+        }
+        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.artisan, artisan_amount, &escrow.artisan, Symbol::new(&env, "recurring_release"), artisan_amount);
 
         env.events().publish(
             (Symbol::new(&env, "recurring_escrow"), id),
@@ -7299,11 +7286,8 @@ impl CraftNexusContract {
 
         // CEI Pattern: INTERACTIONS - External calls AFTER state updates
         if remaining > 0 {
-            let token_client = token::Client::new(&env, &escrow.token);
-            Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, remaining, &escrow.buyer, Symbol::new(&env, "recurring_cancel_refund"), remaining);
-
-            // Track locked funds (#212)
             Self::update_total_locked(&env, &escrow.token, -remaining);
+            Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, remaining, &escrow.buyer, Symbol::new(&env, "recurring_cancel_refund"), remaining);
         }
 
         env.events().publish(
@@ -7334,6 +7318,7 @@ impl CraftNexusContract {
         token: Address,
         destination: Address,
     ) -> Result<i128, Error> {
+        let _guard = ReentryGuardScope::new(&env);
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 
