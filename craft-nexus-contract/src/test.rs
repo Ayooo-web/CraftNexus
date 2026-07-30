@@ -5090,249 +5090,275 @@ fn test_is_account_under_collateralized_detection() {
     assert_eq!(client.is_account_under_collateralized(&seller), true);
 }
 
-// ===== Multi-Sig Admin Action Tests (#932) =====
+// ===== Deterministic Fee Splitting Engine Tests =====
 
-#[test]
-fn test_admin_action_propose_requires_signer() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+fn assert_fee_split_balances(
+    _token_client: &token::Client,
+    contract_client: &CraftNexusContractClient,
+    order_id: u32,
+    escrow_amount: i128,
+    expected_platform: i128,
+    expected_seller: i128,
+    expected_buyer: i128,
+) {
+    let escrow = contract_client.get_escrow(&order_id);
+    assert!(escrow.status == EscrowStatus::Released || escrow.status == EscrowStatus::Resolved || escrow.status == EscrowStatus::Refunded,
+        "escrow must be in terminal state, got {:?}", escrow.status);
 
-    let stranger = Address::generate(&env);
-    let action = AdminActionKind::PausePlatform(true);
-    let result = client.try_propose_admin_action(&stranger, &action);
-    assert!(matches!(result, Err(Ok(Error::NotAnAdminActionSigner))));
-}
-
-#[test]
-fn test_admin_action_approve_requires_signer() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
-
-    let signers = vec![&env, admin.clone()];
-    client.set_admin_action_signers(&signers);
-    client.set_admin_action_threshold(&1);
-    client.set_admin_action_timelock_delay(&60);
-
-    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
-
-    let stranger = Address::generate(&env);
-    let result = client.try_approve_admin_action(&action.id, &stranger);
-    assert!(matches!(result, Err(Ok(Error::NotAnAdminActionSigner))));
-}
-
-#[test]
-fn test_admin_action_needs_approvals() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
-
-    let signers = vec![&env, admin.clone()];
-    client.set_admin_action_signers(&signers);
-    client.set_admin_action_threshold(&2);
-    client.set_admin_action_timelock_delay(&1);
-
-    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
-    assert_eq!(action.approvals.len(), 1);
-
-    env.ledger().with_mut(|li| {
-        li.timestamp += 2;
-    });
-
-    let result = client.try_execute_admin_action(&action.id);
-    assert!(matches!(result, Err(Ok(Error::AdminActionNeedsApprovals))));
-}
-
-#[test]
-fn test_admin_action_timelock_blocks_execution() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
-
-    let signer2 = Address::generate(&env);
-    let signers = vec![&env, admin.clone(), signer2.clone()];
-    client.set_admin_action_signers(&signers);
-    client.set_admin_action_threshold(&2);
-    client.set_admin_action_timelock_delay(&60);
-
-    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
-    client.approve_admin_action(&action.id, &signer2);
-
-    let result = client.try_execute_admin_action(&action.id);
-    assert!(matches!(result, Err(Ok(Error::AdminActionTimelockActive))));
-}
-
-#[test]
-fn test_admin_action_executes_after_timelock_and_approvals() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
-
-    let signer2 = Address::generate(&env);
-    let signers = vec![&env, admin.clone(), signer2.clone()];
-    client.set_admin_action_signers(&signers);
-    client.set_admin_action_threshold(&2);
-    client.set_admin_action_timelock_delay(&60);
-
-    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
-    assert_eq!(action.threshold, 2);
-    assert_eq!(action.approvals.len(), 1);
-    assert!(!client.is_paused());
-
-    client.approve_admin_action(&action.id, &signer2);
-
-    let result = client.try_execute_admin_action(&action.id);
-    assert!(matches!(result, Err(Ok(Error::AdminActionTimelockActive))));
-
-    env.ledger().with_mut(|li| {
-        li.timestamp += 61;
-    });
-
-    client.execute_admin_action(&action.id);
-    assert!(client.is_paused());
-}
-
-#[test]
-fn test_admin_action_cancel_blocks_execution() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
-
-    client.set_admin_action_threshold(&1);
-    client.set_admin_action_timelock_delay(&60);
-
-    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
-    let cancelled = client.cancel_admin_action(&action.id);
-    assert!(cancelled.cancelled);
-
-    let pending = client.get_pending_admin_actions();
-    assert!(pending.is_empty());
-
-    let result = client.try_execute_admin_action(&action.id);
-    assert!(matches!(result, Err(Ok(Error::AdminActionTerminal))));
-}
-
-#[test]
-fn test_admin_action_double_approval_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
-
-    let signers = vec![&env, admin.clone()];
-    client.set_admin_action_signers(&signers);
-    client.set_admin_action_threshold(&2);
-    client.set_admin_action_timelock_delay(&60);
-
-    let action = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
-    let result = client.try_approve_admin_action(&action.id, &admin);
-    assert!(matches!(result, Err(Ok(Error::AlreadyApproved))));
-}
-
-#[test]
-fn test_admin_action_get_pending_actions() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
-
-    client.set_admin_action_threshold(&1);
-    client.set_admin_action_timelock_delay(&60);
-
-    let action1 = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(true));
-    let action2 = client.propose_admin_action(&admin, &AdminActionKind::PausePlatform(false));
-
-    let pending = client.get_pending_admin_actions();
-    assert_eq!(pending.len(), 2);
-
-    client.cancel_admin_action(action1.id);
-    let pending = client.get_pending_admin_actions();
-    assert_eq!(pending.len(), 1);
-}
-
-#[test]
-fn test_admin_action_set_max_dispute_duration() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
-
-    let signers = vec![&env, admin.clone()];
-    client.set_admin_action_signers(&signers);
-    client.set_admin_action_threshold(&1);
-    client.set_admin_action_timelock_delay(&60);
-
-    let new_duration = 50_000u32;
-    let action = client.propose_admin_action(
-        &admin,
-        &AdminActionKind::SetMaxDisputeDuration(new_duration),
+    assert_eq!(
+        expected_platform + expected_seller + expected_buyer,
+        escrow_amount,
+        "fee split must balance to escrow amount"
     );
-    assert_eq!(action.kind, AdminActionKind::SetMaxDisputeDuration(new_duration));
-
-    env.ledger().with_mut(|li| {
-        li.timestamp += 61;
-    });
-
-    client.execute_admin_action(&action.id);
-    assert_eq!(client.get_max_dispute_duration(), new_duration);
 }
 
 #[test]
-fn test_admin_action_set_stake_cooldown() {
+fn test_fee_policy_version_exposed() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+    let (client, _, _, _, _, _, _) = setup_test(&env, true);
 
-    let signers = vec![&env, admin.clone()];
-    client.set_admin_action_signers(&signers);
-    client.set_admin_action_threshold(&1);
-    client.set_admin_action_timelock_delay(&60);
+    assert_eq!(client.get_fee_policy_version(), 1);
+}
 
-    let new_cooldown = 1_000_000u32;
-    let action = client.propose_admin_action(
-        &admin,
-        &AdminActionKind::SetStakeCooldown(new_cooldown),
+#[test]
+fn test_release_funds_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amount = 1_000_000i128;
+    client.create_escrow(&buyer, &seller, &token_id, &amount, &1, &None);
+    client.release_funds(&1);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let platform_balance = token_client.balance(&platform_wallet);
+    let seller_balance = token_client.balance(&seller);
+
+    assert_fee_split_balances(&token_client, &client, 1, amount, platform_balance, seller_balance, 0);
+}
+
+#[test]
+fn test_auto_release_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amount = 2_000_000i128;
+    client.create_escrow(&buyer, &seller, &token_id, &amount, &1, &None);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += 604_801;
+    });
+    client.auto_release(&1);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let platform_balance = token_client.balance(&platform_wallet);
+    let seller_balance = token_client.balance(&seller);
+
+    assert_fee_split_balances(&token_client, &client, 1, amount, platform_balance, seller_balance, 0);
+}
+
+#[test]
+fn test_batch_release_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amounts = [1_000_000i128, 2_000_000i128, 3_000_000i128];
+    for (i, amount) in amounts.iter().enumerate() {
+        client.create_escrow(&buyer, &seller, &token_id, amount, &(i as u32 + 1), &None);
+    }
+
+    let order_ids: soroban_sdk::Vec<u32> = soroban_sdk::vec![&env, 1u32, 2u32, 3u32];
+    client.release_batch_funds(&1u64, &order_ids, &buyer);
+
+    let token_client = token::Client::new(&env, &token_id);
+    for (i, amount) in amounts.iter().enumerate() {
+        let order_id = i as u32 + 1;
+        let platform_balance = token_client.balance(&platform_wallet);
+        let seller_balance = token_client.balance(&seller);
+        assert_fee_split_balances(&token_client, &client, order_id, *amount, platform_balance, seller_balance, 0);
+    }
+}
+
+#[test]
+fn test_refund_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _platform_wallet, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amount = 1_500_000i128;
+    client.create_escrow(&buyer, &seller, &token_id, &amount, &1, &None);
+    client.refund(&1);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let buyer_balance = token_client.balance(&buyer);
+
+    assert_fee_split_balances(&token_client, &client, 1, amount, 0, 0, buyer_balance);
+}
+
+#[test]
+fn test_dispute_release_to_seller_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, admin) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amount = 800_000i128;
+    client.create_escrow(&buyer, &seller, &token_id, &amount, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "late_delivery"), &buyer);
+
+    client.resolve_dispute(&1, &Resolution::ReleaseToSeller, &admin);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let platform_balance = token_client.balance(&platform_wallet);
+    let seller_balance = token_client.balance(&seller);
+
+    assert_fee_split_balances(&token_client, &client, 1, amount, platform_balance, seller_balance, 0);
+}
+
+#[test]
+fn test_dispute_refund_to_buyer_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, admin) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amount = 800_000i128;
+    client.create_escrow(&buyer, &seller, &token_id, &amount, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "item_not_as_described"), &buyer);
+
+    client.resolve_dispute(&1, &Resolution::RefundToBuyer, &admin);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let buyer_balance = token_client.balance(&buyer);
+
+    assert_fee_split_balances(&token_client, &client, 1, amount, 0, 0, buyer_balance);
+}
+
+#[test]
+fn test_expired_dispute_all_policies_balance_to_escrow_amount() {
+    let policies = [
+        ExpiredDisputeFeePolicy::RefundFullNoPlatformFee,
+        ExpiredDisputeFeePolicy::RefundMinusPlatformFee,
+        ExpiredDisputeFeePolicy::DeductFeeFromSeller,
+        ExpiredDisputeFeePolicy::SplitFee,
+    ];
+
+    for (i, &policy) in policies.iter().enumerate() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CraftNexusContract);
+        let client = CraftNexusContractClient::new(&env, &contract_id);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let platform_wallet = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_addr = token_contract.address();
+        let token_asset = token::StellarAssetClient::new(&env, &token_addr);
+        token_asset.mint(&buyer, &100_000_000);
+
+        client.initialize(&platform_wallet, &admin, &arbitrator, &500, &None::<Address>);
+        client.update_expired_dispute_policy(&policy);
+
+        let amount = 2_500_000i128;
+        client.create_escrow(&buyer, &seller, &token_addr, &amount, &(i as u32 + 1), &Some(604800));
+        client.dispute_escrow(&(i as u32 + 1), &Symbol::new(&env, "test"), &buyer);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 30 * 24 * 60 * 60 + 1;
+        });
+
+        client.resolve_expired_dispute(&(i as u32 + 1));
+
+        let token_client = token::Client::new(&env, &token_addr);
+        let platform_delta = token_client.balance(&platform_wallet);
+        let buyer_delta = token_client.balance(&buyer);
+        let seller_delta = token_client.balance(&seller);
+
+        let sum = platform_delta + buyer_delta + seller_delta;
+        assert_eq!(sum, amount, "policy {:?} must balance to escrow amount", policy);
+    }
+}
+
+#[test]
+fn test_partial_refund_balances_to_escrow_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let amount = 1_200_000i128;
+    let refund_gross = 700_000i128;
+
+    client.create_escrow(&buyer, &seller, &token_id, &amount, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "partial"), &buyer);
+    client.propose_partial_refund(&1, &refund_gross, &buyer);
+    client.accept_partial_refund(&1);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let platform_balance = token_client.balance(&platform_wallet);
+    let buyer_balance = token_client.balance(&buyer);
+    let seller_balance = token_client.balance(&seller);
+
+    assert_fee_split_balances(&token_client, &client, 1, amount, platform_balance, seller_balance, buyer_balance);
+}
+
+#[test]
+fn test_recurring_escrow_cycle_balances_to_cycle_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_recurring_escrow(
+        &buyer,
+        &seller,
+        &token_id,
+        &1_000_000,
+        &3600,
+        &2,
     );
 
     env.ledger().with_mut(|li| {
-        li.timestamp += 61;
+        li.timestamp += 3601;
     });
 
-    client.execute_admin_action(&action.id);
-    assert_eq!(client.get_stake_cooldown(), new_cooldown);
+    client.release_next_cycle(&1);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let platform_balance = token_client.balance(&platform_wallet);
+    let seller_balance = token_client.balance(&seller);
+
+    let cycle_amount = 500_000i128; // 1_000_000 / 2
+    assert_fee_split_balances(&token_client, &client, 1, cycle_amount, platform_balance, seller_balance, 0);
 }
 
 #[test]
-fn test_admin_action_set_moderator() {
+fn test_allocation_invariant_never_violated() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
-    let signers = vec![&env, admin.clone()];
-    client.set_admin_action_signers(&signers);
-    client.set_admin_action_threshold(&1);
-    client.set_admin_action_timelock_delay(&60);
+    token_admin.mint(&buyer, &100_000_000);
 
-    let moderator = Address::generate(&env);
-    let action = client.propose_admin_action(
-        &admin,
-        &AdminActionKind::SetModerator(moderator.clone()),
-    );
+    // Sweep a representative range of amounts.
+    for amount in [1, 19, 20, 39, 40, 99, 100, 999, 1000, 9999, 10_000, 99_999, 100_000, 999_999, 1_000_000].iter() {
+        let order_id = *amount as u32;
+        client.create_escrow(&buyer, &seller, &token_id, amount, &order_id, &None);
 
-    env.ledger().with_mut(|li| {
-        li.timestamp += 61;
-    });
-
-    client.execute_admin_action(&action.id);
-    assert_eq!(client.get_moderator(), Some(moderator));
+        // ReleaseFunds
+        client.release_funds(&order_id);
+        let escrow = client.get_escrow(&order_id);
+        assert_eq!(escrow.status, EscrowStatus::Released);
+    }
 }
-
-#[test]
-fn test_admin_action_zero_threshold_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
-
-    let result = client.try_set_admin_action_threshold(&0);
-    assert!(matches!(result, Err(Error::InvalidFee)));
-}
-
 

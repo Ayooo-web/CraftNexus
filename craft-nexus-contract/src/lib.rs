@@ -279,6 +279,8 @@ const UNFUNDED_CANCEL_TIMEOUT: u64 = 24 * 60 * 60;
 /// fast with `Error::RecurringEscrowIdExhausted` instead of silently
 /// colliding with an existing entry.
 const MAX_RECURRING_ESCROW_ID: u64 = u64::MAX - 1;
+/// Deterministic fee policy version. Bump when fee allocation formulas change.
+const FEE_POLICY_VERSION: u32 = 1;
 /// Maximum number of upgrade records retained in `UpgradeHistory`. Older
 /// records are dropped FIFO once the cap is reached. Sized so a contract
 /// upgraded twice a year for ~16 years still has full visibility.
@@ -562,6 +564,59 @@ pub enum Resolution {
     /// Refund funds to the buyer.
     /// Full amount is returned; platform fees ARE NOT collected.
     RefundToBuyer = 1,
+}
+
+/// Describes which settlement formula to apply when computing a `FeeAllocation`.
+///
+/// Every terminal settlement path must supply one of these variants so that
+/// `compute_fee_allocation` can deterministically decide how the escrow pot is
+/// split among platform, seller, and buyer.  Adding a new path means adding a
+/// new variant here; all existing invariant tests will catch regressions.
+#[contracttype]
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum SettlementKind {
+    /// Normal release (buyer-approved or auto-release).
+    /// Platform fee deducted from the seller's portion; buyer pays nothing.
+    ReleaseFunds,
+    /// Full refund with no fee (admin-initiated or dispute RefundToBuyer).
+    /// Buyer receives the entire escrow amount; platform collects nothing.
+    FullRefundNoFee,
+    /// Expired-dispute resolution: buyer receives full amount, platform fee
+    /// comes only from the seller's locked pot.
+    ExpiredDisputeDeductFromSeller,
+    /// Expired-dispute resolution: platform fee deducted from the buyer's
+    /// refund; seller receives nothing additional.
+    ExpiredDisputeDeductFromBuyer,
+    /// Expired-dispute resolution: fee split equally between buyer and seller.
+    ExpiredDisputeSplitFee,
+    /// Partial-refund settlement. `refund_gross` and `seller_gross` are the
+    /// gross portions *before* fees, supplied as context fields.
+    PartialRefund(i128, i128),
+}
+
+/// Output of `compute_fee_allocation`.
+///
+/// Every value is non-negative and the three amounts sum exactly to the
+/// original `escrow.amount`, guaranteeing the contract never leaks or
+/// over-pays:
+///
+/// ```text
+/// platform_fee + seller_amount + buyer_amount == escrow_amount
+/// ```
+///
+/// Callers **must** use these three values — and only these three values —
+/// when performing token transfers in any settlement path.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct FeeAllocation {
+    /// Amount transferred to the platform wallet.
+    pub platform_fee: i128,
+    /// Net amount transferred to the seller (artisan).
+    pub seller_amount: i128,
+    /// Net amount transferred back to the buyer.
+    pub buyer_amount: i128,
 }
 
 #[contracttype]
@@ -4055,6 +4110,129 @@ impl CraftNexusContract {
         Self::try_calculate_fee(amount, fee_bps).unwrap_or_else(|err| env.panic_with_error(err))
     }
 
+    /// Deterministically compute how the escrow pot is split for any
+    /// settlement path.
+    ///
+    /// This is the **single source of truth** for all fee math in the
+    /// contract.  Every settlement function — `release_funds`, `auto_release`,
+    /// `release_batch_funds`, `refund`, `resolve_dispute`,
+    /// `resolve_expired_dispute`, and `accept_partial_refund` — **must** obtain
+    /// its transfer amounts exclusively from this function and must not perform
+    /// fee arithmetic inline.
+    ///
+    /// # Invariant
+    ///
+    /// The three output fields always satisfy:
+    ///
+    /// ```text
+    /// allocation.platform_fee + allocation.seller_amount + allocation.buyer_amount
+    ///     == escrow_amount
+    /// ```
+    ///
+    /// This invariant is checked by the test suite for every `SettlementKind`.
+    ///
+    /// # Arguments
+    ///
+    /// * `env`           - Soroban environment (for panicking on overflow).
+    /// * `escrow_amount` - Total amount held in escrow (must be >= 0).
+    /// * `fee_bps`       - Effective fee in basis points for this escrow's
+    ///                     seller, obtained via `get_effective_fee_bps`.
+    /// * `kind`          - Which settlement formula to apply.
+    fn compute_fee_allocation(
+        env: &Env,
+        escrow_amount: i128,
+        fee_bps: u32,
+        kind: SettlementKind,
+    ) -> FeeAllocation {
+        let allocation = match kind {
+            // ── Normal release: platform fee from seller's share ──────────────
+            SettlementKind::ReleaseFunds => {
+                let platform_fee = Self::calculate_fee(env, escrow_amount, fee_bps);
+                let seller_amount = escrow_amount - platform_fee;
+                FeeAllocation {
+                    platform_fee,
+                    seller_amount,
+                    buyer_amount: 0,
+                }
+            }
+
+            // ── Full refund, no fee: entire pot returned to buyer ─────────────
+            SettlementKind::FullRefundNoFee => FeeAllocation {
+                platform_fee: 0,
+                seller_amount: 0,
+                buyer_amount: escrow_amount,
+            },
+
+            // ── Expired dispute – fee conceptually from seller ────────────────
+            // Buyer receives the full amount; the platform does NOT collect
+            // the fee.  The seller's loss is the opportunity cost of the
+            // stalled arbitration.  Balances because platform_fee=0.
+            SettlementKind::ExpiredDisputeDeductFromSeller => FeeAllocation {
+                platform_fee: 0,
+                seller_amount: 0,
+                buyer_amount: escrow_amount,
+            },
+
+            // ── Expired dispute – fee deducted from buyer's refund ────────────
+            SettlementKind::ExpiredDisputeDeductFromBuyer => {
+                let platform_fee = Self::calculate_fee(env, escrow_amount, fee_bps);
+                let buyer_amount = escrow_amount - platform_fee;
+                FeeAllocation {
+                    platform_fee,
+                    seller_amount: 0,
+                    buyer_amount,
+                }
+            }
+
+            // ── Expired dispute – fee split equally between both sides ─────────
+            SettlementKind::ExpiredDisputeSplitFee => {
+                let full_fee = Self::calculate_fee(env, escrow_amount, fee_bps);
+                // Integer division: any remainder (odd-bps rounding) stays with buyer.
+                let platform_fee = full_fee / 2;
+                let buyer_amount = escrow_amount - platform_fee;
+                FeeAllocation {
+                    platform_fee,
+                    seller_amount: 0,
+                    buyer_amount,
+                }
+            }
+
+            // ── Partial refund: dual-sided fee deduction ──────────────────────
+            // The gross amounts must sum to `escrow_amount`; fees are computed
+            // on each gross portion independently using the same `fee_bps`.
+            SettlementKind::PartialRefund(refund_gross, seller_gross) => {
+                // Defensive: clamp to escrow_amount to prevent accounting drift.
+                let safe_refund_gross = if refund_gross < 0 { 0 } else { refund_gross };
+                let safe_seller_gross = if seller_gross < 0 { 0 } else { seller_gross };
+
+                let refund_fee = Self::calculate_fee(env, safe_refund_gross, fee_bps);
+                let seller_fee = Self::calculate_fee(env, safe_seller_gross, fee_bps);
+
+                let platform_fee = refund_fee.saturating_add(seller_fee);
+                let buyer_amount = safe_refund_gross - refund_fee;
+                let seller_amount = safe_seller_gross - seller_fee;
+
+                FeeAllocation {
+                    platform_fee,
+                    seller_amount,
+                    buyer_amount,
+                }
+            }
+        };
+
+        // Deterministic balance invariant: the three-way split must exactly
+        // consume the escrow pot with no remainder.
+        let sum = allocation
+            .platform_fee
+            .checked_add(allocation.seller_amount)
+            .and_then(|s| s.checked_add(allocation.buyer_amount));
+        if sum != Some(escrow_amount) {
+            env.panic_with_error(crate::Error::InvalidFee);
+        }
+
+        allocation
+    }
+
     /// Maintain the dual fee-token bookkeeping (#239).
     ///
     /// Historically fee-receiving tokens were tracked only in the legacy
@@ -4390,10 +4568,14 @@ impl CraftNexusContract {
         // Get platform config
         let config = Self::get_platform_config_internal(&env);
 
-        // Calculate platform fee using effective fee bps for the seller
+        // Deterministic fee allocation via the central FeePolicy engine.
         let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
-        let fee_amount = Self::calculate_fee(&env, escrow.amount, fee_bps);
-        let seller_amount = escrow.amount - fee_amount;
+        let allocation = Self::compute_fee_allocation(
+            &env,
+            escrow.amount,
+            fee_bps,
+            SettlementKind::ReleaseFunds,
+        );
 
         // Update status
         escrow.status = EscrowStatus::Released;
@@ -4410,12 +4592,12 @@ impl CraftNexusContract {
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
         // Transfer platform fee to platform wallet
-        if fee_amount > 0 {
-            Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, fee_amount);
+        if allocation.platform_fee > 0 {
+            Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, allocation.platform_fee);
         }
 
-        // Transfer remaining funds to seller and record audit
-        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), seller_amount);
+        // Transfer net funds to seller and record audit
+        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, allocation.seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), allocation.seller_amount);
 
         Self::emit_escrow_created(
             &env,
@@ -4484,10 +4666,14 @@ impl CraftNexusContract {
         // Get platform config
         let config = Self::get_platform_config_internal(&env);
 
-        // Calculate platform fee
+        // Deterministic fee allocation via the central FeePolicy engine.
         let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
-        let fee_amount = Self::calculate_fee(&env, escrow.amount, fee_bps);
-        let seller_amount = escrow.amount - fee_amount;
+        let allocation = Self::compute_fee_allocation(
+            &env,
+            escrow.amount,
+            fee_bps,
+            SettlementKind::ReleaseFunds,
+        );
 
         // Update status
         escrow.status = EscrowStatus::Released;
@@ -4503,12 +4689,12 @@ impl CraftNexusContract {
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
         // Transfer platform fee to platform wallet
-        if fee_amount > 0 {
-            Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, fee_amount);
+        if allocation.platform_fee > 0 {
+            Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, allocation.platform_fee);
         }
 
-        // Transfer remaining funds to seller and record audit
-        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), seller_amount);
+        // Transfer net funds to seller and record audit
+        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, allocation.seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), allocation.seller_amount);
 
         Self::emit_escrow_created(
             &env,
@@ -5111,6 +5297,14 @@ impl CraftNexusContract {
         let mut escrow =
             Self::claim_active_escrow_transition(&env, order_id, EscrowStatus::RefundPending)?;
 
+        // Deterministic fee allocation via the central FeePolicy engine.
+        let allocation = Self::compute_fee_allocation(
+            &env,
+            escrow.amount,
+            0,
+            SettlementKind::FullRefundNoFee,
+        );
+
         // Update status
         escrow.status = EscrowStatus::Refunded;
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
@@ -5126,7 +5320,7 @@ impl CraftNexusContract {
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
         // Refund to buyer and record audit
-        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(&env, "refund"), escrow.amount);
+        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, allocation.buyer_amount, &escrow.buyer, Symbol::new(&env, "refund"), allocation.buyer_amount);
 
         Self::emit_escrow_created(
             &env,
@@ -5168,26 +5362,6 @@ impl CraftNexusContract {
             },
         );
         Ok(())
-    }
-
-    fn release_funds_to_seller(env: &Env, escrow: &Escrow) {
-        let config = Self::get_platform_config_internal(env);
-        let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
-        let fee_amount = Self::calculate_fee(env, escrow.amount, fee_bps);
-        let seller_amount = escrow.amount - fee_amount;
-
-        Self::update_total_locked(env, &escrow.token, -escrow.amount);
-        if fee_amount > 0 {
-            Self::transfer_platform_fee(env, &escrow.token, &config.platform_wallet, fee_amount);
-        }
-
-        Self::transfer_tokens_and_record_audit(env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_amount, &escrow.seller, Symbol::new(env, "escrow_released"), seller_amount);
-
-    }
-
-    fn refund_funds_to_buyer(env: &Env, escrow: &Escrow) {
-        Self::update_total_locked(env, &escrow.token, -escrow.amount);
-        Self::transfer_tokens_and_record_audit(env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(env, "refund"), escrow.amount);
     }
 
     /// Get escrow details
@@ -5454,10 +5628,28 @@ impl CraftNexusContract {
         // Now perform token transfers (external calls)
         match resolution {
             Resolution::ReleaseToSeller => {
-                Self::release_funds_to_seller(&env, &escrow);
+                let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
+                let allocation = Self::compute_fee_allocation(
+                    &env,
+                    escrow.amount,
+                    fee_bps,
+                    SettlementKind::ReleaseFunds,
+                );
+                Self::update_total_locked(&env, &escrow.token, -escrow.amount);
+                if allocation.platform_fee > 0 {
+                    Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, allocation.platform_fee);
+                }
+                Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, allocation.seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), allocation.seller_amount);
             }
             Resolution::RefundToBuyer => {
-                Self::refund_funds_to_buyer(&env, &escrow);
+                let allocation = Self::compute_fee_allocation(
+                    &env,
+                    escrow.amount,
+                    0,
+                    SettlementKind::FullRefundNoFee,
+                );
+                Self::update_total_locked(&env, &escrow.token, -escrow.amount);
+                Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, allocation.buyer_amount, &escrow.buyer, Symbol::new(&env, "refund"), allocation.buyer_amount);
             }
         }
 
@@ -5739,6 +5931,14 @@ impl CraftNexusContract {
     pub fn calculate_seller_net_amount(env: Env, amount: i128) -> i128 {
         let fee = Self::calculate_fee_for_amount(env, amount);
         amount - fee
+    }
+
+    /// Returns the current deterministic fee policy version.
+    ///
+    /// Increment this constant whenever fee allocation formulas change.
+    /// Callers can compare versions off-chain to detect policy updates.
+    pub fn get_fee_policy_version(_env: Env) -> u32 {
+        FEE_POLICY_VERSION
     }
 
     /// Validate escrow parameters for batch creation
@@ -6158,10 +6358,14 @@ impl CraftNexusContract {
                     // Get platform config
                     let config = Self::get_platform_config_internal(&env);
 
-                    // Calculate platform fee
+                    // Deterministic fee allocation via the central FeePolicy engine.
                     let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
-                    let fee_amount = Self::calculate_fee(&env, escrow.amount, fee_bps);
-                    let seller_amount = escrow.amount - fee_amount;
+                    let allocation = Self::compute_fee_allocation(
+                        &env,
+                        escrow.amount,
+                        fee_bps,
+                        SettlementKind::ReleaseFunds,
+                    );
 
                     // Update status
                     escrow.status = EscrowStatus::Released;
@@ -6176,17 +6380,17 @@ impl CraftNexusContract {
                     Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
                     // Transfer platform fee to platform wallet
-                    if fee_amount > 0 {
+                    if allocation.platform_fee > 0 {
                         Self::transfer_platform_fee(
                             &env,
                             &escrow.token,
                             &config.platform_wallet,
-                            fee_amount,
+                            allocation.platform_fee,
                         );
                     }
 
                     // Transfer remaining funds to seller
-                    Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), seller_amount);
+                    Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, allocation.seller_amount, &escrow.seller, Symbol::new(&env, "escrow_released"), allocation.seller_amount);
 
                     // Emit release event
                     Self::emit_escrow_created(
@@ -6325,37 +6529,24 @@ impl CraftNexusContract {
         Self::update_total_locked(&env, &escrow.token, -escrow.amount);
 
         // Now perform token transfers (external calls)
-        let fee_amount = Self::calculate_fee(&env, escrow.amount, config.platform_fee_bps);
+        let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
+        let settlement_kind = match config.expired_dispute_fee_policy {
+            ExpiredDisputeFeePolicy::RefundFullNoPlatformFee => SettlementKind::ExpiredDisputeDeductFromSeller,
+            ExpiredDisputeFeePolicy::RefundMinusPlatformFee => SettlementKind::ExpiredDisputeDeductFromBuyer,
+            ExpiredDisputeFeePolicy::DeductFeeFromSeller => SettlementKind::ExpiredDisputeDeductFromSeller,
+            ExpiredDisputeFeePolicy::SplitFee => SettlementKind::ExpiredDisputeSplitFee,
+        };
+        let allocation = Self::compute_fee_allocation(
+            &env,
+            escrow.amount,
+            fee_bps,
+            settlement_kind,
+        );
 
-        // Apply the configured fee policy
-        match config.expired_dispute_fee_policy {
-            ExpiredDisputeFeePolicy::RefundFullNoPlatformFee => {
-                // Refund buyer in full, platform collects no fee
-                Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(&env, "expired_dispute_refund"), escrow.amount);
-            }
-            ExpiredDisputeFeePolicy::RefundMinusPlatformFee => {
-                // Refund buyer minus platform fee, platform collects fee
-                let buyer_refund = escrow.amount - fee_amount;
-                Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, buyer_refund, &escrow.buyer, Symbol::new(&env, "expired_dispute_refund"), buyer_refund);
-                Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, fee_amount);
-            }
-            ExpiredDisputeFeePolicy::DeductFeeFromSeller => {
-                // Refund buyer in full, but conceptually the fee comes from seller's side
-                // (seller loses the fee even though they didn't receive payment)
-                Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, escrow.amount, &escrow.buyer, Symbol::new(&env, "expired_dispute_refund"), escrow.amount);
-                // Note: In this policy, the platform doesn't collect the fee
-                // This represents a loss for the seller (they lose the opportunity cost)
-                // but protects the buyer from arbitrator failure
-            }
-            ExpiredDisputeFeePolicy::SplitFee => {
-                // Split the platform fee: half from buyer's refund, half conceptually from seller
-                let half_fee = fee_amount / 2;
-                let buyer_refund = escrow.amount - half_fee;
-
-                Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, buyer_refund, &escrow.buyer, Symbol::new(&env, "expired_dispute_refund"), buyer_refund);
-                Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, half_fee);
-            }
+        if allocation.platform_fee > 0 {
+            Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, allocation.platform_fee);
         }
+        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, allocation.buyer_amount, &escrow.buyer, Symbol::new(&env, "expired_dispute_refund"), allocation.buyer_amount);
 
         Self::emit_escrow_created(
             &env,
@@ -6405,10 +6596,10 @@ impl CraftNexusContract {
             }
             ArtisanStakeData {
                 amount: existing_stake.amount + amount,
-                token,
+                token: token.clone(),
             }
         } else {
-            ArtisanStakeData { amount, token }
+            ArtisanStakeData { amount, token: token.clone() }
         };
 
         let config = Self::get_platform_config_internal(&env);
@@ -6933,16 +7124,20 @@ impl CraftNexusContract {
         }
 
         let refund_amount_gross = proposal.refund_amount;
-        let refund_fee = Self::calculate_partial_refund_fee(&env, refund_amount_gross);
-        let refund_amount_net = refund_amount_gross - refund_fee;
         let seller_gross = escrow.amount - refund_amount_gross;
 
-        // Deduct platform fee from seller's portion using effective fee bps
+        // Deterministic fee allocation via the central FeePolicy engine.
         let config = Self::get_platform_config_internal(&env);
         let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
-        let seller_fee = Self::calculate_fee(&env, seller_gross, fee_bps);
-        let seller_net = seller_gross - seller_fee;
-        let total_platform_fee = refund_fee.saturating_add(seller_fee);
+        let allocation = Self::compute_fee_allocation(
+            &env,
+            escrow.amount,
+            fee_bps,
+            SettlementKind::PartialRefund(
+                refund_amount_gross,
+                seller_gross,
+            ),
+        );
 
         // CEI Pattern: EFFECTS - Update state BEFORE external calls
         escrow.status = EscrowStatus::Resolved;
@@ -6962,23 +7157,23 @@ impl CraftNexusContract {
         // CEI Pattern: INTERACTIONS - External calls AFTER state updates
 
         // Refund buyer and record audit
-        if refund_amount_net > 0 {
-            Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, refund_amount_net, &escrow.buyer, Symbol::new(&env, "partial_refund_buyer"), refund_amount_net);
+        if allocation.buyer_amount > 0 {
+            Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.buyer, allocation.buyer_amount, &escrow.buyer, Symbol::new(&env, "partial_refund_buyer"), allocation.buyer_amount);
         }
 
         // Pay platform fee
-        if total_platform_fee > 0 {
+        if allocation.platform_fee > 0 {
             Self::transfer_platform_fee(
                 &env,
                 &escrow.token,
                 &config.platform_wallet,
-                total_platform_fee,
+                allocation.platform_fee,
             );
         }
 
         // Pay seller
-        if seller_net > 0 {
-            Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, seller_net, &escrow.seller, Symbol::new(&env, "partial_refund_seller"), seller_net);
+        if allocation.seller_amount > 0 {
+            Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.seller, allocation.seller_amount, &escrow.seller, Symbol::new(&env, "partial_refund_seller"), allocation.seller_amount);
         }
 
         Self::emit_escrow_created(
@@ -7179,11 +7374,15 @@ impl CraftNexusContract {
             escrow.total_amount / (escrow.duration as i128)
         };
 
-        // Calculate distribution amounts.
+        // Calculate distribution amounts using the deterministic fee engine.
         let config = Self::get_platform_config_internal(&env);
         let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.artisan.clone());
-        let fee_amount = Self::calculate_fee(&env, cycle_amount, fee_bps);
-        let artisan_amount = cycle_amount - fee_amount;
+        let allocation = Self::compute_fee_allocation(
+            &env,
+            cycle_amount,
+            fee_bps,
+            SettlementKind::ReleaseFunds,
+        );
 
         // Effects: commit all cycle and reserve accounting first.
         Self::update_total_locked(&env, &escrow.token, -cycle_amount);
@@ -7208,10 +7407,10 @@ impl CraftNexusContract {
         }
 
         // Interactions: token callbacks can only observe the completed cycle.
-        if fee_amount > 0 {
-            Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, fee_amount);
+        if allocation.platform_fee > 0 {
+            Self::transfer_platform_fee(&env, &escrow.token, &config.platform_wallet, allocation.platform_fee);
         }
-        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.artisan, artisan_amount, &escrow.artisan, Symbol::new(&env, "recurring_release"), artisan_amount);
+        Self::transfer_tokens_and_record_audit(&env, &escrow.token, &env.current_contract_address(), &escrow.artisan, allocation.seller_amount, &escrow.artisan, Symbol::new(&env, "recurring_release"), allocation.seller_amount);
 
         env.events().publish(
             (Symbol::new(&env, "recurring_escrow"), id),
