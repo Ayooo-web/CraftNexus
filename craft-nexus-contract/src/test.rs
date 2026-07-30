@@ -32,7 +32,7 @@ fn setup_test(
     let admin = Address::generate(env);
 
     let token_admin = Address::generate(env);
-    let token_contract = env.register_stellar_asset_contract(token_admin.clone());
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token_admin_client = token::StellarAssetClient::new(env, &token_contract.address());
 
     let arbitrator = Address::generate(env);
@@ -611,7 +611,7 @@ fn test_platform_fee_deduction_10_percent() {
     let admin = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let token_contract = env.register_stellar_asset_contract(token_admin.clone());
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token_admin_client = token::StellarAssetClient::new(&env, &token_contract.address());
 
     let arbitrator = Address::generate(&env);
@@ -721,7 +721,7 @@ fn test_update_platform_fee() {
     let seller = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let token_contract = env.register_stellar_asset_contract(token_admin.clone());
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token_admin_client = token::StellarAssetClient::new(&env, &token_contract.address());
 
     let arbitrator = Address::generate(&env);
@@ -786,7 +786,7 @@ fn test_update_platform_fee_too_high() {
     let platform_wallet = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let _token_contract = env.register_stellar_asset_contract(token_admin.clone());
+    let _token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
 
     let arbitrator = Address::generate(&env);
 
@@ -1277,13 +1277,13 @@ fn test_integration_multiple_tokens_and_escrows() {
 
     // Token A
     let token_a_admin = Address::generate(&env);
-    let token_a_contract = env.register_stellar_asset_contract(token_a_admin.clone());
+    let token_a_contract = env.register_stellar_asset_contract_v2(token_a_admin.clone());
     let token_a_asset = token::StellarAssetClient::new(&env, &token_a_contract.address());
     token_a_asset.mint(&buyer, &100_000_000);
 
     // Token B
     let token_b_admin = Address::generate(&env);
-    let token_b_contract = env.register_stellar_asset_contract(token_b_admin.clone());
+    let token_b_contract = env.register_stellar_asset_contract_v2(token_b_admin.clone());
     let token_b_asset = token::StellarAssetClient::new(&env, &token_b_contract.address());
     token_b_asset.mint(&buyer, &200_000_000);
 
@@ -1376,7 +1376,7 @@ fn test_unstake_rejects_different_token_than_original_stake() {
     let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
 
     let other_token_admin = Address::generate(&env);
-    let other_token_contract = env.register_stellar_asset_contract(other_token_admin.clone());
+    let other_token_contract = env.register_stellar_asset_contract_v2(other_token_admin.clone());
     let other_token_admin_client =
         token::StellarAssetClient::new(&env, &other_token_contract.address());
 
@@ -1695,7 +1695,7 @@ fn test_contract_address_admin_is_authorized() {
     let admin_contract = env.register_contract(None, CraftNexusContract);
     let arbitrator = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token_contract = env.register_stellar_asset_contract(token_admin.clone());
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
 
     env.ledger().with_mut(|li| {
         li.timestamp = 1711368000;
@@ -3051,7 +3051,7 @@ fn test_create_escrow_non_whitelisted_token_rejected() {
 
     // Attempt to create an escrow with a different, non-whitelisted token
     let other_token_admin = Address::generate(&env);
-    let other_token = env.register_stellar_asset_contract(other_token_admin.clone());
+    let other_token = env.register_stellar_asset_contract_v2(other_token_admin.clone());
     let other_token_client = token::StellarAssetClient::new(&env, &other_token.address());
     other_token_client.mint(&buyer, &100_000_000);
 
@@ -3125,7 +3125,7 @@ fn test_batch_escrow_non_whitelisted_token_rejected() {
 
     // Build a batch with a non-whitelisted second token
     let other_token_admin = Address::generate(&env);
-    let other_token = env.register_stellar_asset_contract(other_token_admin.clone());
+    let other_token = env.register_stellar_asset_contract_v2(other_token_admin.clone());
 
     let params = soroban_sdk::vec![
         &env,
@@ -3187,7 +3187,7 @@ fn test_multiple_tokens_on_whitelist() {
 
     // Register a second token
     let token2_admin = Address::generate(&env);
-    let token2 = env.register_stellar_asset_contract(token2_admin.clone());
+    let token2 = env.register_stellar_asset_contract_v2(token2_admin.clone());
     let token2_client = token::StellarAssetClient::new(&env, &token2.address());
     token2_client.mint(&buyer, &100_000_000);
 
