@@ -161,6 +161,7 @@ pub enum Error {
     EvidenceAlreadyUsed = 51,
     /// Invalid dispute session for evidence submission (#927)
     InvalidDisputeSession = 52,
+    UnsupportedToken = 50,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
