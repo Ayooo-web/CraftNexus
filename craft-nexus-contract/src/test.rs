@@ -846,11 +846,13 @@ fn test_initialize_emits_config_events() {
     let fee_event: ConfigUpdatedEvent = events
         .get(events.len() - 2)
         .unwrap()
+        .unwrap()
         .2
         .try_into_val(&env)
         .unwrap();
     let wallet_event: ConfigUpdatedEvent = events
         .get(events.len() - 1)
+        .unwrap()
         .unwrap()
         .2
         .try_into_val(&env)
