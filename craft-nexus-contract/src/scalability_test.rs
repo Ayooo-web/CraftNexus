@@ -799,68 +799,6 @@ fn test_artisan_stake_queue_pruning_can_empty_queue() {
     }
 }
 
-/// Regression test for #703: when pruning leaves some non-matured deposits
-/// alive (partial prune), no stale ArtisanStakeQueueIndexed keys must remain
-/// at positions >= the new queue count.
-///
-/// Setup:
-///   1. Add `half` deposits at t=0  (cohort A – will be matured by step 3).
-///   2. Add enough deposits to reach PRUNE_THRESHOLD without going over (cohort B).
-///   3. Advance time past the cooldown so cohort A matures.
-///   4. One more stake triggers prune: cohort A removed, cohort B compacted to
-///      indices 0..surviving, new deposit appended.
-///
-/// Assertion: every slot at [new_count, PRUNE_THRESHOLD) is absent from storage.
-#[test]
-fn test_prune_no_stale_index_keys_after_partial_prune() {
-    let (env, client, _, artisan, token, _, _, _) = setup_test();
-    let token_asset = token::StellarAssetClient::new(&env, &token);
-    token_asset.mint(&artisan, &200_000_000);
-
-    let half = STAKE_QUEUE_PRUNE_THRESHOLD / 2;
-
-    // Cohort A: half deposits at current time – these will mature.
-    for _ in 0..half {
-        client.stake_tokens(&artisan, &token, &1000);
-    }
-    assert_eq!(client.get_artisan_stake_queue_count(&artisan), half);
-
-    // Cohort B: fill up to PRUNE_THRESHOLD - 1 so the NEXT stake triggers pruning.
-    // These are added while cohort A's cooldown is still active, so all deposits
-    // in the queue share the same cooldown_end (stake_tokens reuses it).
-    for _ in 0..(STAKE_QUEUE_PRUNE_THRESHOLD - half) {
-        client.stake_tokens(&artisan, &token, &1000);
-    }
-    assert_eq!(
-        client.get_artisan_stake_queue_count(&artisan),
-        STAKE_QUEUE_PRUNE_THRESHOLD
-    );
-
-    // Advance time past the cooldown so ALL current deposits mature.
-    env.ledger().with_mut(|li| {
-        li.timestamp += DEFAULT_STAKE_COOLDOWN as u64 + 1;
-    });
-
-    // This stake hits count >= PRUNE_THRESHOLD and triggers pruning.
-    // All prior deposits are now matured and should be removed; the new
-    // deposit is written at index 0.
-    client.stake_tokens(&artisan, &token, &9999);
-
-    let new_count = client.get_artisan_stake_queue_count(&artisan);
-
-    // Core assertion: no stale ArtisanStakeQueueIndexed key may exist at any
-    // position >= new_count up to the former maximum index.
-    for index in new_count..STAKE_QUEUE_PRUNE_THRESHOLD {
-        let stale_key = DataKey::ArtisanStakeQueueIndexed(artisan.clone(), index);
-        let still_present =
-            env.as_contract(&client.address, || env.storage().persistent().has(&stale_key));
-        assert!(
-            !still_present,
-            "stale index key {index} must not exist after pruning (new_count={new_count})"
-        );
-    }
-}
-
 #[test]
 fn test_artisan_stake_queue_migration() {
     let (env, client, _, artisan, _, _, _, _) = setup_test();

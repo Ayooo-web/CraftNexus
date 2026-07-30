@@ -445,13 +445,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "RateLimit"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                },
-                {
-                  "u32": 1
+                  "symbol": "StorageLayoutVersion"
                 }
               ]
             },
@@ -468,13 +462,52 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "RateLimit"
+                      "symbol": "StorageLayoutVersion"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "u32": 1
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          518400
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "UpgradeApprovalState"
+                },
+                {
+                  "u32": 0
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "UpgradeApprovalState"
                     },
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                    },
-                    {
-                      "u32": 1
+                      "u32": 0
                     }
                   ]
                 },
@@ -483,7 +516,15 @@
                   "map": [
                     {
                       "key": {
-                        "symbol": "count"
+                        "symbol": "approvals"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "nonce"
                       },
                       "val": {
                         "u32": 1
@@ -491,10 +532,18 @@
                     },
                     {
                       "key": {
-                        "symbol": "window_start"
+                        "symbol": "signers"
                       },
                       "val": {
-                        "u64": 1711368000
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "threshold"
+                      },
+                      "val": {
+                        "u32": 1
                       }
                     }
                   ]
@@ -553,22 +602,6 @@
                               },
                               "val": {
                                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "dispute_escalation_window"
-                              },
-                              "val": {
-                                "u32": 259200
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "evidence_challenge_window"
-                              },
-                              "val": {
-                                "u32": 172800
                               }
                             },
                             {
@@ -640,22 +673,6 @@
                               },
                               "val": {
                                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "rate_limit_max_calls"
-                              },
-                              "val": {
-                                "u32": 5
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "rate_limit_window"
-                              },
-                              "val": {
-                                "u32": 3600
                               }
                             },
                             {
