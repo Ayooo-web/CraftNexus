@@ -151,7 +151,7 @@ pub enum Error {
     /// Caller is not an authorized admin action signer
     NotAnAdminActionSigner = 49,
     /// Contract does not implement the supported token interface.
-    UnsupportedToken = 46,
+    UnsupportedToken = 50,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -2876,7 +2876,7 @@ impl CraftNexusContract {
         if action.executed {
             return Err(Error::AdminActionTerminal);
         }
-        if action.approvals.len() as u32 < action.threshold {
+        if (action.approvals.len() as u32) < action.threshold {
             return Err(Error::AdminActionNeedsApprovals);
         }
         let now = env.ledger().timestamp();
@@ -2984,7 +2984,7 @@ impl CraftNexusContract {
                 Ok(())
             }
             AdminActionKind::ExecuteUpgrade(expected_wasm_hash) => {
-                Self::execute_upgrade(env, expected_wasm_hash)
+                Self::execute_upgrade(env.clone(), expected_wasm_hash.clone())
             }
             AdminActionKind::SetMaxDisputeDuration(duration) => {
                 let mut config = Self::get_platform_config_internal(env);
