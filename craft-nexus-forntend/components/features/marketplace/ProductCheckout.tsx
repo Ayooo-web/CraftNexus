@@ -70,7 +70,6 @@ export function ProductCheckout({
   // Calculate fees using deterministic integer arithmetic (matches on-chain contract)
   const platformFee = calculateDeterministicFee(product.price);
   const sellerReceives = platformFee.sellerReceives;
-  const platformFeeAmount = platformFee.platformFee;
 
   // Handle successful escrow creation
   const handleEscrowSuccess = useCallback(
@@ -217,9 +216,9 @@ export function ProductCheckout({
               </div>
               <div className="flex justify-between">
                 <span className="text-gray-600">
-                  Platform Fee ({platformFeePercentage}%)
+                  Platform Fee ({PLATFORM_COMMISSION_PERCENT}%)
                 </span>
-                <span className="font-medium">${platformFee.toFixed(2)}</span>
+                <span className="font-medium">${platformFee.platformFee.toFixed(2)}</span>
               </div>
               <div className="border-t pt-2 flex justify-between">
                 <span className="text-gray-600">Total</span>

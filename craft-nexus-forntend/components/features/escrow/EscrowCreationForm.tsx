@@ -60,6 +60,7 @@ export function EscrowCreationForm({
   const platformFeeResult = calculateDeterministicFee(amountNum);
   const platformFee = platformFeeResult.platformFee;
   const sellerReceives = platformFeeResult.sellerReceives;
+  const platformFeePercentage = 2.5;
 
   // Handle form input changes
   const handleChange = useCallback(
