@@ -5304,7 +5304,7 @@ impl CraftNexusContract {
             SettlementKind::FullRefundNoFee,
         );
 
-        // Update status
+        // CEI: persist the Refunded state before any external token transfer.
         escrow.status = EscrowStatus::Refunded;
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
         Self::extend_persistent(&env, &(ESCROW, order_id));
