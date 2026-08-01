@@ -6137,6 +6137,11 @@ let _previous_admin = config.admin.clone();
         config.expired_dispute_fee_policy
     }
 
+    /// Get the current moderator address, if set.
+    pub fn get_moderator(env: Env) -> Option<Address> {
+        Self::get_platform_config_internal(&env).moderator
+    }
+
     pub fn set_moderator(env: Env, moderator: Address) {
         let mut config = Self::get_platform_config(env.clone());
         config.admin.require_auth();
@@ -7265,6 +7270,11 @@ let _previous_admin = config.admin.clone();
         Ok(())
     }
 
+    /// Get the current maximum dispute duration (in seconds).
+    pub fn get_max_dispute_duration(env: Env) -> u32 {
+        Self::get_platform_config_internal(&env).max_dispute_duration
+    }
+
     /// Admin sets the maximum dispute duration (in seconds).
     pub fn set_max_dispute_duration(env: Env, duration_seconds: u32) -> Result<(), Error> {
         let admin = Self::get_admin(&env)?;
@@ -7284,6 +7294,11 @@ let _previous_admin = config.admin.clone();
             ConfigValue::U32(duration_seconds),
         );
         Ok(())
+    }
+
+    /// Get the current stake cooldown period (in seconds).
+    pub fn get_stake_cooldown(env: Env) -> u32 {
+        Self::get_platform_config_internal(&env).stake_cooldown
     }
 
     /// Admin sets the stake cooldown period (in seconds).
