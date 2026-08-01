@@ -48,53 +48,75 @@ pub mod onboarding;
 #[repr(u32)]
 pub enum Error {
     // â”€â”€ Auth / Access (1â€“9): rollback immediately â”€â”€
-    /// Unauthorized operation
+    /// The caller is not authorized for this operation. Ensure you are using
+    /// the correct admin, arbitrator, moderator, buyer, or seller address.
     Unauthorized = 1,
-    /// Escrow not found
+    /// No escrow exists with the given order ID. Verify the order_id is
+    /// correct and the escrow has not already been cleaned up.
     EscrowNotFound = 2,
-    /// Invalid escrow state for operation
+    /// The escrow is not in the required state for this operation. For example,
+    /// you cannot release a Disputed escrow or re-fund an already-funded escrow.
+    /// Call get_escrow to inspect the current status before retrying.
     InvalidEscrowState = 3,
     /// DEPRECATED: Handled by onboarding contract. Retained for ABI compatibility.
     UsernameAlreadyExists = 4,
-    /// Token not whitelisted
+    /// The token is not on the platform whitelist. An admin must call
+    /// whitelist_token before this token can be used in escrows.
     TokenNotWhitelisted = 5,
-    /// Amount below minimum
+    /// The escrow amount is below the configured per-token minimum. Call
+    /// get_fee_token_config to check the minimum, then increase the amount.
     AmountBelowMinimum = 6,
-    /// Release window too long
+    /// The requested release window exceeds the platform-configured maximum.
+    /// Call get_max_release_window to check the current ceiling.
     ReleaseWindowTooLong = 7,
-    /// Not in dispute state
+    /// The escrow is not in the Disputed state; dispute resolution cannot
+    /// proceed. The escrow must be in Disputed status before resolve_dispute
+    /// can be called.
     NotInDispute = 8,
     /// DEPRECATED: Handled by onboarding contract. Retained for ABI compatibility.
     AlreadyOnboarded = 9,
     // â”€â”€ State / Transition (10â€“19): retry after state change â”€â”€
-    /// Invalid fee amount (must be <= MAX_PLATFORM_FEE_BPS)
+    /// The fee exceeds the maximum allowed platform fee (MAX_PLATFORM_FEE_BPS,
+    /// currently 10%). Reduce fee_bps and retry.
     InvalidFee = 10,
-    /// Buyer and seller cannot be the same
+    /// The buyer and seller addresses are identical; self-escrow is not
+    /// permitted. Use distinct buyer and seller addresses.
     SameBuyerSeller = 11,
-    /// Platform not initialized
+    /// The platform has not been initialized. Call initialize before
+    /// invoking any escrow operations.
     PlatformNotInitialized = 12,
-    /// Release window not yet elapsed
+    /// The escrow release window has not yet elapsed; auto-release is
+    /// premature. Wait until created_at + release_window seconds have passed.
     ReleaseWindowNotElapsed = 13,
     /// Batch operation error (deprecated: use BatchLimitExceeded)
     BatchOperationFailed = 14,
-    /// Contract is paused
+    /// The contract is currently paused by an admin. Wait for the platform
+    /// to be unpaused (is_paused returns false) before retrying.
     ContractPaused = 15,
-    /// Dispute resolution deadline has not yet expired
+    /// The dispute deadline (max_dispute_duration) has not yet elapsed;
+    /// resolve_expired_dispute cannot be called yet. Wait until
+    /// dispute_initiated_at + max_dispute_duration seconds have passed.
     DisputeExpired = 16,
-    /// Artisan stake is below the required minimum
+    /// The artisan's staked collateral is below the required minimum. The
+    /// artisan must call stake_tokens to top up before this operation proceeds.
     InsufficientStake = 17,
-    /// Stake cooldown period is still active
+    /// The stake cooldown period has not yet elapsed. Wait until the
+    /// cooldown_end timestamp has passed before attempting to unstake.
     StakeCooldownActive = 18,
-    /// Refund amount is invalid (zero, negative, or exceeds escrow amount)
+    /// The partial refund amount is invalid: it must be positive and not
+    /// exceed the escrow amount. Adjust refund_amount and retry.
     InvalidRefundAmount = 19,
     // â”€â”€ Config / Resource (20â€“29): operator must act â”€â”€
     /// Partial refund proposal not found
     ProposalNotFound = 20,
     /// Partial refund proposal already exists for this order
     ProposalAlreadyExists = 21,
-    /// Re-entrancy detected
+    /// A re-entrant call was detected and blocked. Do not call guarded
+    /// functions recursively. Retry the operation as a standalone call.
     ReentryDetected = 22,
-    /// Release window is zero or negative
+    /// The release window is below the platform-configured minimum
+    /// (min_release_window). Call get_min_release_window to check the floor,
+    /// then increase the window value.
     ReleaseWindowTooShort = 23,
     /// Staked funds can only be withdrawn in the original staking token
     StakeTokenMismatch = 24,
@@ -760,6 +782,10 @@ pub struct FundMovementAuditEntry {
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 pub struct EscrowEvent {
+    /// Schema version for this event payload. Increment when fields are added
+    /// or reordered so off-chain indexers can handle multiple schema generations
+    /// without breaking across upgrades. Current version: 1.
+    pub schema_version: u32,
     pub escrow_id: u64,
     pub action: EscrowAction,
     pub buyer: Address,
@@ -776,6 +802,10 @@ pub struct EscrowEvent {
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 pub struct EscrowResolvedEvent {
+    /// Schema version for this event payload. Increment when fields are added
+    /// or reordered so off-chain indexers can handle multiple schema generations
+    /// without breaking across upgrades. Current version: 1.
+    pub schema_version: u32,
     pub escrow_id: u64,
     pub buyer: Address,
     pub seller: Address,
@@ -3507,7 +3537,8 @@ let _previous_admin = config.admin.clone();
         Self::emit_escrow_created(
             &env,
             EscrowEvent {
-                escrow_id: order_id as u64,
+                    schema_version: 1,
+                    escrow_id: order_id as u64,
                 action: EscrowAction::Created,
                 buyer: buyer.clone(),
                 seller: seller.clone(),
@@ -3628,7 +3659,8 @@ let _previous_admin = config.admin.clone();
         Self::emit_escrow_created(
             &env,
             EscrowEvent {
-                escrow_id: order_id as u64,
+                    schema_version: 1,
+                    escrow_id: order_id as u64,
                 action: EscrowAction::Created,
                 buyer: buyer.clone(),
                 seller: seller.clone(),
@@ -3661,7 +3693,8 @@ let _previous_admin = config.admin.clone();
         Self::emit_escrow_created(
             &env,
             EscrowEvent {
-                escrow_id: order_id as u64,
+                    schema_version: 1,
+                    escrow_id: order_id as u64,
                 action: EscrowAction::Created, // Re-emit as created/funded
                 buyer: escrow.buyer.clone(),
                 seller: escrow.seller.clone(),
@@ -4711,7 +4744,8 @@ let _previous_admin = config.admin.clone();
         Self::emit_escrow_created(
             &env,
             EscrowEvent {
-                escrow_id: order_id as u64,
+                    schema_version: 1,
+                    escrow_id: order_id as u64,
                 action: EscrowAction::Released,
                 buyer: escrow.buyer.clone(),
                 seller: escrow.seller.clone(),
@@ -4808,7 +4842,8 @@ let _previous_admin = config.admin.clone();
         Self::emit_escrow_created(
             &env,
             EscrowEvent {
-                escrow_id: order_id as u64,
+                    schema_version: 1,
+                    escrow_id: order_id as u64,
                 action: EscrowAction::Released,
                 buyer: escrow.buyer.clone(),
                 seller: escrow.seller.clone(),
@@ -4881,7 +4916,8 @@ let _previous_admin = config.admin.clone();
         Self::emit_escrow_created(
             &env,
             EscrowEvent {
-                escrow_id: order_id as u64,
+                    schema_version: 1,
+                    escrow_id: order_id as u64,
                 action: EscrowAction::Extended,
                 buyer: escrow.buyer.clone(),
                 seller: escrow.seller.clone(),
@@ -5674,7 +5710,8 @@ let _previous_admin = config.admin.clone();
         Self::emit_escrow_created(
             &env,
             EscrowEvent {
-                escrow_id: order_id as u64,
+                    schema_version: 1,
+                    escrow_id: order_id as u64,
                 action: EscrowAction::Disputed,
                 buyer: escrow.buyer.clone(),
                 seller: escrow.seller.clone(),
@@ -5733,6 +5770,19 @@ let _previous_admin = config.admin.clone();
             env.panic_with_error(crate::Error::InvalidEscrowState);
         }
 
+        // Issue #657: enforce arbitrator time-lock. If the dispute deadline has
+        // already elapsed the escrow must be settled via resolve_expired_dispute
+        // instead. This prevents a stale or compromised arbitrator from
+        // resolving disputes after the platform's expiry policy has kicked in.
+        if let Some(initiated_at) = escrow.dispute_initiated_at {
+            let config_ref = Self::get_platform_config_internal(&env);
+            if initiated_at + config_ref.max_dispute_duration as u64
+                <= env.ledger().timestamp()
+            {
+                env.panic_with_error(crate::Error::ArbitratorDeadlineExceeded);
+            }
+        }
+
         // CRITICAL: Update status BEFORE external calls (CEI pattern)
         escrow.status = EscrowStatus::Resolved;
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
@@ -5779,7 +5829,8 @@ let _previous_admin = config.admin.clone();
         Self::emit_escrow_created(
             &env,
             EscrowEvent {
-                escrow_id: order_id as u64,
+                    schema_version: 1,
+                    escrow_id: order_id as u64,
                 action: EscrowAction::Resolved,
                 buyer: escrow.buyer.clone(),
                 seller: escrow.seller.clone(),
@@ -5791,7 +5842,8 @@ let _previous_admin = config.admin.clone();
         Self::emit_escrow_resolved_event(
             &env,
             EscrowResolvedEvent {
-                escrow_id: order_id as u64,
+                    schema_version: 1,
+                    escrow_id: order_id as u64,
                 buyer: escrow.buyer.clone(),
                 seller: escrow.seller.clone(),
                 arbitrator: authorized_address.clone(),
@@ -6336,7 +6388,8 @@ let _previous_admin = config.admin.clone();
         Self::emit_escrow_created(
             env,
             EscrowEvent {
-                escrow_id: params.order_id as u64,
+                    schema_version: 1,
+                    escrow_id: params.order_id as u64,
                 action: EscrowAction::Created,
                 buyer: params.buyer.clone(),
                 seller: params.seller.clone(),
@@ -6528,7 +6581,8 @@ let _previous_admin = config.admin.clone();
                             Self::emit_escrow_created(
                                 &env,
                                 EscrowEvent {
-                                    escrow_id: id,
+                                        schema_version: 1,
+                                        escrow_id: id,
                                     action: EscrowAction::BatchCreated,
                                     buyer: escrow.buyer,
                                     seller: escrow.seller,
@@ -6687,7 +6741,8 @@ let _previous_admin = config.admin.clone();
                     Self::emit_escrow_created(
                         &env,
                         EscrowEvent {
-                            escrow_id: order_id as u64,
+                                schema_version: 1,
+                                escrow_id: order_id as u64,
                             action: EscrowAction::BatchReleased,
                             buyer: escrow.buyer.clone(),
                             seller: escrow.seller.clone(),
@@ -6842,7 +6897,8 @@ let _previous_admin = config.admin.clone();
         Self::emit_escrow_created(
             &env,
             EscrowEvent {
-                escrow_id: order_id as u64,
+                    schema_version: 1,
+                    escrow_id: order_id as u64,
                 action: EscrowAction::Resolved,
                 buyer: escrow.buyer.clone(),
                 seller: escrow.seller.clone(),
@@ -7487,7 +7543,8 @@ let _previous_admin = config.admin.clone();
         Self::emit_escrow_created(
             &env,
             EscrowEvent {
-                escrow_id: order_id as u64,
+                    schema_version: 1,
+                    escrow_id: order_id as u64,
                 action: EscrowAction::Resolved,
                 buyer: escrow.buyer.clone(),
                 seller: escrow.seller.clone(),
