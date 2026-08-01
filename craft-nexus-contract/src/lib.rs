@@ -5857,6 +5857,102 @@ let _previous_admin = config.admin.clone();
         }
     }
 
+    /// Resolve a dispute by splitting funds between buyer and seller.
+    ///
+    /// `buyer_amount` is the gross amount returned to the buyer. The platform
+    /// fee is charged once on the seller's portion only, matching the logic of
+    /// a normal release but applied to a reduced seller share.
+    pub fn resolve_dispute_partial(
+        env: Env,
+        order_id: u32,
+        buyer_amount: i128,
+        authorized_address: Address,
+    ) {
+        let _guard = ReentryGuardScope::new(&env);
+        let config = Self::get_platform_config_internal(&env);
+        authorized_address.require_auth();
+        let is_authorized = authorized_address == config.admin
+            || Some(authorized_address.clone()) == config.moderator
+            || authorized_address == config.arbitrator;
+        if !is_authorized {
+            env.panic_with_error(crate::Error::Unauthorized);
+        }
+
+        let mut escrow = Self::get_stored_escrow(&env, order_id);
+
+        if escrow.status != EscrowStatus::Disputed {
+            env.panic_with_error(crate::Error::InvalidEscrowState);
+        }
+
+        if buyer_amount <= 0 || buyer_amount >= escrow.amount {
+            env.panic_with_error(crate::Error::InvalidRefundAmount);
+        }
+
+        escrow.status = EscrowStatus::Resolved;
+        env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+
+        let proposal_key = DataKey::PartialRefundProposal(order_id);
+        env.storage().persistent().remove(&proposal_key);
+
+        Self::update_active_obligations(&env, &escrow.buyer, -1);
+        Self::update_active_obligations(&env, &escrow.seller, -1);
+        Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
+        Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
+
+        Self::release_funds_partial(&env, &escrow, buyer_amount);
+
+        Self::emit_escrow_created(
+            &env,
+            EscrowEvent {
+                escrow_id: order_id as u64,
+                action: EscrowAction::Resolved,
+                buyer: escrow.buyer.clone(),
+                seller: escrow.seller.clone(),
+                amount: escrow.amount,
+                token: escrow.token.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Self::emit_escrow_resolved_event(
+            &env,
+            EscrowResolvedEvent {
+                escrow_id: order_id as u64,
+                buyer: escrow.buyer.clone(),
+                seller: escrow.seller.clone(),
+                arbitrator: authorized_address.clone(),
+                amount: escrow.amount,
+                token: escrow.token.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        let ts = env.ledger().timestamp();
+        Self::emit_reputation_update(
+            &env,
+            ReputationUpdateEvent {
+                address: escrow.seller.clone(),
+                successful_delta: 1,
+                disputed_delta: 0,
+                metrics_sales_delta: 1,
+                metrics_amount: buyer_amount,
+                token: escrow.token.clone(),
+                timestamp: ts,
+            },
+        );
+        Self::emit_reputation_update(
+            &env,
+            ReputationUpdateEvent {
+                address: escrow.buyer.clone(),
+                successful_delta: 1,
+                disputed_delta: 0,
+                metrics_sales_delta: 0,
+                metrics_amount: 0,
+                token: escrow.token.clone(),
+                timestamp: ts,
+            },
+        );
+    }
+
     /// Update platform fee percentage (admin only)
     ///
     /// # Arguments
@@ -7303,9 +7399,9 @@ let _previous_admin = config.admin.clone();
     /// Accept the outstanding partial refund proposal for a disputed escrow.
     ///
     /// The counterparty (the party that did NOT submit the proposal) calls this function.
-    /// Funds are distributed from a gross refund model: buyer receives
-    /// `refund_amount - refund_fee`, seller receives the remainder minus seller-side
-    /// platform fee. The escrow status is set to Resolved.
+    /// Funds are distributed from a gross refund model: buyer receives the full
+    /// proposed refund amount, seller receives the remainder minus a single
+    /// platform fee on the seller's portion. The escrow status is set to Resolved.
     pub fn accept_partial_refund(env: Env, order_id: u32) -> Result<(), Error> {
         let _guard = ReentryGuardScope::new(&env);
         let escrow_opt: Option<Escrow> = env.storage().persistent().get(&(ESCROW, order_id));
@@ -7463,8 +7559,10 @@ let _previous_admin = config.admin.clone();
         if gross_refund <= 0 || gross_refund > escrow.amount {
             return false;
         }
-        let potential_refund_fee = Self::calculate_partial_refund_fee(env, gross_refund);
-        gross_refund.saturating_add(potential_refund_fee) <= escrow.amount
+        let seller_gross = escrow.amount - gross_refund;
+        let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
+        let seller_fee = Self::calculate_fee(env, seller_gross, fee_bps);
+        seller_gross >= seller_fee
     }
 
     /// Create a new recurring escrow for recurring payments/subscriptions.

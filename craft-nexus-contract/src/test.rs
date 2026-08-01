@@ -521,6 +521,106 @@ fn test_resolve_dispute_non_disputed() {
 }
 
 #[test]
+fn test_resolve_dispute_partial_release_50_50() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, admin) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "Partial_delivery"), &buyer);
+
+    // 50/50 split: buyer gets 25M, seller gets 25M minus 5% fee
+    client.resolve_dispute_partial(&1, &25_000_000, &admin);
+
+    let escrow = client.get_escrow(&1);
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
+
+    let token_client = token::Client::new(&env, &token_id);
+    // Buyer gets exactly their share
+    assert_eq!(token_client.balance(&buyer), 25_000_000);
+    // Seller gets 25M - 5% fee (1_250_000) = 23_750_000
+    assert_eq!(token_client.balance(&seller), 23_750_000);
+}
+
+#[test]
+fn test_resolve_dispute_partial_release_custom_fee_tier() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, admin) = setup_test(&env, true);
+
+    // Set custom 2% fee for seller
+    client.set_artisan_fee_tier(&seller, &200);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "Partial_delivery"), &buyer);
+
+    // 70/30 split: buyer gets 35M, seller gets 15M minus 2% fee
+    client.resolve_dispute_partial(&1, &35_000_000, &admin);
+
+    let token_client = token::Client::new(&env, &token_id);
+    assert_eq!(token_client.balance(&buyer), 35_000_000);
+    // Seller gets 15M - 2% fee (300_000) = 14_700_000
+    assert_eq!(token_client.balance(&seller), 14_700_000);
+}
+
+#[test]
+fn test_resolve_dispute_partial_release_fee_deducted_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, platform_wallet, admin) =
+        setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "Partial_delivery"), &buyer);
+
+    // 50/50 split
+    client.resolve_dispute_partial(&1, &25_000_000, &admin);
+
+    let token_client = token::Client::new(&env, &token_id);
+    // Fee is 5% of seller's 25M = 1_250_000 — charged exactly once
+    let expected_fee = 25_000_000 * 500 / 10_000;
+    assert_eq!(expected_fee, 1_250_000);
+
+    // Buyer + seller + platform_fee should equal escrow amount
+    let buyer_balance = token_client.balance(&buyer);
+    let seller_balance = token_client.balance(&seller);
+    let platform_balance = token_client.balance(&platform_wallet);
+    assert_eq!(buyer_balance + seller_balance + platform_balance, 50_000_000);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #18)")]
+fn test_resolve_dispute_partial_release_zero_buyer_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, admin) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "Invalid_split"), &buyer);
+
+    client.resolve_dispute_partial(&1, &0, &admin);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #18)")]
+fn test_resolve_dispute_partial_release_full_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, admin) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+    client.dispute_escrow(&1, &Symbol::new(&env, "Invalid_split"), &buyer);
+
+    // buyer_amount == escrow.amount is invalid (must be < full amount)
+    client.resolve_dispute_partial(&1, &50_000_000, &admin);
+}
+
+#[test]
 #[should_panic]
 fn test_refund_failure_unauthorized() {
     let env = Env::default();
