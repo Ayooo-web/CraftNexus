@@ -2654,7 +2654,7 @@ impl CraftNexusContract {
         // registered ledger node that controls its own private key (#419).
         new_admin.require_auth();
 
-        let previous_admin = config.admin.clone();
+let _previous_admin = config.admin.clone();
         config.pending_admin = Some(new_admin.clone());
         env.storage()
             .instance()
