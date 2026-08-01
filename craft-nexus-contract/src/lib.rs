@@ -5711,6 +5711,20 @@ let _previous_admin = config.admin.clone();
             env.panic_with_error(crate::Error::Unauthorized);
         }
 
+        // Block blacklisted arbitrators/moderators (#725).
+        // The admin is the one who manages the blacklist and cannot be locked
+        // out of dispute resolution by their own administrative action.
+        if authorized_address != config.admin
+            && env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::ArbitratorBlacklist(authorized_address.clone()))
+                .unwrap_or(false)
+        {
+            env.panic_with_error(crate::Error::ArbitratorBlacklisted);
+        }
+
+
         let mut escrow = Self::get_stored_escrow(&env, order_id);
 
         if escrow.status != EscrowStatus::Disputed {
@@ -5978,6 +5992,65 @@ let _previous_admin = config.admin.clone();
             .set(&DataKey::PlatformConfig, &config);
         Self::emit_config_updated(&env, "moderator", previous, ConfigValue::Address(moderator));
     }
+
+    /// Add an address to the arbitrator blacklist (admin only) (#725).
+    ///
+    /// Once blacklisted, the address is rejected by `resolve_dispute` with
+    /// `Error::ArbitratorBlacklisted`, even if it matches the configured
+    /// `arbitrator` or `moderator` role. The admin itself is never blocked
+    /// by this mechanism.
+    ///
+    /// # Arguments
+    /// * `arbitrator` - Address to blacklist
+    pub fn blacklist_arbitrator(env: Env, arbitrator: Address) {
+        let config = Self::get_platform_config_internal(&env);
+        config.admin.require_auth();
+
+        let key = DataKey::ArbitratorBlacklist(arbitrator.clone());
+        env.storage().persistent().set(&key, &true);
+        Self::extend_persistent(&env, &key);
+
+        Self::emit_config_updated(
+            &env,
+            "arbitrator_blacklisted",
+            ConfigValue::String(String::from_str(&env, "false")),
+            ConfigValue::Address(arbitrator),
+        );
+    }
+
+    /// Remove an address from the arbitrator blacklist (admin only) (#725).
+    ///
+    /// After removal the address may again act as arbitrator or moderator,
+    /// provided it still holds the relevant role in `PlatformConfig`.
+    ///
+    /// # Arguments
+    /// * `arbitrator` - Address to remove from the blacklist
+    pub fn remove_arbitrator_from_blacklist(env: Env, arbitrator: Address) {
+        let config = Self::get_platform_config_internal(&env);
+        config.admin.require_auth();
+
+        let key = DataKey::ArbitratorBlacklist(arbitrator.clone());
+        env.storage().persistent().remove(&key);
+
+        Self::emit_config_updated(
+            &env,
+            "arbitrator_unblacklisted",
+            ConfigValue::Address(arbitrator),
+            ConfigValue::String(String::from_str(&env, "false")),
+        );
+    }
+
+    /// Returns `true` if `arbitrator` is currently on the blacklist (#725).
+    ///
+    /// # Arguments
+    /// * `arbitrator` - Address to query
+    pub fn is_arbitrator_blacklisted(env: Env, arbitrator: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ArbitratorBlacklist(arbitrator))
+            .unwrap_or(false)
+    }
+
 
     /// Set the minimum escrow amount for a specific token (admin only)
     ///
