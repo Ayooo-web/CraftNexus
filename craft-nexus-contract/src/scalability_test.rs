@@ -142,6 +142,7 @@ fn test_batch_escrow_indexing_scales_linearly_for_twenty_entries() {
             release_window: Some(3600),
             ipfs_hash: None,
             metadata_hash: None,
+            service_agreement_hash: None,
         });
     }
 
