@@ -3561,7 +3561,10 @@ impl OnboardingContract {
             volume_delta
         };
 
-        metrics.total_volume = metrics.total_volume.saturating_add(normalized_delta);
+        metrics.total_volume = metrics
+            .total_volume
+            .checked_add(normalized_delta)
+            .unwrap_or_else(|| env.panic_with_error(Error::VolumeOverflow));
 
         env.storage().persistent().set(&key, &metrics);
         Self::extend_persistent(&env, &key);
