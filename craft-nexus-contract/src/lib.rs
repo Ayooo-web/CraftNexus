@@ -540,6 +540,16 @@ pub struct RecurringEscrowEvent {
 }
 
 #[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct PlatformStats {
+    pub total_volume: i128,
+    pub total_escrows: u32,
+    pub active_users: u32,
+    pub whitelist_count: u32,
+}
+
+#[contracttype]
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
 pub enum EscrowStatus {
@@ -1343,6 +1353,8 @@ pub trait OnboardingInterface {
     /// `delta` should be `+1` when an escrow becomes active and `-1` when the
     /// escrow closes. The onboarding contract rejects underflows.
     fn update_active_contracts(env: Env, user: Address, delta: i32);
+    /// Number of onboarding profiles whose status is currently active.
+    fn get_active_user_count(env: Env) -> u32;
     /// Refresh the persistent TTL for a user's profile entry.
     fn bump_user_profile_ttl(env: Env, user: Address) -> bool;
     /// Refresh the persistent TTL for a user's activity metrics entry.
@@ -7020,6 +7032,23 @@ impl CraftNexusContract {
     pub fn get_escrow_count(env: Env) -> u32 {
         Self::migrate_legacy_all_escrow_ids(&env);
         Self::get_persistent_u32(&env, &DataKey::EscrowCount)
+    }
+
+    /// Return dashboard-level platform stats in one read-only contract call.
+    pub fn get_platform_stats(env: Env) -> PlatformStats {
+        Self::migrate_legacy_all_escrow_ids(&env);
+        Self::migrate_legacy_whitelisted_tokens(&env);
+
+        let active_users = Self::get_onboarding_client(&env)
+            .map(|(_, onboarding)| onboarding.get_active_user_count())
+            .unwrap_or(0);
+
+        PlatformStats {
+            total_volume: Self::get_total_volume(&env),
+            total_escrows: Self::get_persistent_u32(&env, &DataKey::EscrowCount),
+            active_users,
+            whitelist_count: Self::get_whitelist_count(&env),
+        }
     }
 
     /// Returns a page of all escrow order IDs created on the platform, in creation order.

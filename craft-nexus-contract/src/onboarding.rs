@@ -2141,6 +2141,18 @@ impl OnboardingContract {
         value
     }
 
+    fn update_active_user_count(env: &Env, delta: i32) {
+        let key = DataKey::ActiveUserCount;
+        let count: u32 = Self::read_persistent(env, &key).unwrap_or(0);
+        let new_count = if delta > 0 {
+            count.saturating_add(delta as u32)
+        } else {
+            count.saturating_sub((-delta) as u32)
+        };
+        env.storage().persistent().set(&key, &new_count);
+        Self::extend_persistent(env, &key);
+    }
+
     /// TTL-bump variant that first checks the entry exists (Issue #82 optimization).
     ///
     /// [PERFORMANCE #82] Optimized storage layout: Validates storage entry presence before
@@ -2595,6 +2607,7 @@ impl OnboardingContract {
         };
 
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::update_active_user_count(&env, 1);
 
         env.storage()
             .persistent()
@@ -2765,6 +2778,11 @@ impl OnboardingContract {
             }
             None => 0,
         }
+    }
+
+    /// Return the number of profiles currently in active status.
+    pub fn get_active_user_count(env: Env) -> u32 {
+        Self::read_persistent(&env, &DataKey::ActiveUserCount).unwrap_or(0)
     }
 
     /// Get user profile by username (case-insensitive)
@@ -3074,6 +3092,7 @@ impl OnboardingContract {
         // Update profile state
         profile.status = ProfileStatus::Deactivated;
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::update_active_user_count(&env, -1);
 
         // Issue #524 — event payload now carries the user's role at
         // deactivation time. The role was overwritten in the
@@ -3150,6 +3169,7 @@ impl OnboardingContract {
 
         profile.status = ProfileStatus::Active;
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::update_active_user_count(&env, 1);
 
         env.events().publish(
             (Symbol::new(&env, "ProfileReactivated"), user.clone()),
