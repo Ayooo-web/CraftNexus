@@ -1,6 +1,6 @@
 [package]
 name = "craft-nexus-contract"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -12,6 +12,10 @@ testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
 soroban-sdk = { version = "21.0.0" }
+time = "0.3.37"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wee_alloc = "0.4.5"
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
@@ -29,3 +33,4 @@ lto = true
 [profile.release-with-logs]
 inherits = "release"
 debug-assertions = true
+

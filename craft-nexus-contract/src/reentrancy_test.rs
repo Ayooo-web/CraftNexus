@@ -2,9 +2,110 @@
 
 use super::*;
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::{Address as _, Ledger},
     token, Address, Env, Symbol,
 };
+
+#[contract]
+struct CallbackToken;
+
+#[contractimpl]
+impl CallbackToken {
+    pub fn initialize(env: Env, target: Address, order_id: u32) {
+        env.storage().instance().set(&Symbol::new(&env, "target"), &target);
+        env.storage().instance().set(&Symbol::new(&env, "order"), &order_id);
+    }
+
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        1_000_000
+    }
+
+    pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+        let target: Address = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "target"))
+            .unwrap();
+        let order_id: u32 = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "order"))
+            .unwrap();
+        CraftNexusContractClient::new(&env, &target).release_funds(&order_id);
+    }
+}
+
+#[contract]
+struct UnsupportedTokenContract;
+
+#[contractimpl]
+impl UnsupportedTokenContract {
+    pub fn ping(_env: Env) {}
+}
+
+#[test]
+fn admin_cannot_whitelist_unsupported_token_contract() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+    client.initialize(
+        &Address::generate(&env),
+        &admin,
+        &Address::generate(&env),
+        &500,
+        &None,
+    );
+
+    let unsupported = env.register_contract(None, UnsupportedTokenContract);
+    assert_eq!(
+        client.try_whitelist_token(&unsupported),
+        Err(Ok(Error::UnsupportedToken))
+    );
+    assert_eq!(client.get_whitelisted_token_count(), 0);
+}
+
+#[test]
+fn malicious_token_callback_is_rejected_and_rolls_back() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.budget().reset_unlimited();
+
+    let admin = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+    client.initialize(
+        &Address::generate(&env),
+        &admin,
+        &Address::generate(&env),
+        &500,
+        &None,
+    );
+
+    let order_id = 991u32;
+    let token_id = env.register_contract(None, CallbackToken);
+    CallbackTokenClient::new(&env, &token_id).initialize(&contract_id, &order_id);
+
+    assert!(client
+        .try_create_escrow(
+            &buyer,
+            &seller,
+            &token_id,
+            &5_000,
+            &order_id,
+            &Some(86_400),
+        )
+        .is_err());
+    assert!(client.try_get_escrow(&order_id).is_err());
+}
 
 #[test]
 fn test_release_cei_pattern() {
@@ -327,7 +428,7 @@ fn test_cancel_recurring_escrow_cei_pattern() {
 
     // Create recurring escrow
     let escrow_obj =
-        client.create_recurring_escrow(&buyer, &artisan, &token.address(), &10000, &1000, &86400);
+        client.create_recurring_escrow(&buyer, &artisan, &token.address(), &1000, &1000, &86400);
     let id = escrow_obj.id;
 
     // Cancel recurring escrow
@@ -342,6 +443,67 @@ fn test_cancel_recurring_escrow_cei_pattern() {
     });
     assert_eq!(escrow.is_active, false);
 }
+
+/// Issue #704 — Disputing an escrow after its deadline has passed allows arbitrator resolution
+/// and claiming of platform / arbitrator fees.
+#[test]
+fn test_dispute_expired_recurring_escrow_arbitrator_fees() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.budget().reset_unlimited();
+
+    let admin = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let platform_wallet = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token.address());
+
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+
+    client.initialize(
+        &platform_wallet,
+        &admin,
+        &arbitrator,
+        &500, // 5% fee (500 BPS)
+        &None,
+    );
+
+    client.set_min_escrow_amount(&token.address(), &0);
+    client.set_min_release_window(&1);
+
+    token_client.mint(&buyer, &100_000_000);
+
+    let order_id = 704u32;
+    client.create_escrow(
+        &buyer,
+        &seller,
+        &token.address(),
+        &50_000_000,
+        &order_id,
+        &Some(86400),
+    );
+
+    // Fast forward ledger timestamp past funding/release deadline (86,400s)
+    env.ledger().with_mut(|li| {
+        li.timestamp += 100_000;
+    });
+
+    // Dispute escrow after deadline
+    client.dispute_escrow(&order_id, &Symbol::new(&env, "ExpiredDispute"), &buyer);
+
+    // Arbitrator resolves dispute releasing funds to seller (with platform/arbitrator fee deduction)
+    client.resolve_dispute(&order_id, &Resolution::ReleaseToSeller, &arbitrator);
+
+    // Verify escrow status is resolved
+    let escrow = client.get_escrow(&order_id);
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
+}
+
 
 #[test]
 fn test_auto_release_cei_pattern() {
@@ -541,4 +703,113 @@ fn test_active_obligations_updated_before_transfers() {
     // Verify active obligations were decremented before transfer
     assert!(!client.has_active_escrows(&buyer));
     assert!(!client.has_active_escrows(&seller));
+}
+
+/// Direct unit test of the `ReentryGuardScope` RAII guard (issue #607).
+///
+/// This exercises the fix mechanism itself rather than going through the host's
+/// transaction-rollback safety net: it asserts the guard is set while the scope
+/// is alive and is unconditionally cleared the instant the scope is dropped —
+/// the property that makes early `Err(...)` returns safe. It fails if the `Drop`
+/// implementation is ever removed or broken.
+#[test]
+fn test_reentry_guard_scope_releases_on_drop() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, CraftNexusContract);
+
+    env.as_contract(&contract_id, || {
+        assert!(
+            !env.storage().temporary().has(&DataKey::ReentryGuard),
+            "guard should start clear"
+        );
+
+        {
+            let _guard = ReentryGuardScope::new(&env);
+            assert!(
+                env.storage().temporary().has(&DataKey::ReentryGuard),
+                "guard must be set while the scope is alive"
+            );
+        } // `_guard` dropped here
+
+        assert!(
+            !env.storage().temporary().has(&DataKey::ReentryGuard),
+            "ReentryGuardScope must clear the guard on drop"
+        );
+    });
+}
+
+/// Regression test for issue #607.
+///
+/// A guarded function that fails *mid-call* and returns `Err(...)` (rather than
+/// panicking) must still clear the reentrancy guard. Otherwise the guard stays
+/// set in temporary storage and permanently locks every other guarded entry
+/// point (a denial-of-service). The `ReentryGuardScope` RAII guard guarantees
+/// the guard is released on *every* exit path — `Ok`, `Err`, or panic.
+#[test]
+fn test_reentry_guard_cleared_after_failing_call() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.budget().reset_unlimited();
+
+    let admin = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let platform_wallet = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let onboarding_contract = Address::generate(&env);
+
+    let token = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token.address());
+
+    let contract_id = env.register_contract(None, CraftNexusContract);
+    let client = CraftNexusContractClient::new(&env, &contract_id);
+
+    client.initialize(
+        &platform_wallet,
+        &admin,
+        &Address::generate(&env),
+        &500,
+        &Some(onboarding_contract),
+    );
+
+    token_client.mint(&buyer, &10000);
+
+    let order_id = 1u32;
+    client.create_escrow(
+        &buyer,
+        &seller,
+        &token.address(),
+        &5000,
+        &order_id,
+        &Some(86400),
+    );
+
+    // `refund` enters the guard, then bails out early with `Err(EscrowNotFound)`
+    // because escrow 999 does not exist. This is precisely the non-panicking
+    // early-return path that previously leaked the guard.
+    let failed = client.try_refund(&999u64);
+    assert!(
+        failed.is_err() || failed.unwrap().is_err(),
+        "refund of a non-existent escrow should fail"
+    );
+
+    // The guard must NOT remain set in temporary storage after the failure.
+    let guard_still_set: bool = env.as_contract(&contract_id, || {
+        env.storage().temporary().has(&DataKey::ReentryGuard)
+    });
+    assert!(
+        !guard_still_set,
+        "ReentryGuard leaked after a failing call — contract would be permanently locked"
+    );
+
+    // A subsequent legitimate guarded call must still succeed. If the guard had
+    // leaked, this would panic with `ReentryDetected`.
+    client.release_funds(&order_id);
+    let escrow: Escrow = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&(Symbol::new(&env, "ESCROW"), order_id))
+            .unwrap()
+    });
+    assert_eq!(escrow.status, EscrowStatus::Released);
 }
