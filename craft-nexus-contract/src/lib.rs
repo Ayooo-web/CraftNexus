@@ -3287,6 +3287,15 @@ let _previous_admin = config.admin.clone();
             return Err(Error::AdminRecoveryFailed);
         }
 
+        // Reject recovery to the address that is already the current admin.
+        // This would be a no-op that masks a failed/misconfigured recovery
+        // attempt rather than actually restoring access.
+        if let Ok(current_admin) = Self::get_admin(&env) {
+            if recovered_admin == current_admin {
+                return Err(Error::AdminRecoveryFailed);
+            }
+        }
+
         // Check if recovery time lock has passed (#431 â€” TTL-friendly read)
         let recovery_time = Self::get_persistent_u64(&env, &DataKey::AdminRecoveryTime);
 
