@@ -78,15 +78,14 @@ if [ "${GENERATE_CONTRACT_ID}" = "1" ]; then
     STELLAR_BIN=""
     if command -v stellar >/dev/null 2>&1; then
         STELLAR_BIN="stellar"
-    elif command -v soroban >/dev/null 2>&1; then
-        STELLAR_BIN="soroban"
     elif [ -x "./.local-bin/stellar-cli-bin" ]; then
         STELLAR_BIN="./.local-bin/stellar-cli-bin"
     fi
 
     if [ -n "${STELLAR_BIN}" ]; then
         echo "Generating contract ID for network: ${STELLAR_NETWORK}"
-        "${STELLAR_BIN}" contract id generate --network "${STELLAR_NETWORK}"
+        echo "Note: 'contract id wasm' requires --salt and --source-account."
+        echo "Use 'stellar contract deploy' to deploy and obtain the contract ID."
     else
         echo "Skipping contract ID generation: Stellar CLI not found."
     fi
