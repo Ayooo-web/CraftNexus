@@ -13,6 +13,8 @@ extern crate alloc;
 #[cfg(test)]
 mod enhanced_features_test;
 #[cfg(test)]
+mod error_coverage_test;
+#[cfg(test)]
 mod event_snapshot_test;
 #[cfg(test)]
 mod expired_dispute_fee_test;
