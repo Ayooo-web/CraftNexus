@@ -198,7 +198,9 @@ pub enum DataKey {
     /// Active contract counter per user (Issue #39)
     /// Tracks the number of active escrows/agreements for an address.
     ActiveContractCount(Address),
-    /// Pending manual verification request marker keyed by user (#138)
+    /// Pending manual verification request marker keyed by user (#138).
+    /// Stored in **temporary** storage (#702): cleared on approve/reject/clear and
+    /// must not receive `extend_ttl` (default temporary expiry is sufficient).
     VerificationRequest(Address),
     /// Queue head pointer for manual verification requests (#138)
     VerificationQueueHead,
@@ -1319,11 +1321,12 @@ impl OnboardingContract {
 
     fn is_verification_pending_internal(env: &Env, user: &Address) -> bool {
         let key = DataKey::VerificationRequest(user.clone());
-        let is_pending = env.storage().persistent().has(&key);
-        if is_pending {
-            Self::extend_persistent(env, &key);
-        }
-        is_pending
+        // Issue #702: pending markers live in temporary storage. Do not call
+        // extend_ttl — temporary entries are cleared on process/clear and rely
+        // on short default expiry rather than persistent rent extensions.
+        // Also accept a legacy persistent marker from pre-#702 deployments
+        // without refreshing its TTL (that would defeat this optimization).
+        env.storage().temporary().has(&key) || env.storage().persistent().has(&key)
     }
 
     fn enqueue_verification_request(env: &Env, user: &Address) {
@@ -1333,10 +1336,10 @@ impl OnboardingContract {
         Self::extend_persistent(env, &queue_index_key);
 
         let pending_key = DataKey::VerificationRequest(user.clone());
+        // Temporary write only — no extend_ttl (#702).
         env.storage()
-            .persistent()
+            .temporary()
             .set(&pending_key, &env.ledger().timestamp());
-        Self::extend_persistent(env, &pending_key);
 
         Self::set_queue_pointer(env, DataKey::VerificationQueueTail, tail + 1);
     }
@@ -1368,6 +1371,8 @@ impl OnboardingContract {
 
     fn clear_verification_request(env: &Env, user: &Address) {
         let pending_key = DataKey::VerificationRequest(user.clone());
+        env.storage().temporary().remove(&pending_key);
+        // Drop any legacy persistent marker left by pre-#702 deployments.
         env.storage().persistent().remove(&pending_key);
         Self::advance_verification_head(env);
     }
@@ -2105,6 +2110,11 @@ impl OnboardingContract {
     /// missing key is a no-op, but it still costs CPU. For hot paths that
     /// may legitimately call the helper with absent keys, use
     /// [`Self::extend_persistent_if_present`] instead.
+    ///
+    /// # Issue #702 — temporary storage
+    /// Never route temporary keys through this helper. Pending verification
+    /// markers (`DataKey::VerificationRequest`) use temporary storage and must
+    /// not pay for `extend_ttl`; they are cleared on approve/reject/clear.
     fn extend_persistent(env: &Env, key: &impl soroban_sdk::IntoVal<Env, soroban_sdk::Val>) {
         env.storage()
             .persistent()
@@ -2139,6 +2149,18 @@ impl OnboardingContract {
             Self::extend_persistent(env, key);
         }
         value
+    }
+
+    fn update_active_user_count(env: &Env, delta: i32) {
+        let key = DataKey::ActiveUserCount;
+        let count: u32 = Self::read_persistent(env, &key).unwrap_or(0);
+        let new_count = if delta > 0 {
+            count.saturating_add(delta as u32)
+        } else {
+            count.saturating_sub((-delta) as u32)
+        };
+        env.storage().persistent().set(&key, &new_count);
+        Self::extend_persistent(env, &key);
     }
 
     /// TTL-bump variant that first checks the entry exists (Issue #82 optimization).
@@ -2595,6 +2617,7 @@ impl OnboardingContract {
         };
 
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::update_active_user_count(&env, 1);
 
         env.storage()
             .persistent()
@@ -2625,6 +2648,7 @@ impl OnboardingContract {
                 role,
             },
         );
+        Self::increment_persistent_u32(&env, &DataKey::GlobalOnboardCount);
 
         profile
     }
@@ -2765,6 +2789,11 @@ impl OnboardingContract {
             }
             None => 0,
         }
+    }
+
+    /// Return the number of profiles currently in active status.
+    pub fn get_active_user_count(env: Env) -> u32 {
+        Self::read_persistent(&env, &DataKey::ActiveUserCount).unwrap_or(0)
     }
 
     /// Get user profile by username (case-insensitive)
@@ -3074,6 +3103,7 @@ impl OnboardingContract {
         // Update profile state
         profile.status = ProfileStatus::Deactivated;
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::update_active_user_count(&env, -1);
 
         // Issue #524 — event payload now carries the user's role at
         // deactivation time. The role was overwritten in the
@@ -3150,6 +3180,7 @@ impl OnboardingContract {
 
         profile.status = ProfileStatus::Active;
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::update_active_user_count(&env, 1);
 
         env.events().publish(
             (Symbol::new(&env, "ProfileReactivated"), user.clone()),
@@ -3328,7 +3359,6 @@ impl OnboardingContract {
 
         config.platform_admin.require_auth();
 
-        Self::extend_persistent(&env, &DataKey::Config);
         config.escrow_contract = Some(contract_address);
 
         env.storage().persistent().set(&DataKey::Config, &config);
@@ -3403,7 +3433,6 @@ impl OnboardingContract {
             .persistent()
             .get(&DataKey::Config)
             .unwrap_or_else(|| env.panic_with_error(Error::NotInitialized));
-        Self::extend_persistent(&env, &DataKey::Config);
 
         config.platform_admin.require_auth();
         config.auto_verify_enabled = enabled;
@@ -3517,7 +3546,6 @@ impl OnboardingContract {
             None => config.platform_admin.require_auth(),
         }
         Self::extend_persistent(&env, &DataKey::Config);
-        Self::extend_persistent(&env, &DataKey::Config);
 
         let key = DataKey::UserMetrics(address.clone());
         let mut metrics = Self::read_user_metrics(&env, &address);
@@ -3541,7 +3569,10 @@ impl OnboardingContract {
             volume_delta
         };
 
-        metrics.total_volume = metrics.total_volume.saturating_add(normalized_delta);
+        metrics.total_volume = metrics
+            .total_volume
+            .checked_add(normalized_delta)
+            .unwrap_or_else(|| env.panic_with_error(Error::VolumeOverflow));
 
         env.storage().persistent().set(&key, &metrics);
         Self::extend_persistent(&env, &key);
@@ -3669,7 +3700,7 @@ impl OnboardingContract {
             profile.is_verified = true;
             Self::persist_public_user_profile(env, &address, &profile);
 
-            // Emit distinct AutoVerifiedEvent to fulfill #654 architecture requirements
+            // auto-verification triggered — emit AutoVerifiedEvent (#713)
             env.events().publish(
                 (Symbol::new(env, "AutoVerifiedEvent"), address.clone()),
                 AutoVerifiedEvent {
@@ -4002,7 +4033,8 @@ impl OnboardingContract {
     /// # Storage Side-Effects
     /// - **Read** [`DataKey::VerificationQueueHead`] / [`DataKey::VerificationQueueTail`] — TTL extended.
     /// - **Read** [`DataKey::VerificationQueueIndex(i)`] for each slot — stale entries removed.
-    /// - **Read** [`DataKey::VerificationRequest(user)`] for each candidate — TTL extended if active.
+    /// - **Read** [`DataKey::VerificationRequest(user)`] for each candidate (temporary
+    ///   storage, no TTL extension — issue #702).
     ///
     /// # Emitted Events
     /// None.
@@ -4478,6 +4510,7 @@ impl OnboardingContract {
 
         // Interaction (CEI pattern: external transfer is the last step)
         Self::collect_username_change_fee(&env, &user, &config, snapshotted_fee_token);
+        Self::increment_persistent_u32(&env, &DataKey::GlobalUsernameChangeCount);
 
         profile
     }
@@ -4531,6 +4564,7 @@ impl OnboardingContract {
         env.storage()
             .persistent()
             .set(&DataKey::UsernameChangeFee, &fee);
+        Self::increment_persistent_u32(&env, &DataKey::GlobalAdminActionCount);
         Self::extend_persistent(&env, &DataKey::UsernameChangeFee);
     }
 
@@ -4574,6 +4608,7 @@ impl OnboardingContract {
         env.storage()
             .persistent()
             .set(&DataKey::UsernameChangeFeeToken, &token);
+        Self::increment_persistent_u32(&env, &DataKey::GlobalAdminActionCount);
         Self::extend_persistent(&env, &DataKey::UsernameChangeFeeToken);
     }
 
@@ -4623,6 +4658,7 @@ impl OnboardingContract {
         env.storage()
             .persistent()
             .set(&DataKey::UsernameChangeFeeWallet, &wallet);
+        Self::increment_persistent_u32(&env, &DataKey::GlobalAdminActionCount);
         Self::extend_persistent(&env, &DataKey::UsernameChangeFeeWallet);
     }
 
