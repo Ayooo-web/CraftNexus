@@ -5615,12 +5615,79 @@ let _previous_admin = config.admin.clone();
         elapsed >= escrow.release_window as u64
     }
 
-    /// Dispute an escrow
+    /// Open a dispute on an active escrow, entering the **Disputed** lifecycle state.
+    ///
+    /// ## Dispute lifecycle overview
+    ///
+    /// Once an escrow is `Active`, either party can call this function to move it into
+    /// the dispute pipeline. The overall state machine looks like this:
+    ///
+    /// ```text
+    ///  Active
+    ///    │
+    ///    ▼  dispute_escrow()
+    ///  DisputePending  ──►  Disputed
+    ///                          │
+    ///               ┌──────────┼────────────────────┐
+    ///               │          │                    │
+    ///               ▼          ▼                    ▼
+    ///     submit_evidence   escalate_dispute   propose_partial_refund
+    ///      (any time while   (after escalation    (buyer-initiated
+    ///       Disputed)         window elapses)       negotiation)
+    ///               │          │                    │
+    ///               └──────────┼────────────────────┘
+    ///                          │
+    ///               ┌──────────┴──────────┐
+    ///               │                     │
+    ///               ▼                     ▼
+    ///       resolve_dispute()    resolve_expired_dispute()
+    ///       (arbitrator/admin/   (anyone, after max_dispute_duration
+    ///        moderator, after     has elapsed without resolution)
+    ///        evidence window)
+    ///               │                     │
+    ///               └──────────┬──────────┘
+    ///                          ▼
+    ///                       Resolved
+    /// ```
+    ///
+    /// ## Preconditions
+    ///
+    /// - The platform must not be paused.
+    /// - The caller must be the escrow's `buyer` or `seller`.
+    /// - The escrow must currently be in the `Active` state.
+    /// - The caller must not have exceeded the per-account dispute rate limit
+    ///   (`rate_limit_max_calls` within `rate_limit_window`). This prevents spam
+    ///   disputes that would congest the arbitration queue.
+    ///
+    /// ## State transition
+    ///
+    /// The transition uses an atomic "claim" pattern (`DisputePending` as an
+    /// intermediate sentinel) to prevent race conditions where two callers might
+    /// simultaneously dispute the same escrow. After the claim, the status is
+    /// immediately set to `Disputed` and `dispute_initiated_at` is stamped with
+    /// the current ledger timestamp. This timestamp gates two downstream timers:
+    ///
+    /// 1. **Evidence challenge window** (`evidence_challenge_window`): during this
+    ///    period both parties may submit or rebut evidence. `resolve_dispute` is
+    ///    blocked until the window has elapsed (see [`Self::resolve_dispute`]).
+    /// 2. **Escalation window** (`dispute_escalation_window`): after this period
+    ///    either party may call `escalate_dispute` to flag the dispute as stalled
+    ///    and surface it to priority queues (see [`Self::escalate_dispute`]).
+    /// 3. **Maximum duration** (`max_dispute_duration`): if the arbitrator has not
+    ///    resolved the dispute before this deadline, anyone can call
+    ///    `resolve_expired_dispute` to force-close it (see
+    ///    [`Self::resolve_expired_dispute`]).
+    ///
+    /// ## Events emitted
+    ///
+    /// - `EscrowEvent { action: EscrowAction::Disputed, … }` — consumed by
+    ///   off-chain indexers and arbitration dashboards.
     ///
     /// # Arguments
-    /// * `order_id` - Order identifier
-    /// * `dispute_reason` - Reason for dispute
-    /// * `authorized_address` - Address authorized to dispute (buyer or seller)
+    /// * `order_id` - Identifier of the escrow to dispute.
+    /// * `dispute_reason` - Short symbolic reason (e.g. `"item_not_received"`).
+    ///   Stored on-chain for audit; not evaluated by the contract logic.
+    /// * `authorized_address` - Must be the escrow's `buyer` or `seller`.
     pub fn dispute_escrow(
         env: Env,
         order_id: u32,
@@ -5629,23 +5696,39 @@ let _previous_admin = config.admin.clone();
     ) {
         authorized_address.require_auth();
 
+        // Rate-limit disputes per account to deter spam. Each account has its
+        // own independent counter, so one party flooding disputes does not
+        // affect the other party's limit.
+        Self::enforce_rate_limit(&env, &authorized_address, RateLimitAction::DisputeCreation)
+            .unwrap_or_else(|e| env.panic_with_error(e));
+
         let escrow_for_auth = Self::get_stored_escrow(&env, order_id);
 
-        // Allow buyer or seller to dispute
+        // Only the two parties to this specific escrow may open a dispute;
+        // admin/arbitrator cannot initiate on their behalf.
         if !(escrow_for_auth.buyer == authorized_address
             || escrow_for_auth.seller == authorized_address)
         {
             env.panic_with_error(crate::Error::Unauthorized);
         }
 
+        // Atomically claim the escrow through the DisputePending sentinel to
+        // prevent a second concurrent caller from also transitioning it. The
+        // function panics if the current status is not Active.
         let mut escrow =
             Self::claim_active_escrow_transition(&env, order_id, EscrowStatus::DisputePending)
                 .unwrap_or_else(|e| env.panic_with_error(e));
 
+        // Finalize transition: stamp the dispute metadata and persist.
         escrow.status = EscrowStatus::Disputed;
         escrow.dispute_reason = Some(dispute_reason); // Assign Symbol
-        escrow.dispute_initiated_at = Some(env.ledger().timestamp());
+        // dispute_initiated_at is the single source of truth for all three
+        // downstream timers (evidence window, escalation window, max duration).
+        escrow.dispute_initiated_at = Some(env.ledger().timestamp() as u32);
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+        // Increment the global active dispute counter used by emergency-op
+        // guards (admin recovery, upgrade proposals) to detect unsafe conditions.
+        Self::update_active_dispute_count(&env, 1);
 
         Self::emit_escrow_created(
             &env,
@@ -5662,18 +5745,68 @@ let _previous_admin = config.admin.clone();
         );
     }
 
-    /// Resolve disputed escrow (arbitrator only).
+    /// Finalize a disputed escrow and disburse funds — the normal arbitrated resolution path.
     ///
-    /// This function transitions the escrow from `Disputed` to `Resolved`.
-    /// Depending on the `resolution` choice:
-    /// - `ReleaseToSeller`: Funds are sent to the seller minus the platform fee.
-    /// - `RefundToBuyer`: Full original amount is returned to the buyer.
+    /// ## Role in the dispute lifecycle
     ///
-    /// # Edge Cases
-    /// - **Refund Failure**: If the transfer to the buyer fails (e.g. account revoked),
-    ///   the entire transaction reverts due to Stellar's atomicity.
-    ///   The escrow remains in `Disputed` state for re-investigation.
-    /// - **State Logic**: Can ONLY be called if `status` is currently `Disputed`.
+    /// `resolve_dispute` is the primary exit from the `Disputed` state when an
+    /// authorized party (arbitrator, admin, or moderator) has reviewed the
+    /// evidence and reached a decision. It must be called **after** the evidence
+    /// challenge window (`evidence_challenge_window`) has elapsed, ensuring both
+    /// parties had a fair opportunity to submit and rebut evidence before the
+    /// decision is locked in (see `dispute_escrow` for the full state diagram).
+    ///
+    /// If the arbitrator does not act before `max_dispute_duration` expires, any
+    /// party can force-close the dispute via `resolve_expired_dispute` instead.
+    ///
+    /// ## Authorization
+    ///
+    /// Callable by the platform `admin`, the designated `arbitrator`, or any
+    /// configured `moderator`. Parties to the escrow (buyer/seller) cannot call
+    /// this function directly — they can only influence the outcome through
+    /// evidence submission or `propose_partial_refund`.
+    ///
+    /// ## CEI pattern (Checks → Effects → Interactions)
+    ///
+    /// To prevent reentrancy attacks this function follows the CEI pattern strictly:
+    ///
+    /// 1. **Checks** — verify status, authorization, and the evidence window.
+    /// 2. **Effects** — update `escrow.status` to `Resolved` and persist all
+    ///    storage writes (dispute counter, obligation counters, contract counters,
+    ///    orphaned refund-proposal cleanup) **before** any token transfer.
+    /// 3. **Interactions** — execute the token transfer as the very last step.
+    ///
+    /// If the token transfer reverts (e.g. the recipient's trustline was revoked),
+    /// Soroban's atomic execution rolls back all storage writes and the escrow
+    /// stays in `Disputed` so the arbitrator can retry with a different resolution.
+    ///
+    /// ## Resolution outcomes
+    ///
+    /// | `resolution`        | Funds flow                                          | Reputation delta                        |
+    /// |---------------------|-----------------------------------------------------|-----------------------------------------|
+    /// | `ReleaseToSeller`   | `amount − platform_fee` → seller; fee → platform   | seller: +1 success; buyer: +1 disputed  |
+    /// | `RefundToBuyer`     | full `amount` → buyer; no fee deducted              | buyer: +1 success; seller: +1 disputed  |
+    ///
+    /// Reputation deltas are emitted as `ReputationUpdateEvent` for the off-chain
+    /// reputation service (decoupled from the onboarding contract, #211).
+    ///
+    /// ## Events emitted
+    ///
+    /// - `EscrowEvent { action: EscrowAction::Resolved, … }`
+    /// - `EscrowResolvedEvent { arbitrator, … }` — includes the arbitrator address
+    ///   for audit trails.
+    /// - Two `ReputationUpdateEvent` entries (one per party).
+    ///
+    /// # Arguments
+    /// * `order_id` - Identifier of the escrow to resolve.
+    /// * `resolution` - `ReleaseToSeller` or `RefundToBuyer`.
+    /// * `authorized_address` - Arbitrator, admin, or moderator address.
+    ///
+    /// # Errors
+    /// * Panics with [`Error::Unauthorized`] if `authorized_address` is not privileged.
+    /// * Panics with [`Error::InvalidEscrowState`] if the escrow is not `Disputed`.
+    /// * Panics with [`Error::ChallengeWindowActive`] if called before the evidence
+    ///   challenge window has elapsed.
     pub fn resolve_dispute(
         env: Env,
         order_id: u32,
@@ -5683,6 +5816,8 @@ let _previous_admin = config.admin.clone();
         let _guard = ReentryGuardScope::new(&env);
         let config = Self::get_platform_config_internal(&env);
         authorized_address.require_auth();
+        // Only privileged roles may finalize a dispute; neither buyer nor seller
+        // can unilaterally choose the outcome via this path.
         let is_authorized = authorized_address == config.admin
             || Some(authorized_address.clone()) == config.moderator
             || authorized_address == config.arbitrator;
@@ -5706,39 +5841,50 @@ let _previous_admin = config.admin.clone();
 
         let mut escrow = Self::get_stored_escrow(&env, order_id);
 
+        // Guard: must still be in the Disputed state. Resolved, Expired, or
+        // Active escrows must not be double-closed.
         if escrow.status != EscrowStatus::Disputed {
             env.panic_with_error(crate::Error::InvalidEscrowState);
         }
 
-        // Issue #657: enforce arbitrator time-lock. If the dispute deadline has
-        // already elapsed the escrow must be settled via resolve_expired_dispute
-        // instead. This prevents a stale or compromised arbitrator from
-        // resolving disputes after the platform's expiry policy has kicked in.
-        if let Some(initiated_at) = escrow.dispute_initiated_at {
-            let config_ref = Self::get_platform_config_internal(&env);
-            if initiated_at + config_ref.max_dispute_duration as u64
-                <= env.ledger().timestamp()
-            {
-                env.panic_with_error(crate::Error::ArbitratorDeadlineExceeded);
-            }
+        // Evidence challenge period (#942): the arbitrator cannot finalize a
+        // dispute until the challenge window has elapsed since it was opened,
+        // giving both parties a guaranteed opportunity to submit counter-evidence.
+        let initiated_at = escrow
+            .dispute_initiated_at
+            .unwrap_or_else(|| env.panic_with_error(crate::Error::InvalidEscrowState));
+        if env.ledger().timestamp() < initiated_at + config.evidence_challenge_window as u64 {
+            env.panic_with_error(crate::Error::ChallengeWindowActive);
         }
 
-        // CRITICAL: Update status BEFORE external calls (CEI pattern)
+        // --- Effects (all storage writes before any token transfer) ---
+
+        // CRITICAL: Update status BEFORE external calls (CEI pattern).
+        // Marking Resolved here ensures that even if the token transfer below
+        // were to somehow re-enter (not possible on Soroban, but defensive),
+        // a second call would hit the InvalidEscrowState guard above.
         escrow.status = EscrowStatus::Resolved;
         env.storage().persistent().set(&(ESCROW, order_id), &escrow);
+        // Decrement the global active-dispute counter so emergency-op guards
+        // (admin recovery, upgrade proposals) see the correct headcount.
+        Self::update_active_dispute_count(&env, -1);
 
         // Decrement active counts
         Self::update_active_obligations(&env, &escrow.buyer, -1);
         Self::update_active_obligations(&env, &escrow.seller, -1);
 
-        // Clean up any orphaned partial refund proposal
-        let proposal_key = DataKey::PartialRefundProposal(order_id);
+        // Remove any outstanding partial-refund proposal for this order.
+        // If left in storage it would be orphaned data with no usable path
+        // to execution, since the escrow is now Resolved.
+        let proposal_key = DataKey::RefundProposal(order_id);
         env.storage().persistent().remove(&proposal_key);
 
         Self::safe_update_active_contracts(&env, escrow.buyer.clone(), -1);
         Self::safe_update_active_contracts(&env, escrow.seller.clone(), -1);
 
-        // Now perform token transfers (external calls)
+        // --- Interactions (token transfers last, per CEI) ---
+        // If the transfer reverts (e.g. recipient trustline closed), Soroban
+        // rolls back all writes above and the escrow stays Disputed for retry.
         match resolution {
             Resolution::ReleaseToSeller => {
                 let fee_bps = Self::get_effective_fee_bps(env.clone(), escrow.seller.clone());
@@ -5793,7 +5939,10 @@ let _previous_admin = config.admin.clone();
             },
         );
 
-        // Emit reputation update events â€” decoupled from onboarding contract (#211)
+        // Emit reputation update events — decoupled from onboarding contract (#211).
+        // The winner receives a successful_delta; the losing party receives a
+        // disputed_delta. Off-chain services aggregate these to compute reputation
+        // scores without the contract needing to maintain per-user state.
         let ts = env.ledger().timestamp();
         match resolution {
             Resolution::ReleaseToSeller => {
@@ -6779,11 +6928,44 @@ let _previous_admin = config.admin.clone();
 
     // â”€â”€ Dispute Resolution Deadline (#93) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    /// Resolve a dispute that has exceeded the maximum dispute duration.
+    /// Force-close a dispute that the arbitrator failed to resolve within `max_dispute_duration`.
     ///
-    /// If the dispute has been open for longer than the configured max_dispute_duration,
-    /// the escrow is resolved according to the configured expired_dispute_fee_policy.
-    /// Returns DisputeExpired error if the deadline has not yet passed.
+    /// ## Role in the dispute lifecycle
+    ///
+    /// This is the **safety-net exit** from the `Disputed` state. When the
+    /// designated arbitrator does not call `resolve_dispute` before the
+    /// `max_dispute_duration` deadline (measured from `dispute_initiated_at`),
+    /// any account — including bots and the disputing parties themselves — can
+    /// call this function to unblock the locked funds.
+    ///
+    /// Unlike `resolve_dispute`, this path does not require authorization and
+    /// does not consult the arbitrator. The outcome is fully determined by the
+    /// operator-configured `expired_dispute_fee_policy` (see
+    /// [`Self::update_expired_dispute_policy`]).
+    ///
+    /// ## Fee policies
+    ///
+    /// | Policy                    | Buyer receives          | Platform receives |
+    /// |---------------------------|-------------------------|-------------------|
+    /// | `RefundFullNoPlatformFee` | full `amount`           | nothing           |
+    /// | `RefundMinusPlatformFee`  | `amount − fee`          | `fee`             |
+    /// | `DeductFeeFromSeller`     | full `amount`           | nothing           |
+    /// | `SplitFee`                | `amount − fee/2`        | `fee/2`           |
+    ///
+    /// The default policy is `RefundFullNoPlatformFee`, protecting buyers from
+    /// arbitrator failure without penalizing them.
+    ///
+    /// ## CEI pattern
+    ///
+    /// Follows the same Checks → Effects → Interactions ordering as
+    /// `resolve_dispute`: all storage mutations (status, counters, locked-funds
+    /// tracker) are committed before the token transfer is executed.
+    ///
+    /// # Errors
+    /// * [`Error::EscrowNotFound`] — no escrow exists for `order_id`.
+    /// * [`Error::InvalidEscrowState`] — the escrow is not currently `Disputed`.
+    /// * [`Error::DisputeExpired`] — the `max_dispute_duration` deadline has **not**
+    ///   yet passed; the regular `resolve_dispute` path must be used instead.
     pub fn resolve_expired_dispute(env: Env, order_id: u32) -> Result<(), Error> {
         let _guard = ReentryGuardScope::new(&env);
         let escrow_opt: Option<Escrow> = env.storage().persistent().get(&(ESCROW, order_id));
@@ -6803,9 +6985,15 @@ let _previous_admin = config.admin.clone();
         let current_time = env.ledger().timestamp();
 
         let config = Self::get_platform_config_internal(&env);
-        if initiated_at + config.max_dispute_duration as u64 > current_time {
+        // The deadline guard: if the dispute is still within the allowed window
+        // the arbitrator must resolve it via `resolve_dispute`. Returning an
+        // error (rather than panicking) allows the caller to detect this case
+        // without rolling back unrelated ledger state.
+        if (initiated_at as u64) + config.max_dispute_duration as u64 > current_time {
             return Err(Error::DisputeExpired);
         }
+
+        // --- Effects (CEI: all writes before the token transfer) ---
 
         // CRITICAL: Update status BEFORE external calls (CEI pattern)
         escrow.status = EscrowStatus::Resolved;
@@ -6853,6 +7041,311 @@ let _previous_admin = config.admin.clone();
             },
         );
 
+        Ok(())
+    }
+
+    // â”€â”€ Dispute Arbitration Escalation (#941) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Signal that a `Disputed` escrow has stalled and needs priority attention.
+    ///
+    /// ## Role in the dispute lifecycle
+    ///
+    /// Escalation is an **optional** intermediate step between `dispute_escrow`
+    /// and final resolution. It does **not** change who may resolve the dispute —
+    /// the arbitrator, moderator, and admin can always call `resolve_dispute` —
+    /// but it records a permissioned, auditable on-chain checkpoint once
+    /// `dispute_escalation_window` seconds have elapsed since `dispute_initiated_at`.
+    ///
+    /// The primary consumers of escalation are **off-chain monitors and priority
+    /// queues** that key off the `DisputeEscalatedEvent` and
+    /// `get_dispute_escalation` query to surface stalled disputes before they
+    /// hit the hard `max_dispute_duration` deadline enforced by
+    /// `resolve_expired_dispute`. Escalation therefore acts as an early-warning
+    /// mechanism rather than a state-machine transition.
+    ///
+    /// ## Timer relationship
+    ///
+    /// ```text
+    ///  dispute_initiated_at
+    ///       │
+    ///       ├── + evidence_challenge_window  → resolve_dispute unblocked
+    ///       ├── + dispute_escalation_window  → escalate_dispute allowed (this fn)
+    ///       └── + max_dispute_duration       → resolve_expired_dispute allowed
+    /// ```
+    ///
+    /// `dispute_escalation_window` must be configured strictly less than
+    /// `max_dispute_duration` so escalation always precedes the hard timeout.
+    ///
+    /// ## Authorization
+    ///
+    /// Callable by either party to the dispute (buyer/seller) or platform
+    /// staff (admin/arbitrator/moderator). Only one escalation is allowed per
+    /// dispute; a second call returns `InvalidDisputeAction`.
+    ///
+    /// ## Events emitted
+    ///
+    /// - `("dispute_escalated", order_id)` with a `DisputeEscalatedEvent` payload
+    ///   containing the caller address and timestamp for off-chain triage.
+    ///
+    /// # Errors
+    /// * [`Error::InvalidEscrowState`] — the order is not currently `Disputed`.
+    /// * [`Error::Unauthorized`] — caller is not a party to the dispute or platform staff.
+    /// * [`Error::EscalationWindowActive`] — `dispute_escalation_window` has not elapsed yet.
+    /// * [`Error::InvalidDisputeAction`] — the dispute has already been escalated.
+    pub fn escalate_dispute(env: Env, order_id: u32, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+
+        let escrow = Self::get_stored_escrow(&env, order_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+
+        let config = Self::get_platform_config_internal(&env);
+        let is_authorized = caller == escrow.buyer
+            || caller == escrow.seller
+            || caller == config.admin
+            || caller == config.arbitrator
+            || Some(caller.clone()) == config.moderator;
+        if !is_authorized {
+            return Err(Error::Unauthorized);
+        }
+
+        let initiated_at = escrow
+            .dispute_initiated_at
+            .ok_or(Error::InvalidEscrowState)?;
+        let now = env.ledger().timestamp();
+        if now < initiated_at + config.dispute_escalation_window as u64 {
+            return Err(Error::EscalationWindowActive);
+        }
+
+        let key = DataKey::DisputeEscalation(order_id);
+        if env.storage().persistent().has(&key) {
+            return Err(Error::InvalidDisputeAction);
+        }
+
+        env.storage().persistent().set(
+            &key,
+            &DisputeEscalation {
+                order_id,
+                escalated_by: caller.clone(),
+                escalated_at: now,
+            },
+        );
+        Self::extend_persistent(&env, &key);
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_escalated"), order_id as u64),
+            DisputeEscalatedEvent {
+                order_id: order_id as u64,
+                escalated_by: caller,
+                timestamp: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Returns the escalation checkpoint for a disputed order, if any (#941).
+    pub fn get_dispute_escalation(env: Env, order_id: u32) -> Option<DisputeEscalation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeEscalation(order_id))
+    }
+
+    /// Admin sets the dispute escalation window (in seconds) (#941).
+    pub fn set_dispute_escalation_window(env: Env, window_seconds: u32) -> Result<(), Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+
+        let mut config = Self::get_platform_config_internal(&env);
+        let old_value = config.dispute_escalation_window;
+        config.dispute_escalation_window = window_seconds;
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformConfig, &config);
+
+        Self::emit_config_updated(
+            &env,
+            "dispute_escalation_window",
+            ConfigValue::U32(old_value),
+            ConfigValue::U32(window_seconds),
+        );
+        Ok(())
+    }
+
+    // â”€â”€ Dispute Evidence Challenge Period (#942) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Submit initial evidence for a disputed order.
+    ///
+    /// Either party to the dispute (buyer or seller) may call this while the
+    /// order is `Disputed`. `evidence_hash` is a content address (e.g. an IPFS
+    /// CID or document hash) â€” the contract never stores raw evidence content.
+    /// Returns the assigned evidence id, which callers pass as
+    /// `parent_evidence_id` to `submit_counter_evidence`.
+    pub fn submit_evidence(
+        env: Env,
+        order_id: u32,
+        submitter: Address,
+        evidence_hash: String,
+    ) -> Result<u32, Error> {
+        submitter.require_auth();
+
+        let escrow = Self::get_stored_escrow(&env, order_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+        if !(submitter == escrow.buyer || submitter == escrow.seller) {
+            return Err(Error::Unauthorized);
+        }
+
+        Self::append_evidence(&env, order_id, submitter, evidence_hash, None)
+    }
+
+    /// Submit counter-evidence rebutting a previously submitted evidence entry.
+    ///
+    /// `parent_evidence_id` must reference an existing entry for the same
+    /// `order_id`, linking the rebuttal back to the original submission (#942).
+    pub fn submit_counter_evidence(
+        env: Env,
+        order_id: u32,
+        submitter: Address,
+        evidence_hash: String,
+        parent_evidence_id: u32,
+    ) -> Result<u32, Error> {
+        submitter.require_auth();
+
+        let escrow = Self::get_stored_escrow(&env, order_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+        if !(submitter == escrow.buyer || submitter == escrow.seller) {
+            return Err(Error::Unauthorized);
+        }
+
+        let existing = Self::get_evidence_list(&env, order_id);
+        if !existing.iter().any(|e| e.id == parent_evidence_id) {
+            return Err(Error::InvalidDisputeAction);
+        }
+
+        Self::append_evidence(
+            &env,
+            order_id,
+            submitter,
+            evidence_hash,
+            Some(parent_evidence_id),
+        )
+    }
+
+    /// Appends an evidence entry to the bounded per-order log, trimming FIFO
+    /// once `MAX_EVIDENCE_PER_DISPUTE` is exceeded.
+    fn append_evidence(
+        env: &Env,
+        order_id: u32,
+        submitter: Address,
+        evidence_hash: String,
+        parent_evidence_id: Option<u32>,
+    ) -> Result<u32, Error> {
+        let key = DataKey::Evidence(order_id);
+        let mut list = Self::get_evidence_list(env, order_id);
+        let next_id = list.last().map(|e| e.id + 1).unwrap_or(0);
+        let now = env.ledger().timestamp();
+
+        list.push_back(Evidence {
+            id: next_id,
+            order_id,
+            submitter: submitter.clone(),
+            evidence_hash,
+            parent_evidence_id,
+            submitted_at: now,
+        });
+        while list.len() > MAX_EVIDENCE_PER_DISPUTE {
+            list.pop_front();
+        }
+
+        env.storage().persistent().set(&key, &list);
+        Self::extend_persistent(env, &key);
+
+        env.events().publish(
+            (
+                Symbol::new(env, "dispute_evidence_submitted"),
+                order_id as u64,
+            ),
+            EvidenceSubmittedEvent {
+                order_id: order_id as u64,
+                evidence_id: next_id,
+                submitter,
+                parent_evidence_id,
+                timestamp: now,
+            },
+        );
+
+        Ok(next_id)
+    }
+
+    /// Returns the bounded evidence/counter-evidence log for a disputed order (#942).
+    pub fn get_evidence(env: Env, order_id: u32) -> Vec<Evidence> {
+        Self::get_evidence_list(&env, order_id)
+    }
+
+    fn get_evidence_list(env: &Env, order_id: u32) -> Vec<Evidence> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Evidence(order_id))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Admin sets the evidence/counter-evidence challenge window (in seconds) (#942).
+    pub fn set_evidence_challenge_window(env: Env, window_seconds: u32) -> Result<(), Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+
+        let mut config = Self::get_platform_config_internal(&env);
+        let old_value = config.evidence_challenge_window;
+        config.evidence_challenge_window = window_seconds;
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformConfig, &config);
+
+        Self::emit_config_updated(
+            &env,
+            "evidence_challenge_window",
+            ConfigValue::U32(old_value),
+            ConfigValue::U32(window_seconds),
+        );
+        Ok(())
+    }
+
+    // â”€â”€ Rate Limiting for Sensitive Operations (#943) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Admin sets the sliding-window rate limit applied to sensitive
+    /// operations (`dispute_escrow`, `propose_upgrade_wasm`).
+    ///
+    /// `window_seconds` is the length of each fixed window; `max_calls` is
+    /// the maximum number of calls a single account may make within that
+    /// window before being rejected with `Error::RateLimitExceeded`. Setting
+    /// `window_seconds` to `0` disables rate limiting entirely.
+    pub fn set_rate_limit_config(
+        env: Env,
+        window_seconds: u32,
+        max_calls: u32,
+    ) -> Result<(), Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+
+        let mut config = Self::get_platform_config_internal(&env);
+        let old_window = config.rate_limit_window;
+        config.rate_limit_window = window_seconds;
+        config.rate_limit_max_calls = max_calls;
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformConfig, &config);
+
+        Self::emit_config_updated(
+            &env,
+            "rate_limit_window",
+            ConfigValue::U32(old_window),
+            ConfigValue::U32(window_seconds),
+        );
         Ok(())
     }
 
