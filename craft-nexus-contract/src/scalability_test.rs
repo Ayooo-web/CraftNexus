@@ -189,6 +189,68 @@ fn test_batch_escrow_indexing_scales_linearly_for_twenty_entries() {
 }
 
 #[test]
+fn test_scheduled_batch_progresses_in_bounded_idempotent_chunks() {
+    let (env, client, buyer, seller, token, _, _, _) = setup_test();
+    let mut params = soroban_sdk::Vec::new(&env);
+    for i in 0..7u32 {
+        params.push_back(EscrowCreateParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: token.clone(),
+            amount: 1_000,
+            order_id: 2_000 + i,
+            release_window: Some(3_600),
+            ipfs_hash: None,
+            metadata_hash: None,
+            service_agreement_hash: None,
+        });
+    }
+
+    let job_id = client.schedule_batch_escrow(&buyer, &params).unwrap();
+    let first = client
+        .continue_batch_escrow(&job_id, &buyer, &5)
+        .unwrap();
+    assert_eq!(first.next_index, 5);
+    assert_eq!(first.status, BatchJobStatus::Pending);
+    assert_eq!(client.get_escrow(&2_000).batch_id, Some(job_id));
+    assert_eq!(client.get_escrow(&2_004).batch_id, Some(job_id));
+
+    let second = client
+        .continue_batch_escrow(&job_id, &buyer, &5)
+        .unwrap();
+    assert_eq!(second.next_index, 7);
+    assert_eq!(second.status, BatchJobStatus::Completed);
+    assert_eq!(client.get_escrow(&2_006).batch_id, Some(job_id));
+    assert_eq!(client.get_batch_escrow_progress(&job_id).unwrap(), second);
+    assert!(client.try_continue_batch_escrow(&job_id, &buyer, &1).is_err());
+}
+
+#[test]
+fn test_scheduled_batch_can_be_cancelled_before_funds_move() {
+    let (env, client, buyer, seller, token, _, _, _) = setup_test();
+    let mut params = soroban_sdk::Vec::new(&env);
+    params.push_back(EscrowCreateParams {
+        buyer: buyer.clone(),
+        seller,
+        token,
+        amount: 1_000,
+        order_id: 3_000,
+        release_window: Some(3_600),
+        ipfs_hash: None,
+        metadata_hash: None,
+        service_agreement_hash: None,
+    });
+
+    let job_id = client.schedule_batch_escrow(&buyer, &params).unwrap();
+    client.cancel_batch_escrow(&job_id, &buyer).unwrap();
+    assert_eq!(
+        client.get_batch_escrow_progress(&job_id).unwrap().status,
+        BatchJobStatus::Cancelled
+    );
+    assert!(client.try_get_escrow(&3_000).is_err());
+}
+
+#[test]
 fn test_indexed_storage_multiple_users() {
     let (env, client, buyer1, seller1, token, _, _, _) = setup_test();
     let buyer2 = Address::generate(&env);
