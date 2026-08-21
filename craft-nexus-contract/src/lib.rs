@@ -174,6 +174,16 @@ pub enum Error {
     NotAnAdminActionSigner = 49,
     /// Contract does not implement the supported token interface.
     UnsupportedToken = 50,
+    /// The requested scheduled batch does not exist.
+    BatchJobNotFound = 51,
+    /// The caller is not the account that scheduled the batch.
+    BatchJobUnauthorized = 52,
+    /// The scheduled batch has already reached a terminal state.
+    BatchJobCompleted = 53,
+    /// The requested continuation size is outside the scheduler bound.
+    InvalidBatchWorkLimit = 54,
+    /// The scheduled batch was cancelled.
+    BatchJobCancelled = 55,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -289,6 +299,8 @@ const CURRENT_STORAGE_LAYOUT_VERSION: u32 = 1;
 // Conservative batch size to avoid exceeding instruction/read-write limits
 // observed on Soroban testnets. Reduced from 100 to 20 (Issue #198).
 const MAX_BATCH_SIZE: u32 = 20;
+/// Maximum number of escrows a scheduled continuation may process.
+const MAX_SCHEDULED_BATCH_WORK: u32 = 5;
 const MAX_PAGE_SIZE: u32 = 100;
 /// Timeout for unfunded escrows before they can be cancelled (24 hours) (#213)
 const UNFUNDED_CANCEL_TIMEOUT: u64 = 24 * 60 * 60;
@@ -490,6 +502,8 @@ pub enum DataKey {
     RecurringEscrow(u64),
     /// ID counter for recurring escrows
     NextRecurringEscrowId,
+    /// Persisted resource-aware batch escrow job.
+    BatchEscrowJob(u64),
     /// Count of currently active (non-released, non-refunded) escrows or recurring escrows for a user address.
     ActiveObligations(Address),
     /// Required number of distinct signer approvals before a WASM upgrade proposal is committed.
@@ -1249,6 +1263,41 @@ pub struct EscrowCreateParams {
     pub ipfs_hash: Option<String>,
     pub metadata_hash: Option<Bytes>,
     pub service_agreement_hash: Option<Bytes>,
+}
+
+/// Lifecycle state for a resource-aware batch escrow job.
+#[contracttype]
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum BatchJobStatus {
+    Pending = 0,
+    Completed = 1,
+    Cancelled = 2,
+}
+
+/// Persisted state for a scheduled batch. The parameters are immutable so a
+/// continuation always operates on the same ordered input and cursor.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct BatchEscrowJob {
+    pub owner: Address,
+    pub params: Vec<EscrowCreateParams>,
+    pub next_index: u32,
+    pub status: BatchJobStatus,
+}
+
+/// Lightweight progress returned to clients and indexers without exposing the
+/// stored parameter vector.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct BatchJobProgress {
+    pub id: u64,
+    pub owner: Address,
+    pub next_index: u32,
+    pub total: u32,
+    pub status: BatchJobStatus,
 }
 
 /// Policy for handling fees when a dispute expires without arbitrator resolution.
@@ -6740,6 +6789,159 @@ let _previous_admin = config.admin.clone();
         }
 
         Ok(results)
+    }
+
+    /// Schedule a bounded batch for resumable execution.
+    ///
+    /// This performs all validation and buyer authorization before persisting
+    /// the immutable input. It does not create escrows or move funds.
+    pub fn schedule_batch_escrow(
+        env: Env,
+        owner: Address,
+        params: soroban_sdk::Vec<EscrowCreateParams>,
+    ) -> Result<u64, Error> {
+        Self::check_not_paused(&env);
+        owner.require_auth();
+
+        if params.is_empty() || params.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchLimitExceeded);
+        }
+
+        let mut authorized_buyers: Map<Address, u32> = Map::new(&env);
+        for i in 0..params.len() {
+            if let Some(entry) = params.get(i) {
+                if !authorized_buyers.contains_key(entry.buyer.clone()) {
+                    entry.buyer.require_auth();
+                    authorized_buyers.set(entry.buyer, 1u32);
+                }
+                Self::validate_escrow_params(&env, &entry)?;
+            }
+        }
+
+        let job_id = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "next_batch_id"))
+            .unwrap_or(1u64);
+        let next_id = job_id.checked_add(1).ok_or(Error::BatchJobNotFound)?;
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "next_batch_id"), &next_id);
+
+        let job = BatchEscrowJob {
+            owner: owner.clone(),
+            params: params.clone(),
+            next_index: 0,
+            status: BatchJobStatus::Pending,
+        };
+        let key = DataKey::BatchEscrowJob(job_id);
+        env.storage().persistent().set(&key, &job);
+        Self::extend_persistent(&env, &key);
+        env.events().publish(
+            (Symbol::new(&env, "batch_scheduler"), Symbol::new(&env, "scheduled")),
+            (job_id, params.len()),
+        );
+        Ok(job_id)
+    }
+
+    /// Process the next deterministic chunk of a scheduled batch.
+    pub fn continue_batch_escrow(
+        env: Env,
+        job_id: u64,
+        owner: Address,
+        work_limit: u32,
+    ) -> Result<BatchJobProgress, Error> {
+        if work_limit == 0 || work_limit > MAX_SCHEDULED_BATCH_WORK {
+            return Err(Error::InvalidBatchWorkLimit);
+        }
+
+        let key = DataKey::BatchEscrowJob(job_id);
+        let mut job: BatchEscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::BatchJobNotFound)?;
+        if job.owner != owner {
+            return Err(Error::BatchJobUnauthorized);
+        }
+        owner.require_auth();
+        match job.status {
+            BatchJobStatus::Completed => return Err(Error::BatchJobCompleted),
+            BatchJobStatus::Cancelled => return Err(Error::BatchJobCancelled),
+            BatchJobStatus::Pending => {}
+        }
+
+        let end = core::cmp::min(job.next_index + work_limit, job.params.len());
+        let mut chunk = Vec::new(&env);
+        for index in job.next_index..end {
+            if let Some(entry) = job.params.get(index) {
+                chunk.push_back(entry);
+            }
+        }
+
+        // The existing batch function commits the whole chunk atomically. If
+        // it fails, this job cursor is not advanced.
+        Self::create_batch_escrow(env.clone(), job_id, chunk)?;
+        job.next_index = end;
+        if job.next_index == job.params.len() {
+            job.status = BatchJobStatus::Completed;
+        }
+        env.storage().persistent().set(&key, &job);
+        Self::extend_persistent(&env, &key);
+        env.events().publish(
+            (Symbol::new(&env, "batch_scheduler"), Symbol::new(&env, "progress")),
+            (job_id, job.next_index, job.params.len(), job.status),
+        );
+
+        Ok(BatchJobProgress {
+            id: job_id,
+            owner: job.owner,
+            next_index: job.next_index,
+            total: job.params.len(),
+            status: job.status,
+        })
+    }
+
+    /// Cancel a pending batch without creating any escrow or moving funds.
+    pub fn cancel_batch_escrow(env: Env, job_id: u64, owner: Address) -> Result<(), Error> {
+        let key = DataKey::BatchEscrowJob(job_id);
+        let mut job: BatchEscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::BatchJobNotFound)?;
+        if job.owner != owner {
+            return Err(Error::BatchJobUnauthorized);
+        }
+        owner.require_auth();
+        if job.status != BatchJobStatus::Pending {
+            return Err(if job.status == BatchJobStatus::Completed {
+                Error::BatchJobCompleted
+            } else {
+                Error::BatchJobCancelled
+            });
+        }
+        job.status = BatchJobStatus::Cancelled;
+        env.storage().persistent().set(&key, &job);
+        Self::extend_persistent(&env, &key);
+        env.events().publish(
+            (Symbol::new(&env, "batch_scheduler"), Symbol::new(&env, "cancelled")),
+            job_id,
+        );
+        Ok(())
+    }
+
+    /// Return progress for a scheduled batch.
+    pub fn get_batch_escrow_progress(env: Env, job_id: u64) -> Option<BatchJobProgress> {
+        let key = DataKey::BatchEscrowJob(job_id);
+        let job: BatchEscrowJob = env.storage().persistent().get(&key)?;
+        Some(BatchJobProgress {
+            id: job_id,
+            owner: job.owner,
+            next_index: job.next_index,
+            total: job.params.len(),
+            status: job.status,
+        })
     }
 
     /// Release multiple escrows in a batch operation
