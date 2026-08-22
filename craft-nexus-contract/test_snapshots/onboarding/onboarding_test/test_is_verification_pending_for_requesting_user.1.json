@@ -1121,7 +1121,7 @@
                 }
               ]
             },
-            "durability": "persistent"
+            "durability": "temporary"
           }
         },
         [
@@ -1141,7 +1141,7 @@
                     }
                   ]
                 },
-                "durability": "persistent",
+                "durability": "temporary",
                 "val": {
                   "u64": 0
                 }
@@ -1149,7 +1149,7 @@
             },
             "ext": "v0"
           },
-          518400
+          15
         ]
       ],
       [

@@ -2826,6 +2826,77 @@ fn test_get_verification_queue_extends_ttl_for_every_slot() {
     });
 }
 
+// ============================================================
+// Issue #702 – no extend_ttl on temporary verification markers
+// ============================================================
+
+/// Pending verification markers live in temporary storage and must not pay for
+/// persistent `extend_ttl` on enqueue or pending checks.
+#[test]
+fn test_verification_request_uses_temporary_storage_without_extend_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "temp_vrfy"), &UserRole::Artisan);
+    client.request_verification(&user);
+
+    assert!(client.is_verification_pending(&user));
+
+    env.as_contract(&client.address, || {
+        let key = DataKey::VerificationRequest(user.clone());
+        assert!(
+            env.storage().temporary().has(&key),
+            "pending marker must be stored in temporary storage"
+        );
+        assert!(
+            !env.storage().persistent().has(&key),
+            "pending marker must not be duplicated into persistent storage"
+        );
+    });
+
+    // Clearing removes the temporary marker and empties the queue.
+    assert!(client.admin_clear_verification_request(&user));
+    assert!(!client.is_verification_pending(&user));
+    env.as_contract(&client.address, || {
+        let key = DataKey::VerificationRequest(user.clone());
+        assert!(!env.storage().temporary().has(&key));
+        assert!(!env.storage().persistent().has(&key));
+    });
+}
+
+/// Legacy persistent pending markers are still recognized without refreshing TTL.
+#[test]
+fn test_legacy_persistent_verification_request_cleared_without_ttl_bump() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _) = setup_test(&env);
+    let user = Address::generate(&env);
+    client.onboard_user(&user, &String::from_str(&env, "legacy_vrfy"), &UserRole::Artisan);
+
+    // Simulate a pre-#702 persistent pending marker + queue slot.
+    env.as_contract(&client.address, || {
+        let pending_key = DataKey::VerificationRequest(user.clone());
+        env.storage()
+            .persistent()
+            .set(&pending_key, &env.ledger().timestamp());
+        // Intentionally do not extend_ttl — mirrors the #702 policy.
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerificationQueueIndex(0), &user);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerificationQueueTail, &1u64);
+    });
+
+    assert!(client.is_verification_pending(&user));
+    assert!(client.admin_clear_verification_request(&user));
+    assert!(!client.is_verification_pending(&user));
+    assert_eq!(client.get_verification_queue().len(), 0);
+}
+
 /// Read helpers refresh TTL on the entries they return without a second probe.
 #[test]
 fn test_read_paths_refresh_ttl_on_touched_entries() {
