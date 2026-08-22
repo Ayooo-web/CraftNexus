@@ -284,7 +284,6 @@ const BASE58_BTC_CHARSET: [bool; 256] = {
     chars
 };
 const TOTAL_FEES: Symbol = symbol_short!("TOT_FEES");
-const ADMIN: Symbol = symbol_short!("ADMIN");
 
 /// Standard TTL threshold for persistent storage (approx 14 hours at 5s ledger)
 const TTL_THRESHOLD: u32 = 10_000;
@@ -1703,7 +1702,7 @@ impl CraftNexusContract {
         match prefix {
             // base32lower (most common CIDv1 encoding)
             b'b' => {
-                if len < 50 || len > 100 || cid_bytes[1] != b'a' {
+                if !(50..=100).contains(&len) || cid_bytes[1] != b'a' {
                     return false;
                 }
                 payload
@@ -1712,7 +1711,7 @@ impl CraftNexusContract {
             }
             // base16lower (hex)
             b'f' => {
-                if len < 60 || len > 120 || cid_bytes[1] != b'0' || cid_bytes[2] != b'1' {
+                if !(60..=120).contains(&len) || cid_bytes[1] != b'0' || cid_bytes[2] != b'1' {
                     return false;
                 }
                 payload
@@ -1721,7 +1720,7 @@ impl CraftNexusContract {
             }
             // base58btc
             b'z' => {
-                if len < 40 || len > 100 {
+                if !(40..=100).contains(&len) {
                     return false;
                 }
                 payload.iter().all(|b| Self::is_base58_btc_char(*b))
@@ -2222,7 +2221,7 @@ impl CraftNexusContract {
     #[inline(always)]
     fn get_whitelist_count(env: &Env) -> u32 {
         let count_key = DataKey::WhitelistedTokenCount;
-        Self::read_persistent(&env, &count_key).unwrap_or(0u32)
+        Self::read_persistent(env, &count_key).unwrap_or(0u32)
     }
 
     #[inline(always)]
@@ -2293,9 +2292,7 @@ impl CraftNexusContract {
         let count_key = DataKey::EscrowCount;
         let stored_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
         if stored_count < all_ids.len() {
-            env.storage()
-                .persistent()
-                .set(&count_key, &(all_ids.len() as u32));
+            env.storage().persistent().set(&count_key, &all_ids.len());
             Self::extend_persistent(env, &count_key);
         }
 
@@ -2896,6 +2893,10 @@ impl CraftNexusContract {
             .instance()
             .set(&DataKey::PlatformConfig, &config);
 
+        if let Err(e) = Self::set_fallback_admin(&env, admin.clone()) {
+            env.panic_with_error(e);
+        }
+
         env.storage()
             .persistent()
             .set(&PLATFORM_WALLET, &platform_wallet);
@@ -2960,7 +2961,7 @@ impl CraftNexusContract {
         config.admin.require_auth();
 
         // Validate: not the contract address itself (#240)
-        if let Err(_) = Self::validate_admin_address(&env, &new_admin) {
+        if Self::validate_admin_address(&env, &new_admin).is_err() {
             env.panic_with_error(Error::InvalidAdminAddress);
         }
 
@@ -2987,7 +2988,7 @@ impl CraftNexusContract {
         pending.require_auth();
 
         // Validate the pending admin address before accepting the transfer
-        if let Err(_) = Self::validate_admin_address(&env, pending) {
+        if Self::validate_admin_address(&env, pending).is_err() {
             env.panic_with_error(Error::InvalidAdminAddress);
         }
 
@@ -3211,7 +3212,7 @@ impl CraftNexusContract {
         if action.executed {
             return Err(Error::AdminActionTerminal);
         }
-        if (action.approvals.len() as u32) < action.threshold {
+        if action.approvals.len() < action.threshold {
             return Err(Error::AdminActionNeedsApprovals);
         }
         let now = env.ledger().timestamp();
@@ -4220,14 +4221,7 @@ impl CraftNexusContract {
             .get(&key)
             .unwrap_or_else(|| env.panic_with_error(crate::Error::PlatformNotInitialized));
 
-        let map = Map::<Symbol, Val>::try_from_val(env, &stored).expect("Corrupted PlatformConfig");
-        let version_key = symbol_short!("version");
-
-        let config = if map.contains_key(version_key) {
-            PlatformConfig::try_from_val(env, &stored).expect("Corrupted PlatformConfig")
-        } else {
-            PlatformConfig::try_from_val(env, &stored).expect("Corrupted PlatformConfig")
-        };
+        let config = PlatformConfig::try_from_val(env, &stored).expect("Corrupted PlatformConfig");
         env.storage()
             .instance()
             .extend_ttl(TTL_THRESHOLD, TTL_EXTENSION);
@@ -5573,7 +5567,7 @@ impl CraftNexusContract {
 
         // All entries in state.approvals were validated against state.signers
         // when they were added, so a simple length check is sufficient.
-        if (state.approvals.len() as u32) < state.threshold {
+        if state.approvals.len() < state.threshold {
             // Threshold not yet met -- persist updated state and return.
             env.storage().persistent().set(&state_key, &state);
             Self::extend_persistent(&env, &state_key);
@@ -8062,8 +8056,7 @@ impl CraftNexusContract {
         Self::extend_persistent(&env, &stake_key);
 
         // Record stake operation in history queue for audit trail (#237)
-        if let Err(_) = Self::record_stake_history(&env, &artisan, new_stake.amount, "stake_added")
-        {
+        if Self::record_stake_history(&env, &artisan, new_stake.amount, "stake_added").is_err() {
             env.panic_with_error(Error::StakeQueueFull);
         }
 
@@ -8296,7 +8289,7 @@ impl CraftNexusContract {
         }
 
         // Record unstake operation in history for audit trail (#237)
-        if let Err(_) = Self::record_stake_history(&env, &artisan, 0, "stake_removed") {
+        if Self::record_stake_history(&env, &artisan, 0, "stake_removed").is_err() {
             // Don't fail on history recording, but log the issue
             env.events().publish(
                 (Symbol::new(&env, "stake_history_warning"), "queue_full"),

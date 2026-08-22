@@ -1269,7 +1269,7 @@ fn validate_ipfs_cid(cid: &String) -> bool {
         b'b' => {
             // Stricter length check for typical CIDv1 base32 (sha256/dag-pb is 59 chars)
             // Allow range for different hash types but enforce minimum for valid multihash payload
-            if len < 50 || len > 100 {
+            if !(50..=100).contains(&len) {
                 return false;
             }
             // Logic check: CIDv1 base32 ALWAYS starts with 'ba' because version byte 0x01
@@ -1284,7 +1284,7 @@ fn validate_ipfs_cid(cid: &String) -> bool {
         // base16lower (hex)
         b'f' => {
             // CIDv1 base16 typically ~73 chars for sha256
-            if len < 60 || len > 120 {
+            if !(60..=120).contains(&len) {
                 return false;
             }
             // Logic check: CIDv1 base16 ALWAYS starts with 'f01' (0x01 version byte)
@@ -1298,7 +1298,7 @@ fn validate_ipfs_cid(cid: &String) -> bool {
         // base58btc
         b'z' => {
             // CIDv1 base58 typically ~50 chars
-            if len < 40 || len > 100 {
+            if !(40..=100).contains(&len) {
                 return false;
             }
             payload.iter().all(|b| is_base58_btc_char(*b))
@@ -3042,8 +3042,8 @@ impl OnboardingContract {
 
         // [SECURITY] Prevent unnecessary state mutations and replay attacks
         // by recording state transition audit trail for forensic analysis
-        let old_role = profile.role.clone();
-        profile.role = new_role.clone();
+        let old_role = profile.role;
+        profile.role = new_role;
 
         // Store updated profile
         Self::persist_public_user_profile(&env, &user, &profile);
@@ -3145,7 +3145,7 @@ impl OnboardingContract {
         // without a follow-up profile read.
         env.events().publish(
             (Symbol::new(&env, "ProfileDeactivated"), user.clone()),
-            (user, profile.role.clone()),
+            (user, profile.role),
         );
     }
 
@@ -3216,7 +3216,7 @@ impl OnboardingContract {
 
         env.events().publish(
             (Symbol::new(&env, "ProfileReactivated"), user.clone()),
-            (user, profile.role.clone()),
+            (user, profile.role),
         );
 
         profile
@@ -3734,7 +3734,7 @@ impl OnboardingContract {
             && metrics.total_volume >= config.min_volume_for_verify
         {
             profile.is_verified = true;
-            Self::persist_public_user_profile(env, &address, &profile);
+            Self::persist_public_user_profile(env, address, &profile);
 
             // auto-verification triggered — emit AutoVerifiedEvent (#713)
             env.events().publish(
@@ -4468,7 +4468,7 @@ impl OnboardingContract {
         let normalized_new = normalize_username(&env, &new_username);
 
         // Validate new username length
-        let username_len = normalized_new.len() as u32;
+        let username_len = normalized_new.len();
         assert!(
             username_len >= config.min_username_length,
             "Username too short"
