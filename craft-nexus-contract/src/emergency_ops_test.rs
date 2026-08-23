@@ -119,6 +119,62 @@ fn test_sweep_rejects_accounting_invariant_breach() {
 }
 
 #[test]
+fn test_reconciliation_is_bounded_and_blocks_unresolved_sweep() {
+    let (env, client, buyer, seller, token, token_admin, wallet, _admin) =
+        setup_emergency_env();
+
+    token_admin.mint(&buyer, &500_000);
+    client.create_escrow(&buyer, &seller, &token, &100_000, &1, &Some(3600));
+    token_admin.mint(&client.address, &25_000);
+
+    let partial = client.reconcile_token(&token, &0, &1);
+    assert!(partial.is_ok());
+    let report = client.reconcile_token(&token, &1, &1).unwrap();
+    assert!(report.complete);
+    assert!(!report.unresolved);
+    assert_eq!(report.expected_locked, 100_000);
+
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalLocked(token.clone()), &200_000i128);
+    });
+    let report = client.reconcile_token(&token, &0, &1).unwrap();
+    assert!(report.unresolved);
+    let sweep = client.try_sweep_unallocated_funds(&token, &wallet);
+    assert!(matches!(sweep, Err(Ok(Error::ReconciliationRequired))));
+}
+
+#[test]
+fn test_repair_plan_requires_approval_and_is_idempotent() {
+    let (env, client, buyer, seller, token, token_admin, wallet, admin) =
+        setup_emergency_env();
+
+    token_admin.mint(&buyer, &500_000);
+    client.create_escrow(&buyer, &seller, &token, &100_000, &1, &Some(3600));
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalLocked(token.clone()), &200_000i128);
+    });
+    client.reconcile_token(&token, &0, &1).unwrap();
+
+    let plan = client.propose_reconciliation_repair(&token).unwrap();
+    assert!(!plan.applied);
+    client.set_admin_action_timelock_delay(&0);
+    let action = client.propose_admin_action(
+        &admin,
+        &AdminActionKind::ApplyReconciliationRepair(plan.id),
+    );
+    client.execute_admin_action(&action.id);
+
+    let repaired = client.get_reconciliation_repair_plan(&plan.id).unwrap();
+    assert!(repaired.applied);
+    assert_eq!(client.get_fund_allocation(&token).total_locked, 100_000);
+    assert_eq!(client.sweep_unallocated_funds(&token, &wallet), 25_000);
+}
+
+#[test]
 fn test_recovery_blocked_by_active_dispute() {
     let (env, client, buyer, seller, token, token_admin, _wallet, _admin) = setup_emergency_env();
 
