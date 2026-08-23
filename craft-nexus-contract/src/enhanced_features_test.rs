@@ -141,7 +141,7 @@ fn test_cancel_recurring_escrow() {
 #[test]
 fn test_profile_deactivation_success() {
     let env = Env::default();
-    let (_escrow, onboarding, buyer, _, _, _, _, _) = setup_enhanced_test(&env);
+    let (_, onboarding, buyer, _, _, _, _, _) = setup_enhanced_test(&env);
 
     // No active escrows, should succeed
     onboarding.deactivate_profile(&buyer);
