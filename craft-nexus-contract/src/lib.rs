@@ -165,6 +165,12 @@ pub enum Error {
     AlreadyApproved = 43,
     /// Token decimal places are outside the supported range (0–18)
     InvalidTokenDecimals = 44,
+    /// No compatibility manifest has been submitted for the upgrade
+    UpgradeCompatibilityMissing = 45,
+    /// The compatibility manifest does not describe the current state/version
+    UpgradeCompatibilityInvalid = 46,
+    /// The migration report contains records that require manual handling
+    UpgradeMigrationIncomplete = 47,
     /// Persisted storage is on a legacy layout that must be migrated first.
     StorageLayoutMismatch = 45,
     /// Admin action is in a terminal state (executed or cancelled)
@@ -544,6 +550,8 @@ pub enum DataKey {
     TotalStaked(Address),
     /// Bounded log of completed WASM upgrades. Capped at MAX_UPGRADE_HISTORY
     UpgradeHistory,
+    /// Compatibility evidence for completed WASM upgrades.
+    UpgradeCompatibilityHistory,
     /// Key for a recurring escrow by its ID
     RecurringEscrow(u64),
     /// ID counter for recurring escrows
@@ -564,6 +572,8 @@ pub enum DataKey {
     /// Ledger timestamp (u64) recorded when the last upgrade proposal was
     /// cancelled. Used to enforce CANCEL_REPROPOSE_COOLDOWN (Issue #618).
     LastUpgradeCancelledAt,
+    /// Differential compatibility manifest keyed by the proposed WASM hash.
+    UpgradeCompatibilityManifest(BytesN<32>),
     /// Structured evidence log for a disputed escrow order (#927)
     EvidenceLog(u32),
     /// Submitted evidence hash to prevent reuse across disputes (#927)
@@ -1201,6 +1211,52 @@ pub struct UpgradeRecord {
     pub timestamp: u64,
 }
 
+/// Additive audit record for compatibility evidence. Kept separate from
+/// `UpgradeRecord` so existing serialized upgrade history remains readable.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct UpgradeCompatibilityRecord {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub wasm_hash: BytesN<32>,
+    pub state_commitment: BytesN<32>,
+    pub migration_checkpoint: BytesN<32>,
+    pub timestamp: u64,
+}
+
+/// Evidence produced by an isolated old/new implementation compatibility run.
+/// Hash fields commit to the complete manifest and its test evidence; the
+/// contract deliberately does not trust an uncommitted human-readable report.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct UpgradeCompatibilityManifest {
+    pub source_version: u32,
+    pub target_version: u32,
+    pub state_commitment: BytesN<32>,
+    pub interface_commitment: BytesN<32>,
+    pub authorization_commitment: BytesN<32>,
+    pub preconditions_commitment: BytesN<32>,
+    pub postconditions_commitment: BytesN<32>,
+    pub rollback_limitations_commitment: BytesN<32>,
+    pub migration_checkpoint: BytesN<32>,
+    pub migration_complete: bool,
+    pub manual_records: u32,
+}
+
+/// Stable, representative state used by migration tooling when creating a
+/// differential snapshot. The resulting hash is supplied in the manifest.
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct UpgradeStateSnapshot {
+    pub contract_version: u32,
+    pub escrow_count: u32,
+    pub recurring_escrow_next_id: u64,
+    pub upgrade_threshold: u32,
+    pub paused: bool,
+    pub onboarding_configured: bool,
 /// Immutable per-round state for the multi-sig upgrade approval flow.
 ///
 /// Written once on the **first** approval call for a given proposal nonce and
@@ -5664,6 +5720,105 @@ impl CraftNexusContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Return the state summary that migration tooling must snapshot in its
+    /// isolated old/new differential run.
+    pub fn get_upgrade_state_snapshot(env: Env) -> UpgradeStateSnapshot {
+        let config = Self::get_platform_config_internal(&env);
+        UpgradeStateSnapshot {
+            contract_version: Self::get_version(env.clone()),
+            escrow_count: env
+                .storage()
+                .persistent()
+                .get(&DataKey::EscrowCount)
+                .unwrap_or(0),
+            recurring_escrow_next_id: env
+                .storage()
+                .persistent()
+                .get(&DataKey::NextRecurringEscrowId)
+                .unwrap_or(0),
+            upgrade_threshold: Self::get_upgrade_threshold(env.clone()),
+            paused: config.is_paused,
+            onboarding_configured: env
+                .storage()
+                .persistent()
+                .has(&DataKey::OnboardingContractAddress),
+        }
+    }
+
+    /// Hash the current representative state. Tooling should call this before
+    /// and after its isolated migration and place the pre-migration value in
+    /// `UpgradeCompatibilityManifest::state_commitment`.
+    pub fn get_upgrade_state_commitment(env: Env) -> BytesN<32> {
+        let snapshot = Self::get_upgrade_state_snapshot(env.clone());
+        env.crypto().sha256(&env.serialize(&snapshot))
+    }
+
+    fn is_zero_commitment(env: &Env, commitment: &BytesN<32>) -> bool {
+        commitment == &BytesN::<32>::from_array(env, &[0u8; 32])
+    }
+
+    fn validate_compatibility_manifest(
+        env: &Env,
+        manifest: &UpgradeCompatibilityManifest,
+    ) -> Result<(), Error> {
+        let current_version = Self::get_version(env.clone());
+        if manifest.source_version != current_version
+            || manifest.target_version != current_version.saturating_add(1)
+            || Self::is_zero_commitment(env, &manifest.state_commitment)
+            || Self::is_zero_commitment(env, &manifest.interface_commitment)
+            || Self::is_zero_commitment(env, &manifest.authorization_commitment)
+            || Self::is_zero_commitment(env, &manifest.preconditions_commitment)
+            || Self::is_zero_commitment(env, &manifest.postconditions_commitment)
+            || Self::is_zero_commitment(env, &manifest.rollback_limitations_commitment)
+            || Self::is_zero_commitment(env, &manifest.migration_checkpoint)
+        {
+            return Err(Error::UpgradeCompatibilityInvalid);
+        }
+
+        if !manifest.migration_complete || manifest.manual_records != 0 {
+            return Err(Error::UpgradeMigrationIncomplete);
+        }
+
+        if manifest.state_commitment != Self::get_upgrade_state_commitment(env.clone()) {
+            return Err(Error::UpgradeCompatibilityInvalid);
+        }
+        Ok(())
+    }
+
+    /// Submit the differential compatibility evidence for a pending upgrade.
+    /// The manifest is resumable off-chain: a later submission replaces the
+    /// same hash's report, while execution accepts only a complete report with
+    /// no records requiring manual intervention.
+    pub fn submit_upgrade_compatibility_manifest(
+        env: Env,
+        wasm_hash: BytesN<32>,
+        manifest: UpgradeCompatibilityManifest,
+    ) -> Result<(), Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+        Self::validate_upgrade_hash(&env, &wasm_hash)?;
+        if manifest.source_version != Self::get_version(env.clone()) {
+            return Err(Error::UpgradeCompatibilityInvalid);
+        }
+        env.storage().persistent().set(
+            &DataKey::UpgradeCompatibilityManifest(wasm_hash.clone()),
+            &manifest,
+        );
+        Self::extend_persistent(
+            &env,
+            &DataKey::UpgradeCompatibilityManifest(wasm_hash),
+        );
+        Ok(())
+    }
+
+    /// Read the compatibility evidence associated with a proposed WASM hash.
+    pub fn get_upgrade_compatibility_manifest(
+        env: Env,
+        wasm_hash: BytesN<32>,
+    ) -> Option<UpgradeCompatibilityManifest> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UpgradeCompatibilityManifest(wasm_hash))
     /// Return the persisted storage layout version.
     pub fn get_storage_layout_version(env: Env) -> u32 {
         env.storage()
@@ -5746,6 +5901,13 @@ impl CraftNexusContract {
             return Err(Error::UpgradeCooldownActive);
         }
 
+        let manifest: UpgradeCompatibilityManifest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UpgradeCompatibilityManifest(proposal.wasm_hash.clone()))
+            .ok_or(Error::UpgradeCompatibilityMissing)?;
+        Self::validate_compatibility_manifest(&env, &manifest)?;
+
         env.deployer()
             .update_current_contract_wasm(proposal.wasm_hash.clone());
 
@@ -5772,11 +5934,25 @@ impl CraftNexusContract {
                 timestamp: env.ledger().timestamp(),
             },
         );
+        Self::append_upgrade_compatibility_history(
+            &env,
+            UpgradeCompatibilityRecord {
+                from_version: current_version,
+                to_version: new_version,
+                wasm_hash: proposal.wasm_hash.clone(),
+                state_commitment: manifest.state_commitment,
+                migration_checkpoint: manifest.migration_checkpoint,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
 
         // Clear proposal
         env.storage()
             .persistent()
             .remove(&DataKey::WasmUpgradeProposal);
+        env.storage().persistent().remove(&DataKey::UpgradeCompatibilityManifest(
+            proposal.wasm_hash.clone(),
+        ));
 
         Self::emit_upgrade_event(
             &env,
@@ -5895,6 +6071,22 @@ impl CraftNexusContract {
         Self::extend_persistent(env, &DataKey::UpgradeHistory);
     }
 
+    fn append_upgrade_compatibility_history(env: &Env, record: UpgradeCompatibilityRecord) {
+        let mut history: Vec<UpgradeCompatibilityRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UpgradeCompatibilityHistory)
+            .unwrap_or_else(|| Vec::new(env));
+        history.push_back(record);
+        while history.len() > MAX_UPGRADE_HISTORY {
+            history.pop_front();
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::UpgradeCompatibilityHistory, &history);
+        Self::extend_persistent(env, &DataKey::UpgradeCompatibilityHistory);
+    }
+
     /// Returns the bounded log of past contract upgrades (#241).
     ///
     /// Newer entries are at the back. The log is capped at
@@ -5905,6 +6097,14 @@ impl CraftNexusContract {
         env.storage()
             .persistent()
             .get(&DataKey::UpgradeHistory)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns compatibility evidence for completed upgrades.
+    pub fn get_upgrade_compatibility_history(env: Env) -> Vec<UpgradeCompatibilityRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UpgradeCompatibilityHistory)
             .unwrap_or_else(|| Vec::new(&env))
     }
 

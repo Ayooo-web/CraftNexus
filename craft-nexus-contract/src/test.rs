@@ -2090,6 +2090,72 @@ fn test_contract_upgrade_unauthorized() {
 }
 
 #[test]
+fn test_upgrade_requires_compatibility_manifest() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+    let wasm = Bytes::from_array(&env, &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+    let wasm_hash = env.deployer().upload_contract_wasm(wasm);
+
+    client.propose_upgrade_wasm(&admin, &wasm_hash);
+    env.ledger().with_mut(|ledger| {
+        ledger.timestamp += DEFAULT_WASM_UPGRADE_COOLDOWN as u64 + 1;
+    });
+
+    let result = client.try_execute_upgrade(&wasm_hash);
+    assert!(matches!(result, Err(Ok(Error::UpgradeCompatibilityMissing))));
+}
+
+#[test]
+fn test_upgrade_manifest_is_recorded_and_consumed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _, _, admin) = setup_test(&env, true);
+    let wasm = Bytes::from_array(&env, &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+    let wasm_hash = env.deployer().upload_contract_wasm(wasm);
+    let commitment = client.get_upgrade_state_commitment();
+    let nonzero = BytesN::from_array(&env, &[1u8; 32]);
+    let manifest = UpgradeCompatibilityManifest {
+        source_version: 1,
+        target_version: 2,
+        state_commitment: commitment.clone(),
+        interface_commitment: nonzero.clone(),
+        authorization_commitment: nonzero.clone(),
+        preconditions_commitment: nonzero.clone(),
+        postconditions_commitment: nonzero.clone(),
+        rollback_limitations_commitment: nonzero.clone(),
+        migration_checkpoint: nonzero,
+        migration_complete: true,
+        manual_records: 0,
+    };
+
+    client.propose_upgrade_wasm(&admin, &wasm_hash);
+    client.submit_upgrade_compatibility_manifest(&wasm_hash, &manifest);
+    assert_eq!(
+        client
+            .get_upgrade_compatibility_manifest(&wasm_hash)
+            .unwrap(),
+        manifest
+    );
+
+    env.ledger().with_mut(|ledger| {
+        ledger.timestamp += DEFAULT_WASM_UPGRADE_COOLDOWN as u64 + 1;
+    });
+    client.execute_upgrade(&wasm_hash);
+
+    let record = client
+        .get_upgrade_compatibility_history()
+        .last()
+        .unwrap();
+    assert_eq!(record.from_version, 1);
+    assert_eq!(record.to_version, 2);
+    assert_eq!(record.state_commitment, commitment);
+    assert!(client
+        .get_upgrade_compatibility_manifest(&wasm_hash)
+        .is_none());
+}
+
+#[test]
 fn test_get_version_initially() {
     let env = Env::default();
     env.mock_all_auths();
