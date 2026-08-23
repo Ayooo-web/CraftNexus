@@ -328,7 +328,8 @@ fn test_submit_evidence_bound_to_valid_dispute_session() {
     client.create_escrow(&buyer, &seller, &token, &50_000_000, &1, &None);
 
     // Submission fails when not in dispute
-    let result = client.try_submit_evidence(&1, &buyer, &String::from_str(&env, "ipfs://evidence-1"));
+    let result =
+        client.try_submit_evidence(&1, &buyer, &String::from_str(&env, "ipfs://evidence-1"));
     assert!(result.is_err());
 
     // Initiate dispute
@@ -353,7 +354,11 @@ fn test_expired_evidence_automatically_invalidated() {
     let (client, buyer, seller, token, token_admin, _admin) = setup(&env);
     create_and_dispute(&env, &client, &buyer, &seller, &token, &token_admin, 1);
 
-    client.submit_evidence(&1, &buyer, &String::from_str(&env, "ipfs://evidence-expiring"));
+    client.submit_evidence(
+        &1,
+        &buyer,
+        &String::from_str(&env, "ipfs://evidence-expiring"),
+    );
 
     // Verify valid before expiry
     let valid_before = client.get_valid_evidence(&1);
@@ -394,4 +399,3 @@ fn test_prevent_evidence_reuse_across_disputes() {
     let result = client.try_submit_evidence(&2, &buyer, &payload);
     assert!(result.is_err());
 }
-
