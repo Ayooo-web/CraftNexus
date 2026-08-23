@@ -215,6 +215,16 @@ pub enum Error {
     ArbitratorDeadlineExceeded = 65,
     /// This escrow was already settled; a second settlement path cannot run.
     SettlementAlreadyFinalized = 66,
+    /// Tracked obligations exceed the token balance held by the contract.
+    EmergencyAccountingInvariant = 67,
+    /// A reconciliation report has unresolved customer or collateral liabilities.
+    ReconciliationRequired = 68,
+    /// The requested reconciliation repair plan does not exist.
+    RepairPlanNotFound = 69,
+    /// The reconciliation repair plan has already reached a terminal state.
+    RepairPlanTerminal = 70,
+    /// The live token state no longer matches the reviewed repair plan.
+    RepairPlanPreconditionFailed = 71,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -406,6 +416,7 @@ pub enum AdminActionKind {
     SetMinReleaseWindow(u32),
     SetOnboardingContract(Address),
     SetExpiredDisputePolicy(ExpiredDisputeFeePolicy),
+    ApplyReconciliationRepair(u64),
 }
 
 /// A pending critical admin action proposal that requires multi-sig
@@ -548,6 +559,18 @@ pub enum DataKey {
     TotalLocked(Address),
     /// Total amount of funds currently staked by artisans for a token address.
     TotalStaked(Address),
+    /// Indexed artisan address with a persisted stake record.
+    StakedArtisanIndexed(u32),
+    /// Number of indexed artisan stake records.
+    StakedArtisanCount,
+    /// Latest completed reconciliation result for a token address.
+    ReconciliationReport(Address),
+    /// In-progress reconciliation accumulator for a token address.
+    ReconciliationProgress(Address),
+    /// Repair plan awaiting explicit admin-action approval.
+    ReconciliationRepairPlan(u64),
+    /// Monotonic repair-plan identifier.
+    NextReconciliationRepairPlanId,
     /// Bounded log of completed WASM upgrades. Capped at MAX_UPGRADE_HISTORY
     UpgradeHistory,
     /// Compatibility evidence for completed WASM upgrades.
@@ -556,6 +579,8 @@ pub enum DataKey {
     RecurringEscrow(u64),
     /// ID counter for recurring escrows
     NextRecurringEscrowId,
+    /// Number of recurring escrow records created.
+    RecurringEscrowCount,
     /// Persisted resource-aware batch escrow job.
     BatchEscrowJob(u64),
     /// Count of currently active (non-released, non-refunded) escrows or recurring escrows for a user address.
@@ -861,6 +886,48 @@ pub struct FundMovementAuditEntry {
     pub reason: Symbol,
     pub timestamp: u64,
     pub balance_impact: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct FundAllocation {
+    pub balance: i128,
+    pub total_locked: i128,
+    pub total_staked: i128,
+    pub unallocated: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct ReconciliationReport {
+    pub token: Address,
+    pub balance: i128,
+    pub expected_locked: i128,
+    pub expected_staked: i128,
+    pub tracked_locked: i128,
+    pub tracked_staked: i128,
+    pub scanned_escrows: u32,
+    pub next_cursor: u32,
+    pub complete: bool,
+    pub unresolved: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct ReconciliationRepairPlan {
+    pub id: u64,
+    pub token: Address,
+    pub expected_locked: i128,
+    pub expected_staked: i128,
+    pub observed_balance: i128,
+    pub observed_tracked_locked: i128,
+    pub observed_tracked_staked: i128,
+    pub created_at: u64,
+    pub applied: bool,
+    pub cancelled: bool,
 }
 
 #[contracttype]
@@ -2230,6 +2297,9 @@ impl CraftNexusContract {
         let new_total = current.saturating_add(delta);
         env.storage().persistent().set(&key, &new_total);
         Self::extend_persistent(env, &key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ReconciliationReport(token.clone()));
     }
 
     #[inline(always)]
@@ -2239,6 +2309,9 @@ impl CraftNexusContract {
         let new_total = current.saturating_add(delta);
         env.storage().persistent().set(&key, &new_total);
         Self::extend_persistent(env, &key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ReconciliationReport(token.clone()));
     }
 
     /// Extend the TTL of a persistent storage entry using standardized values.
@@ -3357,19 +3430,19 @@ impl CraftNexusContract {
                 Ok(())
             }
             AdminActionKind::SweepUnallocatedFunds(token, destination) => {
-                let balance =
-                    token::Client::new(env, token).balance(&env.current_contract_address());
-                let locked: i128 = env
+                if env
                     .storage()
                     .persistent()
-                    .get(&DataKey::TotalLocked(token.clone()))
-                    .unwrap_or(0);
-                let staked: i128 = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::TotalStaked(token.clone()))
-                    .unwrap_or(0);
-                let unallocated = balance - (locked + staked);
+                    .get::<DataKey, ReconciliationReport>(&DataKey::ReconciliationReport(token.clone()))
+                    .is_some_and(|report| report.unresolved)
+                {
+                    return Err(Error::ReconciliationRequired);
+                }
+                let allocation = Self::fund_allocation(env, token);
+                if allocation.unallocated < 0 {
+                    return Err(Error::EmergencyAccountingInvariant);
+                }
+                let unallocated = allocation.unallocated;
                 if unallocated > 0 {
                     Self::transfer_tokens_and_record_audit(
                         env,
@@ -3521,7 +3594,47 @@ impl CraftNexusContract {
                 );
                 Ok(())
             }
+            AdminActionKind::ApplyReconciliationRepair(plan_id) => {
+                Self::apply_reconciliation_repair(env, *plan_id)
+            }
         }
+    }
+
+    fn apply_reconciliation_repair(env: &Env, plan_id: u64) -> Result<(), Error> {
+        let key = DataKey::ReconciliationRepairPlan(plan_id);
+        let mut plan: ReconciliationRepairPlan = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::RepairPlanNotFound)?;
+        if plan.applied || plan.cancelled {
+            return Err(Error::RepairPlanTerminal);
+        }
+
+        let allocation = Self::fund_allocation(env, &plan.token);
+        if allocation.balance != plan.observed_balance
+            || allocation.total_locked != plan.observed_tracked_locked
+            || allocation.total_staked != plan.observed_tracked_staked
+            || allocation.balance < plan.expected_locked + plan.expected_staked
+        {
+            return Err(Error::RepairPlanPreconditionFailed);
+        }
+
+        env.storage().persistent().set(
+            &DataKey::TotalLocked(plan.token.clone()),
+            &plan.expected_locked,
+        );
+        env.storage().persistent().set(
+            &DataKey::TotalStaked(plan.token.clone()),
+            &plan.expected_staked,
+        );
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ReconciliationReport(plan.token.clone()));
+        plan.applied = true;
+        env.storage().persistent().set(&key, &plan);
+        Self::extend_persistent(env, &key);
+        Ok(())
     }
 
     /// Recover admin access using fallback admin after time lock period (#240)
@@ -8232,6 +8345,20 @@ impl CraftNexusContract {
         // Accumulate stake in a single record with token metadata.
         let stake_key = DataKey::ArtisanStake(artisan.clone());
         let current_stake: Option<ArtisanStakeData> = env.storage().persistent().get(&stake_key);
+        if current_stake.is_none() {
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::StakedArtisanCount)
+                .unwrap_or(0);
+            env.storage().persistent().set(
+                &DataKey::StakedArtisanIndexed(count),
+                &artisan,
+            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::StakedArtisanCount, &(count + 1));
+        }
         let new_stake = if let Some(existing_stake) = current_stake {
             if existing_stake.token != token {
                 env.panic_with_error(crate::Error::StakeTokenMismatch);
@@ -8913,6 +9040,16 @@ impl CraftNexusContract {
             .persistent()
             .set(&DataKey::NextRecurringEscrowId, &next_id);
         Self::extend_persistent(&env, &DataKey::NextRecurringEscrowId);
+        let recurring_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecurringEscrowCount)
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::RecurringEscrowCount,
+            &recurring_count.saturating_add(1),
+        );
+        Self::extend_persistent(&env, &DataKey::RecurringEscrowCount);
 
         let now = env.ledger().timestamp();
 
@@ -9153,6 +9290,228 @@ impl CraftNexusContract {
             .expect("")
     }
 
+    pub fn get_fund_allocation(env: Env, token: Address) -> FundAllocation {
+        Self::fund_allocation(&env, &token)
+    }
+
+    fn fund_allocation(env: &Env, token: &Address) -> FundAllocation {
+        let balance = token::Client::new(env, token).balance(&env.current_contract_address());
+        let total_locked = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLocked(token.clone()))
+            .unwrap_or(0);
+        let total_staked = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked(token.clone()))
+            .unwrap_or(0);
+        FundAllocation {
+            balance,
+            total_locked,
+            total_staked,
+            unallocated: balance - (total_locked + total_staked),
+        }
+    }
+
+    pub fn reconcile_token(
+        env: Env,
+        token: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<ReconciliationReport, Error> {
+        if limit == 0 || limit > MAX_BATCH_SIZE {
+            return Err(Error::InvalidBatchWorkLimit);
+        }
+        let total = Self::get_persistent_u32(&env, &DataKey::EscrowCount);
+        let end = cursor.saturating_add(limit).min(total);
+        let mut expected_locked: i128 = if cursor == 0 {
+            let recurring_count: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RecurringEscrowCount)
+                .unwrap_or(0);
+            let mut recurring_locked = 0i128;
+            for id in 1..=recurring_count {
+                if let Some(recurring) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, RecurringEscrow>(&DataKey::RecurringEscrow(id))
+                {
+                    if recurring.token == token && recurring.is_active {
+                        recurring_locked = recurring_locked.saturating_add(
+                            recurring.total_amount - recurring.released_amount,
+                        );
+                    }
+                }
+            }
+            recurring_locked
+        } else {
+            env.storage()
+                .persistent()
+                .get::<DataKey, i128>(&DataKey::ReconciliationProgress(token.clone()))
+                .unwrap_or(0)
+        };
+        let mut scanned = 0u32;
+        let stake_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakedArtisanCount)
+            .unwrap_or(0);
+        let mut expected_staked = 0i128;
+        for index in 0..stake_count {
+            if let Some(artisan) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::StakedArtisanIndexed(index))
+            {
+                if let Some(stake) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
+                {
+                    if stake.token == token {
+                        expected_staked = expected_staked.saturating_add(stake.amount);
+                    }
+                }
+            }
+        }
+
+        for index in cursor..end {
+            let Some(order_id) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u32>(&DataKey::GlobalEscrowIdIndexed(index))
+            else {
+                continue;
+            };
+            if let Some(escrow) = env
+                .storage()
+                .persistent()
+                .get::<(Symbol, u32), Escrow>(&(ESCROW, order_id))
+            {
+                if escrow.token == token
+                    && matches!(
+                        escrow.status,
+                        EscrowStatus::Active
+                            | EscrowStatus::Disputed
+                            | EscrowStatus::ReleasePending
+                            | EscrowStatus::RefundPending
+                            | EscrowStatus::DisputePending
+                            | EscrowStatus::SettlementPending
+                    )
+                {
+                    expected_locked = expected_locked.saturating_add(escrow.amount);
+                }
+                scanned = scanned.saturating_add(1);
+            }
+        }
+
+        let report = ReconciliationReport {
+            token: token.clone(),
+            balance: token::Client::new(&env, &token)
+                .balance(&env.current_contract_address()),
+            expected_locked,
+            expected_staked,
+            tracked_locked: env
+                .storage()
+                .persistent()
+                .get(&DataKey::TotalLocked(token.clone()))
+                .unwrap_or(0),
+            tracked_staked: env
+                .storage()
+                .persistent()
+                .get(&DataKey::TotalStaked(token.clone()) )
+                .unwrap_or(0),
+            scanned_escrows: scanned,
+            next_cursor: end,
+            complete: end >= total,
+            unresolved: false,
+        };
+        if report.complete {
+            let unresolved = report.expected_locked != report.tracked_locked
+                || report.expected_staked != report.tracked_staked
+                || report.balance < report.expected_locked + report.expected_staked;
+            let final_report = ReconciliationReport { unresolved, ..report };
+            env.storage()
+                .persistent()
+                .set(&DataKey::ReconciliationReport(token), &final_report);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ReconciliationProgress(final_report.token.clone()));
+            return Ok(final_report);
+        }
+        env.storage().persistent().set(
+            &DataKey::ReconciliationProgress(token),
+            &expected_locked,
+        );
+        Ok(report)
+    }
+
+    pub fn get_reconciliation_report(
+        env: Env,
+        token: Address,
+    ) -> Option<ReconciliationReport> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReconciliationReport(token))
+    }
+
+    pub fn propose_reconciliation_repair(
+        env: Env,
+        token: Address,
+    ) -> Result<ReconciliationRepairPlan, Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+        let report: ReconciliationReport = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReconciliationReport(token.clone()))
+            .ok_or(Error::ReconciliationRequired)?;
+        if !report.complete || !report.unresolved {
+            return Err(Error::ReconciliationRequired);
+        }
+        if report.balance < report.expected_locked + report.expected_staked {
+            return Err(Error::EmergencyAccountingInvariant);
+        }
+
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextReconciliationRepairPlanId)
+            .unwrap_or(1);
+        let plan = ReconciliationRepairPlan {
+            id,
+            token,
+            expected_locked: report.expected_locked,
+            expected_staked: report.expected_staked,
+            observed_balance: report.balance,
+            observed_tracked_locked: report.tracked_locked,
+            observed_tracked_staked: report.tracked_staked,
+            created_at: env.ledger().timestamp(),
+            applied: false,
+            cancelled: false,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReconciliationRepairPlan(id), &plan);
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextReconciliationRepairPlanId, &(id + 1));
+        Self::extend_persistent(&env, &DataKey::ReconciliationRepairPlan(id));
+        Self::extend_persistent(&env, &DataKey::NextReconciliationRepairPlanId);
+        Ok(plan)
+    }
+
+    pub fn get_reconciliation_repair_plan(
+        env: Env,
+        plan_id: u64,
+    ) -> Option<ReconciliationRepairPlan> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReconciliationRepairPlan(plan_id))
+    }
+
     /// Recovery function to sweep unallocated tokens from the contract (admin only).
     /// Unallocated funds = current_balance - (total_locked_in_escrows + total_staked_by_artisans).
     pub fn sweep_unallocated_funds(
@@ -9164,21 +9523,19 @@ impl CraftNexusContract {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 
-        let token_client = token::Client::new(&env, &token);
-        let balance = token_client.balance(&env.current_contract_address());
-
-        let locked: i128 = env
+        if env
             .storage()
             .persistent()
-            .get(&DataKey::TotalLocked(token.clone()))
-            .unwrap_or(0);
-        let staked: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TotalStaked(token.clone()))
-            .unwrap_or(0);
-
-        let unallocated = balance - (locked + staked);
+            .get::<DataKey, ReconciliationReport>(&DataKey::ReconciliationReport(token.clone()))
+            .is_some_and(|report| report.unresolved)
+        {
+            return Err(Error::ReconciliationRequired);
+        }
+        let allocation = Self::fund_allocation(&env, &token);
+        if allocation.unallocated < 0 {
+            return Err(Error::EmergencyAccountingInvariant);
+        }
+        let unallocated = allocation.unallocated;
 
         if unallocated > 0 {
             Self::transfer_tokens_and_record_audit(
