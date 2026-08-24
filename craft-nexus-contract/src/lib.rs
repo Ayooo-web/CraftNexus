@@ -4774,17 +4774,17 @@ impl CraftNexusContract {
         previous_status: EscrowStatus,
         next_status: EscrowStatus,
     ) -> Result<(), Error> {
-        let is_allowed = match (previous_status, next_status) {
+        let is_allowed = matches!(
+            (previous_status, next_status),
             (EscrowStatus::Active, EscrowStatus::DisputePending)
-            | (EscrowStatus::Active, EscrowStatus::ReleasePending)
-            | (EscrowStatus::Active, EscrowStatus::RefundPending) => true,
-            (EscrowStatus::DisputePending, EscrowStatus::Disputed) => true,
-            (EscrowStatus::Disputed, EscrowStatus::SettlementPending) => true,
-            (EscrowStatus::SettlementPending, EscrowStatus::Resolved) => true,
-            (EscrowStatus::ReleasePending, EscrowStatus::Released) => true,
-            (EscrowStatus::RefundPending, EscrowStatus::Refunded) => true,
-            _ => false,
-        };
+                | (EscrowStatus::Active, EscrowStatus::ReleasePending)
+                | (EscrowStatus::Active, EscrowStatus::RefundPending)
+                | (EscrowStatus::DisputePending, EscrowStatus::Disputed)
+                | (EscrowStatus::Disputed, EscrowStatus::SettlementPending)
+                | (EscrowStatus::SettlementPending, EscrowStatus::Resolved)
+                | (EscrowStatus::ReleasePending, EscrowStatus::Released)
+                | (EscrowStatus::RefundPending, EscrowStatus::Refunded)
+        );
 
         if is_allowed {
             Ok(())
