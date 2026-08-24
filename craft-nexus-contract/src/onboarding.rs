@@ -261,6 +261,10 @@ pub enum DataKey {
     PohVerifier,
     /// Count of currently active (non-deactivated) users
     ActiveUserCount,
+    /// Monotonically increasing state version for a user profile — incremented
+    /// on role changes, verification transitions, deactivation, and reactivation
+    /// so downstream contracts can detect stale onboarding state.
+    UserStateVersion(Address),
     /// Global onboard event counter
     GlobalOnboardCount,
     /// Global username-change event counter
@@ -351,6 +355,10 @@ pub struct UserProfile {
     pub portfolio_cid: Option<Bytes>,
     /// Status of the user profile - Issue #113
     pub status: ProfileStatus,
+    /// Monotonically increasing state version — bumped on role changes,
+    /// verification transitions, deactivation, and reactivation so downstream
+    /// contracts can detect stale onboarding state.
+    pub state_version: u32,
 }
 
 /// Flat persistent representation stored under [`DataKey::UserProfile`].
@@ -1936,7 +1944,9 @@ impl OnboardingContract {
         cid_bytes
     }
 
-    fn stored_to_public(stored: StoredUserProfile, portfolio_cid: Option<Bytes>) -> UserProfile {
+    fn stored_to_public(env: &Env, stored: StoredUserProfile, portfolio_cid: Option<Bytes>) -> UserProfile {
+        let state_version = Self::read_persistent(env, &DataKey::UserStateVersion(stored.address.clone()))
+            .unwrap_or(1);
         UserProfile {
             version: stored.version,
             address: stored.address,
@@ -1948,6 +1958,7 @@ impl OnboardingContract {
             disputed_trades: stored.disputed_trades,
             portfolio_cid,
             status: stored.status,
+            state_version,
         }
     }
 
@@ -2013,6 +2024,8 @@ impl OnboardingContract {
             status: profile.status,
         };
         Self::persist_stored_user_profile(env, user, &stored);
+        env.storage().persistent().set(&DataKey::UserStateVersion(user.clone()), &1u32);
+        Self::extend_persistent(env, &DataKey::UserStateVersion(user.clone()));
         (stored, true)
     }
 
@@ -2037,6 +2050,8 @@ impl OnboardingContract {
             status: ProfileStatus::Active,
         };
         Self::persist_stored_user_profile(env, user, &stored);
+        env.storage().persistent().set(&DataKey::UserStateVersion(user.clone()), &1u32);
+        Self::extend_persistent(env, &DataKey::UserStateVersion(user.clone()));
         stored
     }
 
@@ -2081,12 +2096,21 @@ impl OnboardingContract {
     fn try_get_user_profile(env: &Env, user: Address) -> Option<UserProfile> {
         let (stored, _) = Self::try_get_stored_user_profile(env, user.clone())?;
         let portfolio_cid = Self::read_portfolio_cid(env, &user);
-        Some(Self::stored_to_public(stored, portfolio_cid))
+        Some(Self::stored_to_public(env, stored, portfolio_cid))
     }
 
     fn get_user_profile(env: &Env, user: Address) -> UserProfile {
         Self::try_get_user_profile(env, user)
             .unwrap_or_else(|| env.panic_with_error(Error::UserNotFound))
+    }
+
+    fn bump_state_version(env: &Env, user: &Address) -> u32 {
+        let key = DataKey::UserStateVersion(user.clone());
+        let current: u32 = Self::read_persistent(env, &key).unwrap_or(1u32);
+        let next: u32 = current.saturating_add(1);
+        env.storage().persistent().set(&key, &next);
+        Self::extend_persistent(env, &key);
+        next
     }
 
     /// Assert that `user` is onboarded and their profile is currently active.
@@ -2380,6 +2404,7 @@ impl OnboardingContract {
             disputed_trades: 0,
             portfolio_cid: None,
             status: ProfileStatus::Active,
+            state_version: 1,
         };
 
         Self::persist_public_user_profile(&env, &admin, &admin_profile);
@@ -2646,6 +2671,7 @@ impl OnboardingContract {
             disputed_trades: 0,
             portfolio_cid: None,
             status: ProfileStatus::Active,
+            state_version: 1,
         };
 
         Self::persist_public_user_profile(&env, &user, &profile);
@@ -2956,6 +2982,52 @@ impl OnboardingContract {
         }
     }
 
+    /// Return true if the user's profile exists and is currently active.
+    ///
+    /// Returns `false` for unknown addresses or any inactive status
+    /// (Deactivated, UnderReview, Flagged).
+    pub fn is_profile_active(env: Env, user: Address) -> bool {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.status == ProfileStatus::Active
+        } else {
+            false
+        }
+    }
+
+    /// Return the schema version stored on a user's profile.
+    ///
+    /// Returns `0` if the user has no profile.
+    pub fn get_user_profile_version(env: Env, user: Address) -> u32 {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.version
+        } else {
+            0
+        }
+    }
+
+    /// Return the monotonically increasing state version for a user's profile.
+    ///
+    /// Returns `0` if the user has no profile. Missing `UserStateVersion`
+    /// keys default to `1` on read.
+    pub fn get_user_state_version(env: Env, user: Address) -> u32 {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.state_version
+        } else {
+            0
+        }
+    }
+
+    /// Return true if the user has passed verification (manual or auto).
+    ///
+    /// Returns `false` for unknown addresses.
+    pub fn is_user_verified(env: Env, user: Address) -> bool {
+        if let Some(profile) = Self::try_get_user_profile(&env, user) {
+            profile.is_verified
+        } else {
+            false
+        }
+    }
+
     /// Assign or update the moderator role for a user (admin only).
     ///
     /// # Security (#117)
@@ -3056,6 +3128,8 @@ impl OnboardingContract {
             (user.clone(), old_role, new_role),
         );
 
+        Self::bump_state_version(&env, &user);
+
         profile
     }
 
@@ -3135,6 +3209,7 @@ impl OnboardingContract {
         // Update profile state
         profile.status = ProfileStatus::Deactivated;
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
         Self::update_active_user_count(&env, -1);
 
         // Issue #524 — event payload now carries the user's role at
@@ -3212,6 +3287,7 @@ impl OnboardingContract {
 
         profile.status = ProfileStatus::Active;
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
         Self::update_active_user_count(&env, 1);
 
         env.events().publish(
@@ -3276,6 +3352,7 @@ impl OnboardingContract {
 
         // Store updated profile
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
 
         // Emit event
         env.events()
@@ -3735,6 +3812,7 @@ impl OnboardingContract {
         {
             profile.is_verified = true;
             Self::persist_public_user_profile(env, address, &profile);
+            Self::bump_state_version(env, address);
 
             // auto-verification triggered — emit AutoVerifiedEvent (#713)
             env.events().publish(
@@ -3957,6 +4035,7 @@ impl OnboardingContract {
 
         profile.is_verified = approve;
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
 
         Self::clear_verification_request(&env, &user);
 
@@ -4520,6 +4599,7 @@ impl OnboardingContract {
 
         // Store updated profile
         Self::persist_public_user_profile(&env, &user, &profile);
+        Self::bump_state_version(&env, &user);
 
         // Record timestamp of username change
         env.storage().persistent().set(

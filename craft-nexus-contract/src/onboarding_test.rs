@@ -2041,6 +2041,7 @@ fn test_migrate_user_profile_moves_embedded_portfolio_to_separate_key() {
         disputed_trades: 1,
         portfolio_cid: Some(expected.clone()),
         status: ProfileStatus::Active,
+        state_version: 0,
     };
 
     env.as_contract(&client.address, || {
