@@ -6529,3 +6529,289 @@ fn test_blacklisted_arbitrator_cannot_use_partial_resolution_path() {
     let receipt = client.get_settlement_receipt(&1).expect("receipt");
     assert_eq!(receipt.path, SettlementPath::ArbitratedPartial);
 }
+
+// ─── Onboarding State Consistency Tests ──────────────────────────────────────
+//
+// These tests verify that the marketplace correctly enforces canonical onboarding
+// state before any privileged escrow operation, satisfying the acceptance criteria
+// described in issue "Strengthen Onboarding and Verification State Consistency
+// Across Contract Versions".
+
+#[cfg(not(target_family = "wasm"))]
+mod onboarding_state_consistency {
+    use super::*;
+    use crate::onboarding::{OnboardingContract, OnboardingContractClient, UserRole};
+    use soroban_sdk::{token, Address, Env, String};
+
+    /// Build a fully wired two-contract environment: real OnboardingContract +
+    /// CraftNexusContract, with both buyer and seller already onboarded.
+    fn setup_wired(
+        env: &Env,
+    ) -> (
+        CraftNexusContractClient<'static>,
+        OnboardingContractClient<'static>,
+        Address, // buyer
+        Address, // seller
+        Address, // token
+        token::StellarAssetClient<'static>,
+    ) {
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+
+        let onboarding_id = env.register_contract(None, OnboardingContract);
+        let onboarding_client = OnboardingContractClient::new(env, &onboarding_id);
+
+        let escrow_id = env.register_contract(None, CraftNexusContract);
+        let escrow_client = CraftNexusContractClient::new(env, &escrow_id);
+
+        let admin = Address::generate(env);
+        let platform_wallet = Address::generate(env);
+        let arbitrator = Address::generate(env);
+
+        onboarding_client.initialize(&admin);
+        onboarding_client.set_escrow_contract(&escrow_id);
+
+        escrow_client.initialize(
+            &platform_wallet,
+            &admin,
+            &arbitrator,
+            &500,
+            &Some(onboarding_id.clone()),
+        );
+        escrow_client.set_min_release_window(&1);
+        escrow_client.set_evidence_challenge_window(&0);
+
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+
+        onboarding_client.onboard_user(
+            &buyer,
+            &String::from_str(env, "buyer_user"),
+            &UserRole::Buyer,
+        );
+        onboarding_client.onboard_user(
+            &seller,
+            &String::from_str(env, "seller_user"),
+            &UserRole::Artisan,
+        );
+
+        let token_admin = Address::generate(env);
+        let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_admin_client = token::StellarAssetClient::new(env, &token_contract.address());
+
+        (
+            escrow_client,
+            onboarding_client,
+            buyer,
+            seller,
+            token_contract.address(),
+            token_admin_client,
+        )
+    }
+
+    // ── Acceptance criterion 1: active users can create escrow ─────────────
+
+    /// Both buyer and seller are active — escrow creation must succeed.
+    #[test]
+    fn test_onboarding_state_valid_users_create_escrow_succeeds() {
+        let env = Env::default();
+        let (escrow, _, buyer, seller, token_id, token_admin) = setup_wired(&env);
+        token_admin.mint(&buyer, &100_000_000);
+
+        let result = escrow.try_create_escrow(
+            &buyer,
+            &seller,
+            &token_id,
+            &10_000i128,
+            &1u32,
+            &Some(3600u32),
+        );
+        assert!(result.is_ok(), "active users should be allowed to create escrow");
+    }
+
+    // ── Acceptance criterion 2: deactivated profile blocks escrow creation ─
+
+    /// Deactivating the seller immediately prevents new escrow creation.
+    #[test]
+    fn test_onboarding_state_deactivated_seller_blocks_create_escrow() {
+        let env = Env::default();
+        let (escrow, onboarding, buyer, seller, token_id, token_admin) = setup_wired(&env);
+        token_admin.mint(&buyer, &100_000_000);
+
+        // Deactivate the seller before attempting escrow creation.
+        onboarding.deactivate_profile(&seller);
+
+        let result = escrow.try_create_escrow(
+            &buyer,
+            &seller,
+            &token_id,
+            &10_000i128,
+            &1u32,
+            &Some(3600u32),
+        );
+        assert_panic_contract_error(result, Error::OnboardingProfileInactive);
+    }
+
+    /// Deactivating the buyer immediately prevents new escrow creation.
+    #[test]
+    fn test_onboarding_state_deactivated_buyer_blocks_create_escrow() {
+        let env = Env::default();
+        let (escrow, onboarding, buyer, seller, token_id, token_admin) = setup_wired(&env);
+        token_admin.mint(&buyer, &100_000_000);
+
+        onboarding.deactivate_profile(&buyer);
+
+        let result = escrow.try_create_escrow(
+            &buyer,
+            &seller,
+            &token_id,
+            &10_000i128,
+            &1u32,
+            &Some(3600u32),
+        );
+        assert_panic_contract_error(result, Error::OnboardingProfileInactive);
+    }
+
+    // ── Acceptance criterion 3: missing profile (state_version == 0) ───────
+
+    /// A user that never onboarded has state_version == 0 — escrow creation
+    /// must be rejected with OnboardingProfileNotFound.
+    #[test]
+    fn test_onboarding_state_no_profile_buyer_blocks_create_escrow() {
+        let env = Env::default();
+        let (escrow, _, _buyer, seller, token_id, token_admin) = setup_wired(&env);
+
+        // Fabricate a completely new address that has never been onboarded.
+        let unknown_buyer = Address::generate(&env);
+        token_admin.mint(&unknown_buyer, &100_000_000);
+
+        let result = escrow.try_create_escrow(
+            &unknown_buyer,
+            &seller,
+            &token_id,
+            &10_000i128,
+            &1u32,
+            &Some(3600u32),
+        );
+        assert_panic_contract_error(result, Error::OnboardingProfileNotFound);
+    }
+
+    /// Same for seller: an un-onboarded seller must be rejected.
+    #[test]
+    fn test_onboarding_state_no_profile_seller_blocks_create_escrow() {
+        let env = Env::default();
+        let (escrow, _, buyer, _seller, token_id, token_admin) = setup_wired(&env);
+        token_admin.mint(&buyer, &100_000_000);
+
+        let unknown_seller = Address::generate(&env);
+
+        let result = escrow.try_create_escrow(
+            &buyer,
+            &unknown_seller,
+            &token_id,
+            &10_000i128,
+            &1u32,
+            &Some(3600u32),
+        );
+        assert_panic_contract_error(result, Error::OnboardingProfileNotFound);
+    }
+
+    // ── Acceptance criterion 4: no-op when no onboarding contract configured
+
+    /// When the escrow contract is initialized without an onboarding contract
+    /// address, validate_onboarding_state must be a complete no-op and escrow
+    /// creation must succeed for any caller.
+    #[test]
+    fn test_onboarding_state_no_contract_configured_is_noop() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+
+        let escrow_id = env.register_contract(None, CraftNexusContract);
+        let escrow = CraftNexusContractClient::new(&env, &escrow_id);
+
+        let admin = Address::generate(&env);
+        let platform_wallet = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        // Initialize WITHOUT an onboarding contract.
+        escrow.initialize(&platform_wallet, &admin, &arbitrator, &500, &None);
+        escrow.set_min_release_window(&1);
+        escrow.set_evidence_challenge_window(&0);
+
+        let token_admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_contract.address());
+        token_admin_client.mint(&buyer, &100_000_000);
+
+        // Neither buyer nor seller is onboarded — but there is no onboarding
+        // contract, so the check must pass transparently.
+        let result = escrow.try_create_escrow(
+            &buyer,
+            &seller,
+            &token_contract.address(),
+            &10_000i128,
+            &1u32,
+            &Some(3600u32),
+        );
+        assert!(
+            result.is_ok(),
+            "create_escrow must succeed when no onboarding contract is configured"
+        );
+    }
+
+    // ── Acceptance criterion 5: reactivated profile can create escrow again ─
+
+    /// After deactivation, a reactivated profile must be allowed to create
+    /// escrows again without any stale-state rejection.
+    #[test]
+    fn test_onboarding_state_reactivated_profile_can_create_escrow() {
+        let env = Env::default();
+        let (escrow, onboarding, buyer, seller, token_id, token_admin) = setup_wired(&env);
+        token_admin.mint(&buyer, &100_000_000);
+
+        // Deactivate seller then reactivate.
+        onboarding.deactivate_profile(&seller);
+        onboarding.reactivate_profile(&seller);
+
+        let result = escrow.try_create_escrow(
+            &buyer,
+            &seller,
+            &token_id,
+            &10_000i128,
+            &1u32,
+            &Some(3600u32),
+        );
+        assert!(
+            result.is_ok(),
+            "reactivated seller should be permitted to participate in escrow"
+        );
+    }
+
+    // ── Acceptance criterion 6: create_unfunded_escrow also checks state ────
+
+    /// validate_onboarding_state is also invoked by create_unfunded_escrow.
+    /// A deactivated seller must be rejected on that path too.
+    #[test]
+    fn test_onboarding_state_deactivated_blocks_unfunded_escrow() {
+        let env = Env::default();
+        let (escrow, onboarding, buyer, seller, token_id, _token_admin) = setup_wired(&env);
+
+        onboarding.deactivate_profile(&seller);
+
+        let result = escrow.try_create_unfunded_escrow(
+            &1u32,
+            &buyer,
+            &seller,
+            &token_id,
+            &10_000i128,
+            &3600u32,
+            &None,
+            &None,
+            &None,
+        );
+        assert_panic_contract_error(result, Error::OnboardingProfileInactive);
+    }
+}

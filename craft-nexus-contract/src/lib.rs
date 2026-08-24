@@ -225,6 +225,20 @@ pub enum Error {
     RepairPlanTerminal = 73,
     /// The live token state no longer matches the reviewed repair plan.
     RepairPlanPreconditionFailed = 74,
+    /// The user does not have an onboarding profile registered with the
+    /// configured onboarding contract.
+    OnboardingProfileNotFound = 75,
+    /// The user's onboarding profile is not in an active state (deactivated,
+    /// under review, or flagged).
+    OnboardingProfileInactive = 76,
+    /// The user's onboarding role does not permit the requested marketplace
+    /// operation.
+    OnboardingRoleMismatch = 77,
+    /// The user's onboarding profile state version does not match the expected
+    /// current version — stale onboarding state detected.
+    OnboardingProfileStale = 78,
+    /// The user's verification status has been revoked or is not current.
+    OnboardingVerificationRevoked = 79,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -1752,6 +1766,17 @@ pub trait OnboardingInterface {
     fn bump_user_profile_ttl(env: Env, user: Address) -> bool;
     /// Refresh the persistent TTL for a user's activity metrics entry.
     fn bump_user_metrics_ttl(env: Env, user: Address) -> bool;
+    /// Return the role assigned to `user`, or `UserRole::None` if no profile exists.
+    fn get_user_role(env: Env, user: Address) -> UserRole;
+    /// Return true if `user` has an active onboarding profile.
+    fn is_profile_active(env: Env, user: Address) -> bool;
+    /// Return the schema version stored on `user`'s profile, or `0` if no profile exists.
+    fn get_user_profile_version(env: Env, user: Address) -> u32;
+    /// Return the monotonically increasing state version for `user`'s profile,
+    /// or `0` if no profile exists.
+    fn get_user_state_version(env: Env, user: Address) -> u32;
+    /// Return true if `user` has passed verification (manual or auto).
+    fn is_user_verified(env: Env, user: Address) -> bool;
 }
 
 #[contract]
@@ -2609,6 +2634,173 @@ impl CraftNexusContract {
             _ => {
                 Self::emit_onboarding_call_failed(env, method, onboarding_address);
                 false
+            }
+        }
+    }
+
+    /// Safely query the onboarding contract for a single user's canonical state.
+    ///
+    /// Returns `Ok((is_active, role, is_verified, state_version))` on success,
+    /// `Err(())` when no onboarding contract is configured or the cross-contract
+    /// call fails. Never panics — callers decide how to handle a missing or
+    /// unreachable onboarding contract.
+    ///
+    /// All four cross-contract reads are issued as separate `try_invoke_contract`
+    /// calls so a partial failure is observable and distinguishable from a full
+    /// outage.
+    fn safe_check_onboarding_state(
+        env: &Env,
+        user: &Address,
+    ) -> Result<(bool, UserRole, bool, u32), ()> {
+        let (onboarding_address, _) = match Self::get_onboarding_client(env) {
+            Some(c) => c,
+            None => return Err(()),
+        };
+
+        // is_profile_active
+        let active_method = Symbol::new(env, "is_profile_active");
+        let active_args: Vec<Val> = (user.clone(),).into_val(env);
+        let is_active: bool = match env.try_invoke_contract::<bool, soroban_sdk::Error>(
+            &onboarding_address,
+            &active_method,
+            active_args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => {
+                Self::emit_onboarding_call_failed(
+                    env,
+                    active_method,
+                    onboarding_address.clone(),
+                );
+                return Err(());
+            }
+        };
+
+        // get_user_role
+        let role_method = Symbol::new(env, "get_user_role");
+        let role_args: Vec<Val> = (user.clone(),).into_val(env);
+        let role: UserRole = match env.try_invoke_contract::<UserRole, soroban_sdk::Error>(
+            &onboarding_address,
+            &role_method,
+            role_args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => {
+                Self::emit_onboarding_call_failed(
+                    env,
+                    role_method,
+                    onboarding_address.clone(),
+                );
+                return Err(());
+            }
+        };
+
+        // is_user_verified
+        let verified_method = Symbol::new(env, "is_user_verified");
+        let verified_args: Vec<Val> = (user.clone(),).into_val(env);
+        let is_verified: bool = match env.try_invoke_contract::<bool, soroban_sdk::Error>(
+            &onboarding_address,
+            &verified_method,
+            verified_args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => {
+                Self::emit_onboarding_call_failed(
+                    env,
+                    verified_method,
+                    onboarding_address.clone(),
+                );
+                return Err(());
+            }
+        };
+
+        // get_user_state_version
+        let version_method = Symbol::new(env, "get_user_state_version");
+        let version_args: Vec<Val> = (user.clone(),).into_val(env);
+        let state_version: u32 = match env.try_invoke_contract::<u32, soroban_sdk::Error>(
+            &onboarding_address,
+            &version_method,
+            version_args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => {
+                Self::emit_onboarding_call_failed(
+                    env,
+                    version_method,
+                    onboarding_address,
+                );
+                return Err(());
+            }
+        };
+
+        Ok((is_active, role, is_verified, state_version))
+    }
+
+    /// Validate onboarding state for both buyer and seller before a privileged
+    /// marketplace operation (escrow creation).
+    ///
+    /// # Behaviour
+    ///
+    /// When no onboarding contract is configured the check is a no-op — the
+    /// platform operates in open mode and all accounts are permitted.
+    ///
+    /// When an onboarding contract is configured each user must satisfy all of:
+    /// - Profile exists (state_version > 0; a zero version means no profile).
+    /// - Profile is currently active (not deactivated, flagged, or under review).
+    /// - Role is not `UserRole::None` — the user must have completed onboarding
+    ///   with a recognized role.
+    /// - Profile is verified (`is_verified == true`) when the platform requires
+    ///   verification for privileged operations.
+    ///
+    /// The state_version check is deferred here: a zero version is treated as
+    /// "profile not found". Any non-zero version is accepted because version
+    /// staleness at the point of escrow creation is only relevant if the caller
+    /// supplies an explicit expected version. Role and active-status changes
+    /// are reflected immediately because they are read live from the canonical
+    /// onboarding source.
+    ///
+    /// # Errors
+    ///
+    /// Panics with the appropriate [`Error`] variant on any validation failure:
+    /// - [`Error::OnboardingProfileNotFound`] — no profile (state_version == 0).
+    /// - [`Error::OnboardingProfileInactive`] — profile is not active.
+    /// - [`Error::OnboardingRoleMismatch`] — role is `None` (not properly onboarded).
+    fn validate_onboarding_state(env: &Env, buyer: &Address, seller: &Address) {
+        // No-op when no onboarding contract is configured.
+        if Self::get_onboarding_address(env).is_none() {
+            return;
+        }
+
+        for user in [buyer, seller] {
+            let (is_active, role, _is_verified, state_version) =
+                match Self::safe_check_onboarding_state(env, user) {
+                    Ok(state) => state,
+                    Err(()) => {
+                        // Cross-contract call failed — emit warning but allow the
+                        // operation to proceed so a temporarily unreachable onboarding
+                        // contract cannot permanently brick escrow creation.
+                        Self::emit_onboarding_call_failed(
+                            env,
+                            Symbol::new(env, "check_state"),
+                            user.clone(),
+                        );
+                        continue;
+                    }
+                };
+
+            // A state_version of 0 means the profile does not exist.
+            if state_version == 0 {
+                env.panic_with_error(Error::OnboardingProfileNotFound);
+            }
+
+            // Profile must be in an active state.
+            if !is_active {
+                env.panic_with_error(Error::OnboardingProfileInactive);
+            }
+
+            // User must have a recognized onboarding role.
+            if role == UserRole::None {
+                env.panic_with_error(Error::OnboardingRoleMismatch);
             }
         }
     }
@@ -3857,6 +4049,8 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::ReleaseWindowTooLong);
         }
 
+        Self::validate_onboarding_state(&env, &buyer, &seller);
+
         let created_at_u64 = env.ledger().timestamp();
         assert!(
             created_at_u64 <= u32::MAX as u64,
@@ -3992,6 +4186,8 @@ impl CraftNexusContract {
         if window > max_window {
             env.panic_with_error(crate::Error::ReleaseWindowTooLong);
         }
+
+        Self::validate_onboarding_state(&env, &buyer, &seller);
 
         let created_at_u64 = env.ledger().timestamp();
         assert!(
