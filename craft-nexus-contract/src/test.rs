@@ -419,6 +419,26 @@ fn test_pending_release_or_refund_blocks_dispute_race() {
 }
 
 #[test]
+fn test_escrow_state_diagnostic_flags_pending_orphans() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &50_000_000, &1, &None);
+
+    env.as_contract(&client.address, || {
+        let mut escrow: Escrow = env.storage().persistent().get(&(ESCROW, 1u32)).unwrap();
+        escrow.status = EscrowStatus::ReleasePending;
+        env.storage().persistent().set(&(ESCROW, 1u32), &escrow);
+    });
+
+    let diagnostic = client.diagnose_escrow_state(&1);
+    assert!(!diagnostic.is_consistent);
+    assert_eq!(diagnostic.issue, EscrowStateIssue::PendingTransitionUnfinished);
+}
+
+#[test]
 fn test_resolve_dispute_release_to_seller() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2123,17 +2143,17 @@ fn test_upgrade_manifest_is_recorded_and_consumed() {
         authorization_commitment: nonzero.clone(),
         preconditions_commitment: nonzero.clone(),
         postconditions_commitment: nonzero.clone(),
-        rollback_limitations_commitment: nonzero.clone(),
+        rollback_commitment: nonzero.clone(),
         migration_checkpoint: nonzero,
         migration_complete: true,
         manual_records: 0,
     };
 
     client.propose_upgrade_wasm(&admin, &wasm_hash);
-    client.submit_upgrade_compatibility_manifest(&wasm_hash, &manifest);
+    client.submit_compat_manifest(&wasm_hash, &manifest);
     assert_eq!(
         client
-            .get_upgrade_compatibility_manifest(&wasm_hash)
+            .get_upgrade_compat_manifest(&wasm_hash)
             .unwrap(),
         manifest
     );
@@ -2144,14 +2164,14 @@ fn test_upgrade_manifest_is_recorded_and_consumed() {
     client.execute_upgrade(&wasm_hash);
 
     let record = client
-        .get_upgrade_compatibility_history()
+        .get_upgrade_compat_history()
         .last()
         .unwrap();
     assert_eq!(record.from_version, 1);
     assert_eq!(record.to_version, 2);
     assert_eq!(record.state_commitment, commitment);
     assert!(client
-        .get_upgrade_compatibility_manifest(&wasm_hash)
+        .get_upgrade_compat_manifest(&wasm_hash)
         .is_none());
 }
 
