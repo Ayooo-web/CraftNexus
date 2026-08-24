@@ -5,8 +5,8 @@
 static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
-    BytesN, Env, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr,
+    Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
 };
 extern crate alloc;
 
@@ -172,59 +172,59 @@ pub enum Error {
     /// The migration report contains records that require manual handling
     UpgradeMigrationIncomplete = 47,
     /// Persisted storage is on a legacy layout that must be migrated first.
-    StorageLayoutMismatch = 45,
+    StorageLayoutMismatch = 48,
     /// Admin action is in a terminal state (executed or cancelled)
-    AdminActionTerminal = 46,
+    AdminActionTerminal = 49,
     /// Admin action does not yet have enough approvals
-    AdminActionNeedsApprovals = 47,
+    AdminActionNeedsApprovals = 50,
     /// Admin action timelock is still active
-    AdminActionTimelockActive = 48,
+    AdminActionTimelockActive = 51,
     /// Caller is not an authorized admin action signer
-    NotAnAdminActionSigner = 49,
+    NotAnAdminActionSigner = 52,
     /// Evidence retention window has expired or is invalid (#927)
-    EvidenceExpired = 50,
+    EvidenceExpired = 53,
     /// Evidence payload has already been used in a previous dispute (#927)
-    EvidenceAlreadyUsed = 51,
+    EvidenceAlreadyUsed = 54,
     /// Invalid dispute session for evidence submission (#927)
-    InvalidDisputeSession = 52,
+    InvalidDisputeSession = 55,
     /// Contract does not implement the supported token interface.
-    UnsupportedToken = 53,
+    UnsupportedToken = 56,
     /// The requested continuation size is outside the scheduler bound.
-    InvalidBatchWorkLimit = 54,
+    InvalidBatchWorkLimit = 57,
     /// The scheduled batch was cancelled.
-    BatchJobCancelled = 55,
+    BatchJobCancelled = 58,
     /// The requested scheduled batch does not exist.
-    BatchJobNotFound = 56,
+    BatchJobNotFound = 59,
     /// The caller is not the account that scheduled the batch.
-    BatchJobUnauthorized = 57,
+    BatchJobUnauthorized = 60,
     /// The scheduled batch has already reached a terminal state.
-    BatchJobCompleted = 58,
+    BatchJobCompleted = 61,
     /// Platform wallet cannot be the contract address.
-    InvalidPlatformWallet = 59,
+    InvalidPlatformWallet = 62,
     /// Provided service-agreement hash is invalid
-    InvalidServiceAgreementHash = 60,
+    InvalidServiceAgreementHash = 63,
     /// Evidence challenge window has not elapsed; arbitrator resolution is blocked.
-    ChallengeWindowActive = 61,
+    ChallengeWindowActive = 64,
     /// The arbitrator address is blacklisted.
-    ArbitratorBlacklisted = 62,
+    ArbitratorBlacklisted = 65,
     /// Dispute action is not valid in the current session (duplicate escalate, bad parent evidence).
-    InvalidDisputeAction = 63,
+    InvalidDisputeAction = 66,
     /// Dispute escalation window has not elapsed.
-    EscalationWindowActive = 64,
+    EscalationWindowActive = 67,
     /// Arbitrator resolution deadline (`max_dispute_duration`) has elapsed.
-    ArbitratorDeadlineExceeded = 65,
+    ArbitratorDeadlineExceeded = 68,
     /// This escrow was already settled; a second settlement path cannot run.
-    SettlementAlreadyFinalized = 66,
+    SettlementAlreadyFinalized = 69,
     /// Tracked obligations exceed the token balance held by the contract.
-    EmergencyAccountingInvariant = 67,
+    EmergencyAccountingInvariant = 70,
     /// A reconciliation report has unresolved customer or collateral liabilities.
-    ReconciliationRequired = 68,
+    ReconciliationRequired = 71,
     /// The requested reconciliation repair plan does not exist.
-    RepairPlanNotFound = 69,
+    RepairPlanNotFound = 72,
     /// The reconciliation repair plan has already reached a terminal state.
-    RepairPlanTerminal = 70,
+    RepairPlanTerminal = 73,
     /// The live token state no longer matches the reviewed repair plan.
-    RepairPlanPreconditionFailed = 71,
+    RepairPlanPreconditionFailed = 74,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -707,6 +707,29 @@ pub enum EscrowStatus {
     DisputePending = 7,
     /// In-flight exclusive claim while a dispute settlement path executes.
     SettlementPending = 8,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+#[repr(u32)]
+pub enum EscrowStateIssue {
+    None = 0,
+    EscrowNotFound = 1,
+    PendingTransitionUnfinished = 2,
+    MissingDisputeTimestamp = 3,
+    InvalidTerminalState = 4,
+    SettlementReceiptConflict = 5,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct EscrowStateDiagnostic {
+    pub order_id: u32,
+    pub status: EscrowStatus,
+    pub is_consistent: bool,
+    pub issue: EscrowStateIssue,
 }
 
 /// Choice of resolution for a disputed escrow.
@@ -1306,7 +1329,7 @@ pub struct UpgradeCompatibilityManifest {
     pub authorization_commitment: BytesN<32>,
     pub preconditions_commitment: BytesN<32>,
     pub postconditions_commitment: BytesN<32>,
-    pub rollback_limitations_commitment: BytesN<32>,
+    pub rollback_commitment: BytesN<32>,
     pub migration_checkpoint: BytesN<32>,
     pub migration_complete: bool,
     pub manual_records: u32,
@@ -1324,6 +1347,8 @@ pub struct UpgradeStateSnapshot {
     pub upgrade_threshold: u32,
     pub paused: bool,
     pub onboarding_configured: bool,
+}
+
 /// Immutable per-round state for the multi-sig upgrade approval flow.
 ///
 /// Written once on the **first** approval call for a given proposal nonce and
@@ -4549,21 +4574,88 @@ impl CraftNexusContract {
         upgraded
     }
 
+    fn assert_valid_transition(
+        previous_status: EscrowStatus,
+        next_status: EscrowStatus,
+    ) -> Result<(), Error> {
+        let is_allowed = match (previous_status, next_status) {
+            (EscrowStatus::Active, EscrowStatus::DisputePending)
+            | (EscrowStatus::Active, EscrowStatus::ReleasePending)
+            | (EscrowStatus::Active, EscrowStatus::RefundPending) => true,
+            (EscrowStatus::DisputePending, EscrowStatus::Disputed) => true,
+            (EscrowStatus::Disputed, EscrowStatus::SettlementPending) => true,
+            (EscrowStatus::SettlementPending, EscrowStatus::Resolved) => true,
+            (EscrowStatus::ReleasePending, EscrowStatus::Released) => true,
+            (EscrowStatus::RefundPending, EscrowStatus::Refunded) => true,
+            _ => false,
+        };
+
+        if is_allowed {
+            Ok(())
+        } else {
+            Err(Error::InvalidEscrowState)
+        }
+    }
+
     fn claim_active_escrow_transition(
         env: &Env,
         order_id: u32,
         pending_status: EscrowStatus,
     ) -> Result<Escrow, Error> {
         let mut escrow = Self::get_stored_escrow(env, order_id);
-        if escrow.status != EscrowStatus::Active {
-            return Err(Error::InvalidEscrowState);
-        }
+        Self::assert_valid_transition(escrow.status, pending_status)?;
 
         escrow.status = pending_status;
         let key = (ESCROW, order_id);
         env.storage().persistent().set(&key, &escrow);
         Self::extend_persistent(env, &key);
         Ok(escrow)
+    }
+
+    fn inspect_escrow_state(env: &Env, order_id: u32) -> EscrowStateDiagnostic {
+        let key = (ESCROW, order_id);
+        let escrow_opt = env.storage().persistent().get::<(Symbol, u32), Escrow>(&key);
+        if escrow_opt.is_none() {
+            return EscrowStateDiagnostic {
+                order_id,
+                status: EscrowStatus::Active,
+                is_consistent: false,
+                issue: EscrowStateIssue::EscrowNotFound,
+            };
+        }
+
+        let escrow = escrow_opt.unwrap();
+        let pending_incomplete = matches!(
+            escrow.status,
+            EscrowStatus::ReleasePending
+                | EscrowStatus::RefundPending
+                | EscrowStatus::DisputePending
+                | EscrowStatus::SettlementPending
+        );
+        let missing_dispute_timestamp = escrow.status == EscrowStatus::Disputed
+            && escrow.dispute_initiated_at.is_none();
+        let terminal_without_receipt = matches!(
+            escrow.status,
+            EscrowStatus::Released | EscrowStatus::Refunded | EscrowStatus::Resolved
+        ) && !Self::has_settlement_receipt(env, order_id)
+            && escrow.status == EscrowStatus::Resolved;
+
+        let issue = if pending_incomplete {
+            EscrowStateIssue::PendingTransitionUnfinished
+        } else if missing_dispute_timestamp {
+            EscrowStateIssue::MissingDisputeTimestamp
+        } else if terminal_without_receipt {
+            EscrowStateIssue::SettlementReceiptConflict
+        } else {
+            EscrowStateIssue::None
+        };
+
+        EscrowStateDiagnostic {
+            order_id,
+            status: escrow.status,
+            is_consistent: matches!(issue, EscrowStateIssue::None),
+            issue,
+        }
     }
 
     fn upgrade_escrow(env: &Env, order_id: u32, mut escrow: Escrow) -> Escrow {
@@ -5863,7 +5955,8 @@ impl CraftNexusContract {
     /// `UpgradeCompatibilityManifest::state_commitment`.
     pub fn get_upgrade_state_commitment(env: Env) -> BytesN<32> {
         let snapshot = Self::get_upgrade_state_snapshot(env.clone());
-        env.crypto().sha256(&env.serialize(&snapshot))
+        let snapshot_bytes = snapshot.to_xdr(&env);
+        env.crypto().sha256(&snapshot_bytes).into()
     }
 
     fn is_zero_commitment(env: &Env, commitment: &BytesN<32>) -> bool {
@@ -5882,7 +5975,7 @@ impl CraftNexusContract {
             || Self::is_zero_commitment(env, &manifest.authorization_commitment)
             || Self::is_zero_commitment(env, &manifest.preconditions_commitment)
             || Self::is_zero_commitment(env, &manifest.postconditions_commitment)
-            || Self::is_zero_commitment(env, &manifest.rollback_limitations_commitment)
+            || Self::is_zero_commitment(env, &manifest.rollback_commitment)
             || Self::is_zero_commitment(env, &manifest.migration_checkpoint)
         {
             return Err(Error::UpgradeCompatibilityInvalid);
@@ -5902,7 +5995,7 @@ impl CraftNexusContract {
     /// The manifest is resumable off-chain: a later submission replaces the
     /// same hash's report, while execution accepts only a complete report with
     /// no records requiring manual intervention.
-    pub fn submit_upgrade_compatibility_manifest(
+    pub fn submit_compat_manifest(
         env: Env,
         wasm_hash: BytesN<32>,
         manifest: UpgradeCompatibilityManifest,
@@ -5925,13 +6018,15 @@ impl CraftNexusContract {
     }
 
     /// Read the compatibility evidence associated with a proposed WASM hash.
-    pub fn get_upgrade_compatibility_manifest(
+    pub fn get_upgrade_compat_manifest(
         env: Env,
         wasm_hash: BytesN<32>,
     ) -> Option<UpgradeCompatibilityManifest> {
         env.storage()
             .persistent()
             .get(&DataKey::UpgradeCompatibilityManifest(wasm_hash))
+    }
+
     /// Return the persisted storage layout version.
     pub fn get_storage_layout_version(env: Env) -> u32 {
         env.storage()
@@ -6214,7 +6309,7 @@ impl CraftNexusContract {
     }
 
     /// Returns compatibility evidence for completed upgrades.
-    pub fn get_upgrade_compatibility_history(env: Env) -> Vec<UpgradeCompatibilityRecord> {
+    pub fn get_upgrade_compat_history(env: Env) -> Vec<UpgradeCompatibilityRecord> {
         env.storage()
             .persistent()
             .get(&DataKey::UpgradeCompatibilityHistory)
@@ -6326,6 +6421,15 @@ impl CraftNexusContract {
     /// * `order_id` - Order identifier
     pub fn get_escrow(env: Env, order_id: u32) -> Escrow {
         Self::get_stored_escrow(&env, order_id)
+    }
+
+    /// Diagnose the escrow lifecycle for partial-state or orphaned transition issues.
+    ///
+    /// This is a read-only guard rail for off-chain monitoring and admin recovery.
+    /// It reports whether a status transition is incomplete, or whether a disputed
+    /// escrow has lost the timestamp required to enforce challenge/expiry windows.
+    pub fn diagnose_escrow_state(env: Env, order_id: u32) -> EscrowStateDiagnostic {
+        Self::inspect_escrow_state(&env, order_id)
     }
 
     /// Read the immutable fund-movement audit history for an account.
