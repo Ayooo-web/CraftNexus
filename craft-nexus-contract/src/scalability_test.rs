@@ -869,6 +869,72 @@ fn test_artisan_stake_queue_migration() {
 }
 
 #[test]
+fn test_legacy_artisan_stake_migration_converts_old_format() {
+    let (env, client, _buyer, artisan, token, _admin, _, _) = setup_test();
+
+    // Simulate legacy storage: old ArtisanStake stored i128 amount,
+    // and ArtisanStakeToken stored the token Address.
+    let stake_key = DataKey::ArtisanStake(artisan.clone());
+    let token_key = DataKey::ArtisanStakeToken(artisan.clone());
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(&stake_key, &7_500_000i128);
+        env.storage()
+            .persistent()
+            .set(&token_key, &token);
+    });
+
+    // Verify legacy storage exists
+    let has_legacy_amount = env.as_contract(&client.address, || {
+        env.storage().persistent().has(&stake_key)
+    });
+    assert!(has_legacy_amount);
+
+    // Run migration via read path (lazy migration)
+    let migrated_amount = client.get_stake(&artisan);
+    assert_eq!(migrated_amount, 7_500_000);
+
+    // Verify new format is stored
+    let stake_data = client.get_artisan_stake_data(&artisan);
+    assert!(stake_data.is_some());
+    let data = stake_data.unwrap();
+    assert_eq!(data.amount, 7_500_000);
+    assert_eq!(data.token, token);
+
+    // Verify legacy token key was removed
+    let has_legacy_token = env.as_contract(&client.address, || {
+        env.storage().persistent().has(&token_key)
+    });
+    assert!(!has_legacy_token);
+}
+
+#[test]
+fn test_legacy_artisan_stake_migration_is_idempotent() {
+    let (env, client, _buyer, artisan, token, _admin, _, _) = setup_test();
+
+    // Set up new-format stake data directly
+    let stake_key = DataKey::ArtisanStake(artisan.clone());
+    let new_stake = crate::ArtisanStakeData {
+        amount: 5_000_000,
+        token: token.clone(),
+    };
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(&stake_key, &new_stake);
+    });
+
+    // Migration should be a no-op on already-migrated data
+    let migrated = client.migrate_legacy_artisan_stake(&artisan);
+    assert_eq!(migrated, 0);
+
+    // Data should be unchanged
+    let stake_data = client.get_artisan_stake_data(&artisan);
+    assert!(stake_data.is_some());
+    let data = stake_data.unwrap();
+    assert_eq!(data.amount, 5_000_000);
+    assert_eq!(data.token, token);
+}
+
+#[test]
 fn test_artisan_stake_queue_max_capacity() {
     let (env, client, _buyer, artisan, token, _admin, _, _) = setup_test();
 
