@@ -32,12 +32,17 @@ mod time_boundary_test;
 #[cfg(test)]
 mod test;
 #[cfg(test)]
+mod pagination_boundary_test;
+#[cfg(test)]
 mod prop_test;
 
 // Onboarding is a separate logical contract; only one `#[contract]` may be linked per WASM
 // artifact. Keep it in this crate for host tests (`cargo test`) but omit from guest builds.
 #[cfg(not(target_family = "wasm"))]
 pub mod onboarding;
+
+/// Centralized pagination input validation (Issue #1022).
+pub mod pagination_validation;
 
 /// Error codes grouped by category for off-chain triage.
 ///
@@ -206,6 +211,10 @@ pub enum Error {
     BatchJobUnauthorized = 60,
     /// The scheduled batch has already reached a terminal state.
     BatchJobCompleted = 61,
+    /// Pagination limit is zero; caller must request at least one item (#1022).
+    PaginationLimitZero = 80,
+    /// Pagination cursor is invalid (past end of dataset or empty dataset) (#1022).
+    PaginationCursorInvalid = 81,
     /// Platform wallet cannot be the contract address.
     InvalidPlatformWallet = 62,
     /// Provided service-agreement hash is invalid
@@ -3183,9 +3192,18 @@ impl CraftNexusContract {
         artisan: Address,
         offset: u32,
         limit: u32,
-    ) -> soroban_sdk::Vec<StakeDeposit> {
+    ) -> Result<soroban_sdk::Vec<StakeDeposit>, Error> {
+        let limit = pagination_validation::validate_limit(
+            limit,
+            pagination_validation::MAX_ADMIN_PAGE_SIZE,
+        )?;
         let count_key = DataKey::ArtisanStakeQueueCount(artisan.clone());
         let total_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        // Return empty if offset is past the end
+        if offset >= total_count {
+            return Ok(soroban_sdk::Vec::new(&env));
+        }
 
         let mut deposits = soroban_sdk::Vec::new(&env);
         let end = core::cmp::min(offset + limit, total_count);
@@ -3201,7 +3219,7 @@ impl CraftNexusContract {
             }
         }
 
-        deposits
+        Ok(deposits)
     }
 
     pub fn initialize(
@@ -4463,10 +4481,8 @@ impl CraftNexusContract {
         buyer.require_auth();
         let mut result = soroban_sdk::Vec::new(&env);
 
-        let page_size = page_size.min(MAX_PAGE_SIZE);
-        if page_size == 0 {
-            return Ok(result);
-        }
+        let page_size =
+            pagination_validation::validate_limit(page_size, pagination_validation::MAX_PAGE_SIZE)?;
 
         // Try new indexed storage first
         let count_key = DataKey::BuyerEscrowCount(buyer.clone());
@@ -4541,10 +4557,8 @@ impl CraftNexusContract {
         seller.require_auth();
         let mut result = soroban_sdk::Vec::new(&env);
 
-        let page_size = page_size.min(MAX_PAGE_SIZE);
-        if page_size == 0 {
-            return Ok(result);
-        }
+        let page_size =
+            pagination_validation::validate_limit(page_size, pagination_validation::MAX_PAGE_SIZE)?;
 
         // Try new indexed storage first
         let count_key = DataKey::SellerEscrowCount(seller.clone());
@@ -6677,15 +6691,20 @@ impl CraftNexusContract {
         actor: Address,
         start_index: u32,
         limit: u32,
-    ) -> Vec<FundMovementAuditEntry> {
+    ) -> Result<Vec<FundMovementAuditEntry>, Error> {
+        let limit = pagination_validation::validate_limit(
+            limit,
+            pagination_validation::MAX_ADMIN_PAGE_SIZE,
+        )?;
         let count_key = DataKey::FundAuditCount(actor.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        let mut history = Vec::new(&env);
 
-        if start_index >= count || limit == 0 {
-            return history;
+        // Return empty if start_index is past the end
+        if start_index >= count {
+            return Ok(Vec::new(&env));
         }
 
+        let mut history = Vec::new(&env);
         let end_index = start_index.saturating_add(limit).min(count);
         for index in start_index..end_index {
             let entry_key = DataKey::FundAuditIndexed(actor.clone(), index);
@@ -6698,7 +6717,7 @@ impl CraftNexusContract {
             }
         }
 
-        history
+        Ok(history)
     }
 
     /// Get escrow metadata fields only.
@@ -8242,9 +8261,10 @@ impl CraftNexusContract {
         owner: Address,
         work_limit: u32,
     ) -> Result<BatchJobProgress, Error> {
-        if work_limit == 0 || work_limit > MAX_SCHEDULED_BATCH_WORK {
-            return Err(Error::InvalidBatchWorkLimit);
-        }
+        pagination_validation::validate_strict_limit(
+            work_limit,
+            pagination_validation::MAX_BATCH_WORK_LIMIT,
+        )?;
 
         let key = DataKey::BatchEscrowJob(job_id);
         let mut job: BatchEscrowJob = env
@@ -9186,12 +9206,17 @@ impl CraftNexusContract {
     /// * `limit` â€“ Page size; values above `MAX_BATCH_SIZE` are silently capped
     ///
     /// # Returns
-    /// A `Vec<u32>` of escrow IDs for the requested page; empty when `page` is out of range.
-    pub fn get_all_escrow_ids_iterative(env: Env, page: u32, limit: u32) -> soroban_sdk::Vec<u32> {
-        let limit = limit.min(MAX_BATCH_SIZE);
-        if limit == 0 {
-            return soroban_sdk::Vec::new(&env);
-        }
+    /// A `Result<Vec<u32>, Error>` containing escrow IDs for the requested page;
+    /// returns `Err(PaginationLimitZero)` if `limit` is zero (#1022).
+    pub fn get_all_escrow_ids_iterative(
+        env: Env,
+        page: u32,
+        limit: u32,
+    ) -> Result<soroban_sdk::Vec<u32>, Error> {
+        let limit = pagination_validation::validate_limit(
+            limit,
+            pagination_validation::MAX_ITERATIVE_PAGE_SIZE,
+        )?;
 
         Self::migrate_legacy_all_escrow_ids(&env);
 
@@ -9199,7 +9224,7 @@ impl CraftNexusContract {
         let start = page * limit;
 
         if start >= total {
-            return soroban_sdk::Vec::new(&env);
+            return Ok(soroban_sdk::Vec::new(&env));
         }
 
         let end = (start + limit).min(total);
@@ -9213,7 +9238,7 @@ impl CraftNexusContract {
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Accept the outstanding partial refund proposal for a disputed escrow.
@@ -9636,9 +9661,10 @@ impl CraftNexusContract {
         cursor: u32,
         limit: u32,
     ) -> Result<ReconciliationReport, Error> {
-        if limit == 0 || limit > MAX_BATCH_SIZE {
-            return Err(Error::InvalidBatchWorkLimit);
-        }
+        pagination_validation::validate_strict_limit(
+            limit,
+            pagination_validation::MAX_RECONCILE_LIMIT,
+        )?;
         let total = Self::get_persistent_u32(&env, &DataKey::EscrowCount);
         let end = cursor.saturating_add(limit).min(total);
         let mut expected_locked: i128 = if cursor == 0 {
