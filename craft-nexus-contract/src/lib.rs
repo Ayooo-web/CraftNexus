@@ -10,6 +10,9 @@ use soroban_sdk::{
 };
 extern crate alloc;
 
+/// Centralised time-boundary policy for the contract.
+pub mod time_policy;
+
 #[cfg(test)]
 mod arbitration_escalation_test;
 #[cfg(test)]
@@ -24,6 +27,8 @@ mod min_release_window_test;
 mod reentrancy_test;
 #[cfg(test)]
 mod scalability_test;
+#[cfg(test)]
+mod time_boundary_test;
 #[cfg(test)]
 mod test;
 #[cfg(test)]
@@ -326,38 +331,39 @@ const READ_TTL_THRESHOLD: u32 = 1_000;
 const TTL_EXTENSION: u32 = 518_400;
 
 // Default configuration constants (can be overridden via PlatformConfig)
+// Re-exported from the centralised time_policy module for single source of truth.
 /// Default grace period for WASM upgrades (7 days in seconds)
-const DEFAULT_WASM_UPGRADE_COOLDOWN: u32 = 7 * 24 * 60 * 60;
+const DEFAULT_WASM_UPGRADE_COOLDOWN: u32 = time_policy::WASM_UPGRADE_COOLDOWN as u32;
 /// Minimum time (seconds) that must elapse after a cancel_upgrade_wasm call
 /// before propose_upgrade_wasm is accepted again (Issue #618).
 /// Prevents the cancel-and-repropose pattern that resets the review window.
-const CANCEL_REPROPOSE_COOLDOWN: u64 = 7 * 24 * 60 * 60; // 7 days
+const CANCEL_REPROPOSE_COOLDOWN: u64 = time_policy::CANCEL_REPROPOSE_COOLDOWN;
 
 /// Default maximum duration a dispute can remain open before it can be force-resolved (30 days in seconds)
-const DEFAULT_MAX_DISPUTE_DURATION: u32 = 30 * 24 * 60 * 60;
+const DEFAULT_MAX_DISPUTE_DURATION: u32 = time_policy::MAX_DISPUTE_DURATION as u32;
 
 /// Default cooldown period after staking before tokens can be unstaked (7 days in seconds)
-const DEFAULT_STAKE_COOLDOWN: u32 = 7 * 24 * 60 * 60;
+const DEFAULT_STAKE_COOLDOWN: u32 = time_policy::STAKE_COOLDOWN as u32;
 
 /// Default minimum release window to prevent "flash" auto-releases (1 day in seconds)
-const DEFAULT_MIN_RELEASE_WINDOW: u32 = 24 * 60 * 60;
+const DEFAULT_MIN_RELEASE_WINDOW: u32 = time_policy::MIN_RELEASE_WINDOW as u32;
 /// Absolute safety ceiling for admin-configurable max release window (365 days).
-const ABSOLUTE_MAX_RELEASE_WINDOW: u32 = 365 * 24 * 60 * 60;
+const ABSOLUTE_MAX_RELEASE_WINDOW: u32 = time_policy::ABSOLUTE_MAX_RELEASE_WINDOW as u32;
 
 /// Default evidence expiry / retention window (7 days in seconds) (#927)
-const DEFAULT_EVIDENCE_EXPIRY_WINDOW: u64 = 7 * 24 * 60 * 60;
+const DEFAULT_EVIDENCE_EXPIRY_WINDOW: u64 = time_policy::EVIDENCE_EXPIRY_WINDOW;
 /// Default challenge period window before a dispute can be resolved (1 day in seconds) (#942)
-const DEFAULT_EVIDENCE_CHALLENGE_WINDOW: u32 = 24 * 60 * 60;
+const DEFAULT_EVIDENCE_CHALLENGE_WINDOW: u32 = time_policy::EVIDENCE_CHALLENGE_WINDOW as u32;
 /// Default dispute escalation window (3 days in seconds) (#941)
-const DEFAULT_DISPUTE_ESCALATION_WINDOW: u32 = 3 * 24 * 60 * 60;
+const DEFAULT_DISPUTE_ESCALATION_WINDOW: u32 = time_policy::DISPUTE_ESCALATION_WINDOW as u32;
 /// Default rate limit max calls per window (#943)
 const DEFAULT_RATE_LIMIT_MAX_CALLS: u32 = 5;
 /// Default rate limit window (1 hour in seconds) (#943)
-const DEFAULT_RATE_LIMIT_WINDOW: u32 = 3600;
+const DEFAULT_RATE_LIMIT_WINDOW: u32 = time_policy::RATE_LIMIT_WINDOW as u32;
 
 /// Maximum platform fee in basis points (10000 = 100%)
 const MAX_PLATFORM_FEE_BPS: u32 = 1000; // 10% max
-const MAX_TOTAL_RELEASE_WINDOW: u32 = 2592000; // 30 days
+const MAX_TOTAL_RELEASE_WINDOW: u32 = time_policy::MAX_TOTAL_RELEASE_WINDOW as u32;
 const CURRENT_ESCROW_VERSION: u32 = 4;
 /// Explicit storage layout version for persisted contract state.
 ///
@@ -373,7 +379,7 @@ const MAX_BATCH_SIZE: u32 = 20;
 const MAX_SCHEDULED_BATCH_WORK: u32 = 5;
 const MAX_PAGE_SIZE: u32 = 100;
 /// Timeout for unfunded escrows before they can be cancelled (24 hours) (#213)
-const UNFUNDED_CANCEL_TIMEOUT: u64 = 24 * 60 * 60;
+const UNFUNDED_CANCEL_TIMEOUT: u64 = time_policy::UNFUNDED_CANCEL_TIMEOUT;
 /// Hard ceiling for `NextRecurringEscrowId` (Issue #233).
 ///
 /// `u64::MAX` is reserved as a sentinel so the allocator can detect an
@@ -403,12 +409,12 @@ const MAX_STAKE_QUEUE_SIZE: u32 = 50;
 /// Threshold at which to trigger automatic pruning of matured stake deposits
 const STAKE_QUEUE_PRUNE_THRESHOLD: u32 = 40;
 /// Time lock period before admin recovery is allowed (7 days) (#240)
-const ADMIN_RECOVERY_DELAY: u64 = 7 * 24 * 60 * 60;
+const ADMIN_RECOVERY_DELAY: u64 = time_policy::ADMIN_RECOVERY_DELAY;
 /// Minimum allowed admin recovery cooldown. Deploys attempting to set a
 /// shorter window (including zero) will be rejected during recovery.
-const MIN_ADMIN_RECOVERY_COOLDOWN: u64 = 7 * 24 * 60 * 60;
+const MIN_ADMIN_RECOVERY_COOLDOWN: u64 = time_policy::MIN_ADMIN_RECOVERY_COOLDOWN;
 /// Default timelock delay for pending critical admin actions (24 hours).
-const DEFAULT_ADMIN_ACTION_TIMELOCK_DELAY: u64 = 24 * 60 * 60;
+const DEFAULT_ADMIN_ACTION_TIMELOCK_DELAY: u64 = time_policy::ADMIN_ACTION_TIMELOCK_DELAY;
 
 /// The kind of critical admin action that requires multi-sig approval
 /// and timelock enforcement.
@@ -4349,7 +4355,8 @@ impl CraftNexusContract {
             .funding_deadline
             .unwrap_or((escrow.created_at as u64) + UNFUNDED_CANCEL_TIMEOUT);
 
-        if current_time >= deadline {
+        // Time policy: deadline is reached when now >= deadline (inclusive end)
+        if time_policy::is_deadline_reached(current_time, deadline) {
             // After the deadline: buyer, seller, or platform admin may cancel.
             let admin = Self::get_admin(&env).unwrap_or(escrow.buyer.clone());
             if caller != escrow.buyer && caller != escrow.seller && caller != admin {
@@ -5180,10 +5187,12 @@ impl CraftNexusContract {
         let initiated_at = Self::dispute_clock(escrow)?;
         let now = env.ledger().timestamp();
         let challenge = config.evidence_challenge_window as u64;
-        if now < initiated_at.saturating_add(challenge) {
+        // Time policy: challenge window is active while now < initiated_at + challenge_window
+        if time_policy::is_window_active(now, initiated_at, challenge) {
             return Err(Error::ChallengeWindowActive);
         }
-        if now >= initiated_at.saturating_add(config.max_dispute_duration as u64) {
+        // Time policy: arbitrator deadline exceeded when now >= initiated_at + max_dispute_duration
+        if time_policy::is_window_elapsed(now, initiated_at, config.max_dispute_duration as u64) {
             return Err(Error::ArbitratorDeadlineExceeded);
         }
         Ok(())
@@ -5196,7 +5205,8 @@ impl CraftNexusContract {
     ) -> Result<(), Error> {
         let initiated_at = Self::dispute_clock(escrow)?;
         let now = env.ledger().timestamp();
-        if now < initiated_at.saturating_add(config.max_dispute_duration as u64) {
+        // Time policy: dispute is expired when now >= initiated_at + max_dispute_duration
+        if time_policy::is_window_active(now, initiated_at, config.max_dispute_duration as u64) {
             return Err(Error::DisputeExpired);
         }
         Ok(())
@@ -5736,9 +5746,8 @@ impl CraftNexusContract {
         }
 
         let current_time = env.ledger().timestamp();
-        let elapsed = current_time - (escrow_for_window.created_at as u64);
-
-        if elapsed < escrow_for_window.release_window as u64 {
+        // Time policy: window is elapsed when now >= created_at + release_window
+        if time_policy::is_window_active(current_time, escrow_for_window.created_at as u64, escrow_for_window.release_window as u64) {
             env.panic_with_error(crate::Error::ReleaseWindowNotElapsed);
         }
 
@@ -5945,7 +5954,8 @@ impl CraftNexusContract {
             .get::<DataKey, u64>(&DataKey::LastUpgradeCancelledAt)
         {
             let now = env.ledger().timestamp();
-            if now < cancelled_at.saturating_add(CANCEL_REPROPOSE_COOLDOWN) {
+            // Time policy: cooldown is active while now < cancelled_at + CANCEL_REPROPOSE_COOLDOWN
+            if time_policy::is_window_active(now, cancelled_at, CANCEL_REPROPOSE_COOLDOWN) {
                 return Err(Error::UpgradeCooldownActive);
             }
         }
@@ -7293,7 +7303,8 @@ impl CraftNexusContract {
         let mut modified = false;
 
         for mut item in log.into_iter() {
-            if !item.is_invalidated && current_time > item.expires_at {
+            // Time policy: evidence expires when now >= expires_at (inclusive end, consistent with all other deadlines)
+            if !item.is_invalidated && time_policy::is_deadline_reached(current_time, item.expires_at) {
                 item.is_invalidated = true;
                 modified = true;
             }
@@ -7314,7 +7325,8 @@ impl CraftNexusContract {
         let current_time = env.ledger().timestamp();
 
         for item in all_evidence.into_iter() {
-            if !item.is_invalidated && current_time <= item.expires_at {
+            // Time policy: evidence is valid while now < expires_at (window active)
+            if !item.is_invalidated && time_policy::is_deadline_pending(current_time, item.expires_at) {
                 valid_log.push_back(item);
             }
         }
@@ -7345,7 +7357,8 @@ impl CraftNexusContract {
             .unwrap_or(escrow.created_at as u64);
         let current_time = env.ledger().timestamp();
 
-        if current_time < dispute_initiated_at + config.dispute_escalation_window as u64 {
+        // Time policy: escalation window is active while now < dispute_initiated_at + escalation_window
+        if time_policy::is_window_active(current_time, dispute_initiated_at, config.dispute_escalation_window as u64) {
             env.panic_with_error(crate::Error::ReleaseWindowNotElapsed);
         }
 
@@ -8855,7 +8868,8 @@ impl CraftNexusContract {
                 .persistent()
                 .get::<DataKey, StakeDeposit>(&deposit_key)
             {
-                if now >= deposit.cooldown_end {
+                // Time policy: deposit is matured when now >= cooldown_end (inclusive end)
+                if time_policy::is_deadline_reached(now, deposit.cooldown_end) {
                     // Deposit is matured, add to unstake amount
                     matured_amount += deposit.amount;
                     // Remove the matured deposit
