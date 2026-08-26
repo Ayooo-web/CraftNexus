@@ -508,6 +508,11 @@ pub enum DataKey {
     ArtisanFeeTier(Address),
     /// Staked token amount and asset for an artisan
     ArtisanStake(Address),
+    /// DEPRECATED legacy storage: Token address backing an artisan's staked balance.
+    ///
+    /// Replaced by [`ArtisanStake::token`] in [`ArtisanStakeData`]. Kept for
+    /// lazy migration of pre-v2 stake records during contract upgrades.
+    ArtisanStakeToken(Address),
     StakeCooldownEnd(Address),
     /// DEPRECATED single-cooldown timestamp for an artisan.
     ///
@@ -3178,6 +3183,35 @@ impl CraftNexusContract {
         queue_len
     }
 
+    /// Migrate legacy artisan stake records from split `ArtisanStake` (i128) +
+    /// `ArtisanStakeToken` (Address) storage to the unified `ArtisanStakeData`
+    /// struct (#1034).
+    ///
+    /// This function is idempotent: it returns 0 if the record is already in
+    /// the new format. Should be called lazily during stake reads or writes
+    /// so existing artisan balances are preserved across contract upgrades.
+    pub fn migrate_legacy_artisan_stake(env: Env, artisan: Address) -> u32 {
+        let stake_key = DataKey::ArtisanStake(artisan.clone());
+        let token_key = DataKey::ArtisanStakeToken(artisan.clone());
+
+        if !env.storage().persistent().has(&token_key) {
+            return 0;
+        }
+
+        let old_amount: Option<i128> = env.storage().persistent().get(&stake_key);
+        let old_token: Option<Address> = env.storage().persistent().get(&token_key);
+
+        if let (Some(amount), Some(token)) = (old_amount, old_token) {
+            let new_stake = ArtisanStakeData { amount, token };
+            env.storage().persistent().set(&stake_key, &new_stake);
+            Self::extend_persistent(&env, &stake_key);
+            env.storage().persistent().remove(&token_key);
+            return 1;
+        }
+
+        0
+    }
+
     /// Get the count of stake deposits in an artisan's queue.
     ///
     /// Returns 0 if no deposits exist. This is more efficient than loading
@@ -4054,6 +4088,7 @@ impl CraftNexusContract {
         // Check artisan (seller) stake requirement (Issue #99)
         let config = Self::get_platform_config_internal(&env);
         if config.min_stake_required > 0 {
+            Self::migrate_legacy_artisan_stake(env.clone(), seller.clone());
             let artisan_stake: i128 = env
                 .storage()
                 .persistent()
@@ -8711,12 +8746,21 @@ impl CraftNexusContract {
             env.panic_with_error(crate::Error::AmountBelowMinimum);
         }
 
+        Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
+
+        // Reject cross-token deposits before any state mutation (#1034).
+        let stake_key = DataKey::ArtisanStake(artisan.clone());
+        let current_stake: Option<ArtisanStakeData> = env.storage().persistent().get(&stake_key);
+        if let Some(existing_stake) = &current_stake {
+            if existing_stake.token != token {
+                env.panic_with_error(crate::Error::StakeTokenMismatch);
+            }
+        }
+
         // Effects are committed before the token interaction.
         Self::update_total_staked(&env, &token, amount);
 
         // Accumulate stake in a single record with token metadata.
-        let stake_key = DataKey::ArtisanStake(artisan.clone());
-        let current_stake: Option<ArtisanStakeData> = env.storage().persistent().get(&stake_key);
         if current_stake.is_none() {
             let count: u32 = env
                 .storage()
@@ -8732,9 +8776,6 @@ impl CraftNexusContract {
                 .set(&DataKey::StakedArtisanCount, &(count + 1));
         }
         let new_stake = if let Some(existing_stake) = current_stake {
-            if existing_stake.token != token {
-                env.panic_with_error(crate::Error::StakeTokenMismatch);
-            }
             ArtisanStakeData {
                 amount: existing_stake.amount + amount,
                 token: token.clone(),
@@ -8896,6 +8937,8 @@ impl CraftNexusContract {
         let _guard = ReentryGuardScope::new(&env);
         artisan.require_auth();
 
+        Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
+
         // Validate the requested token matches the token recorded at stake time.
         // Rejects attempts to withdraw in a cheaper/different asset (#421).
         let stake_key = DataKey::ArtisanStake(artisan.clone());
@@ -9022,11 +9065,20 @@ impl CraftNexusContract {
 
     /// Return the current staked amount for an artisan.
     pub fn get_stake(env: Env, artisan: Address) -> i128 {
+        Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
         env.storage()
             .persistent()
             .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
             .map(|stake: ArtisanStakeData| stake.amount)
             .unwrap_or(0)
+    }
+
+    /// Return the full stake record for an artisan, including the staked token address.
+    pub fn get_artisan_stake_data(env: Env, artisan: Address) -> Option<ArtisanStakeData> {
+        Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
+        env.storage()
+            .persistent()
+            .get::<DataKey, ArtisanStakeData>(&DataKey::ArtisanStake(artisan))
     }
 
     /// Check if an artisan account is under-collateralized (active obligations exist while holding less than minimum required stake).
@@ -9744,6 +9796,7 @@ impl CraftNexusContract {
                 .persistent()
                 .get::<DataKey, Address>(&DataKey::StakedArtisanIndexed(index))
             {
+                Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
                 if let Some(stake) = env
                     .storage()
                     .persistent()

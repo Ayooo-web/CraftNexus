@@ -1709,6 +1709,74 @@ fn test_unstake_rejects_different_token_than_original_stake() {
 }
 
 #[test]
+#[should_panic]
+fn test_stake_rejects_different_token_than_existing_stake() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    let other_token_admin = Address::generate(&env);
+    let other_token_contract = env.register_stellar_asset_contract_v2(other_token_admin.clone());
+    let other_token_admin_client =
+        token::StellarAssetClient::new(&env, &other_token_contract.address());
+
+    token_admin.mint(&seller, &10_000_000);
+    other_token_admin_client.mint(&seller, &10_000_000);
+
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+
+    // Cross-token deposit must be rejected without mutating existing stake.
+    client.stake_tokens(&seller, &other_token_contract.address(), &1_000);
+}
+
+#[test]
+fn test_cross_token_stake_fails_without_mutation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    let other_token_admin = Address::generate(&env);
+    let other_token_contract = env.register_stellar_asset_contract_v2(other_token_admin.clone());
+    let other_token_admin_client =
+        token::StellarAssetClient::new(&env, &other_token_contract.address());
+
+    token_admin.mint(&seller, &10_000_000);
+    other_token_admin_client.mint(&seller, &10_000_000);
+
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+    assert_eq!(client.get_stake(&seller), 5_000_000);
+
+    let token_client = token::Client::new(&env, &token_id);
+    let other_token_client = token::Client::new(&env, &other_token_contract.address());
+
+    let seller_balance_before = token_client.balance(&seller);
+    let other_balance_before = other_token_client.balance(&seller);
+
+    let r = client.try_stake_tokens(&seller, &other_token_contract.address(), &1_000);
+    assert!(r.is_err() || r.unwrap().is_err());
+
+    assert_eq!(client.get_stake(&seller), 5_000_000);
+    assert_eq!(token_client.balance(&seller), seller_balance_before);
+    assert_eq!(other_token_client.balance(&seller), other_balance_before);
+}
+
+#[test]
+fn test_get_artisan_stake_data_exposes_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&seller, &10_000_000);
+    client.stake_tokens(&seller, &token_id, &5_000_000);
+
+    let stake_data = client.get_artisan_stake_data(&seller);
+    assert!(stake_data.is_some());
+    let data = stake_data.unwrap();
+    assert_eq!(data.amount, 5_000_000);
+    assert_eq!(data.token, token_id);
+}
+
+#[test]
 fn test_create_escrow_with_metadata_success_cid_v0() {
     let env = Env::default();
     env.mock_all_auths();
