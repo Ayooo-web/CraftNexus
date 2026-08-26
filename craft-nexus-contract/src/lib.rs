@@ -4060,6 +4060,7 @@ impl CraftNexusContract {
         // Check artisan (seller) stake requirement (Issue #99)
         let config = Self::get_platform_config_internal(&env);
         if config.min_stake_required > 0 {
+            Self::migrate_legacy_artisan_stake(env.clone(), seller.clone());
             let artisan_stake: i128 = env
                 .storage()
                 .persistent()
@@ -9718,6 +9719,7 @@ impl CraftNexusContract {
                 .persistent()
                 .get::<DataKey, Address>(&DataKey::StakedArtisanIndexed(index))
             {
+                Self::migrate_legacy_artisan_stake(env.clone(), artisan.clone());
                 if let Some(stake) = env
                     .storage()
                     .persistent()
