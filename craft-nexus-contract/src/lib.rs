@@ -255,6 +255,10 @@ pub enum Error {
     OnboardingProfileStale = 78,
     /// The user's verification status has been revoked or is not current.
     OnboardingVerificationRevoked = 79,
+    /// An escrow with this order ID already exists. Duplicate escrow
+    /// identifiers are rejected so a retry (or a conflicting external
+    /// reference) can never overwrite an existing escrow's state.
+    EscrowAlreadyExists = 80,
 }
 
 /// Returns `true` if the error is transient and the operation may succeed on retry.
@@ -4087,6 +4091,10 @@ impl CraftNexusContract {
         Self::validate_optional_metadata_hash(&env, &metadata_hash);
         Self::validate_optional_service_agreement_hash(&env, &service_agreement_hash);
 
+        // Reject duplicate escrow identifiers (#1027): a retry or a conflicting
+        // external reference must never overwrite an existing escrow.
+        Self::assert_escrow_not_exists(&env, order_id);
+
         let escrow = Escrow {
             version: CURRENT_ESCROW_VERSION,
             id: order_id as u64,
@@ -4227,6 +4235,10 @@ impl CraftNexusContract {
 
         // Compute the deadline after which any party may cancel the unfunded stub (#656).
         let funding_deadline = created_at_u64 + UNFUNDED_CANCEL_TIMEOUT;
+
+        // Reject duplicate escrow identifiers (#1027): a retry or a conflicting
+        // external reference must never overwrite an existing escrow.
+        Self::assert_escrow_not_exists(&env, order_id);
 
         let escrow = Escrow {
             version: CURRENT_ESCROW_VERSION,
@@ -4791,6 +4803,19 @@ impl CraftNexusContract {
         env.storage().persistent().set(&key, &upgraded);
         Self::extend_persistent(env, &key);
         upgraded
+    }
+
+    /// Reject duplicate escrow identifiers (#1027).
+    ///
+    /// An order ID is the canonical key for an escrow. If one already exists,
+    /// a retry (or a conflicting client-supplied reference) must never
+    /// overwrite the existing escrow, or funds could be lost. On conflict the
+    /// caller receives [`Error::EscrowAlreadyExists`] and all state changes
+    /// are rolled back.
+    fn assert_escrow_not_exists(env: &Env, order_id: u32) {
+        if env.storage().persistent().has(&(ESCROW, order_id)) {
+            env.panic_with_error(crate::Error::EscrowAlreadyExists);
+        }
     }
 
     fn assert_valid_transition(
@@ -7864,6 +7889,12 @@ impl CraftNexusContract {
             }
         }
 
+        // Reject duplicate escrow identifiers (#1027): the order ID is the
+        // canonical key, so a duplicate must not overwrite an existing escrow.
+        if env.storage().persistent().has(&(ESCROW, params.order_id)) {
+            return Err(Error::EscrowAlreadyExists);
+        }
+
         Ok(())
     }
 
@@ -8044,8 +8075,14 @@ impl CraftNexusContract {
         }
 
         // Issue #111: Validate all first (single pass)
+        // Issue #1027: also reject duplicate order IDs within the batch itself.
+        let mut seen_order_ids: Map<u32, bool> = Map::new(&env);
         for i in 0..escrows.len() {
             if let Some(params) = escrows.get(i) {
+                if seen_order_ids.contains_key(params.order_id) {
+                    return Err(Error::EscrowAlreadyExists);
+                }
+                seen_order_ids.set(params.order_id, true);
                 Self::validate_escrow_params(&env, &params)?;
             }
         }

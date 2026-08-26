@@ -139,6 +139,127 @@ fn test_create_escrow_default_window() {
     assert_eq!(escrow.release_window, 604800); // 7 days
 }
 
+// ─── Reject duplicate escrow identifiers (#1027) ─────────────────────────────
+
+/// A retry with an order ID that already exists must be rejected and must not
+/// overwrite the existing escrow.
+#[test]
+fn test_create_escrow_rejects_duplicate_order_id() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &100_000_000);
+    let original = client.create_escrow(&buyer, &seller, &token_id, &500, &7, &Some(3600));
+
+    // Same order ID, different amount — must be rejected as a duplicate.
+    let result = client.try_create_escrow(&buyer, &seller, &token_id, &900, &7, &Some(3600));
+    assert_panic_contract_error(result, Error::EscrowAlreadyExists);
+
+    // State is unchanged: the original escrow is still intact.
+    let stored = client.get_escrow(&7);
+    assert_eq!(stored, original);
+    assert_eq!(stored.amount, 500);
+    assert_eq!(stored.buyer, buyer);
+}
+
+/// Duplicate rejection also applies to the unfunded creation path.
+#[test]
+fn test_create_unfunded_escrow_rejects_duplicate_order_id() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, _, _, _) = setup_test(&env, true);
+
+    let original = client.create_unfunded_escrow(
+        &9, &buyer, &seller, &token_id, &500, &3600, &None, &None, &None,
+    );
+
+    let result = client.try_create_unfunded_escrow(
+        &9, &buyer, &seller, &token_id, &900, &3600, &None, &None, &None,
+    );
+    assert_panic_contract_error(result, Error::EscrowAlreadyExists);
+
+    let stored = client.get_escrow(&9);
+    assert_eq!(stored, original);
+    assert_eq!(stored.amount, 500);
+}
+
+/// A batch containing duplicate order IDs is rejected atomically — no escrow
+/// is created.
+#[test]
+fn test_create_batch_escrow_rejects_duplicate_order_ids() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &1_000_000_000);
+
+    let escrow_params = vec![
+        &env,
+        EscrowCreateParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: token_id.clone(),
+            amount: 100_000_000,
+            order_id: 100,
+            release_window: Some(3600),
+            ipfs_hash: None,
+            metadata_hash: None,
+            service_agreement_hash: None,
+        },
+        EscrowCreateParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: token_id.clone(),
+            amount: 200_000_000,
+            order_id: 100, // duplicate within the batch
+            release_window: Some(3600),
+            ipfs_hash: None,
+            metadata_hash: None,
+            service_agreement_hash: None,
+        },
+    ];
+
+    let result = client.try_create_batch_escrow(&1u64, &escrow_params);
+    assert_eq!(result.unwrap_err(), Ok(Error::EscrowAlreadyExists));
+
+    // The batch is atomic: no escrow was persisted.
+    assert_eq!(client.get_escrow_count(), 0);
+}
+
+/// A batch that collides with an already-existing escrow is rejected.
+#[test]
+fn test_create_batch_escrow_rejects_existing_order_id() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, buyer, seller, token_id, token_admin, _, _) = setup_test(&env, true);
+
+    token_admin.mint(&buyer, &1_000_000_000);
+    client.create_escrow(&buyer, &seller, &token_id, &500, &200, &Some(3600));
+
+    let escrow_params = vec![
+        &env,
+        EscrowCreateParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: token_id.clone(),
+            amount: 300_000_000,
+            order_id: 200, // already exists
+            release_window: Some(3600),
+            ipfs_hash: None,
+            metadata_hash: None,
+            service_agreement_hash: None,
+        },
+    ];
+
+    let result = client.try_create_batch_escrow(&1u64, &escrow_params);
+    assert_eq!(result.unwrap_err(), Ok(Error::EscrowAlreadyExists));
+
+    // The pre-existing escrow is untouched.
+    let stored = client.get_escrow(&200);
+    assert_eq!(stored.amount, 500);
+}
+
 #[test]
 fn test_release_funds_success() {
     let env = Env::default();
